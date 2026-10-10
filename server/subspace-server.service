@@ -1,0 +1,24 @@
+[Unit]
+Description=subspace server (Claude Code channels proof-of-concept)
+After=default.target
+
+[Service]
+Type=simple
+# EDIT the two absolute paths below for your machine:
+#   1. the path to `uv`             -> run: command -v uv
+#   2. the path to the server script in your checkout of this repository
+ExecStart=%h/.local/bin/uv run -qs %h/subspace/server/subspace-server.py
+Restart=on-failure
+RestartSec=2
+
+# GitHub PR monitoring needs a token. systemd --user has no inherited env, so
+# provide it explicitly, e.g. an EnvironmentFile containing GITHUB_TOKEN=...:
+# EnvironmentFile=%h/.config/subspace-server.env
+
+# Optional overrides (defaults shown):
+# Environment=SUBSPACE_WS_HOST=127.0.0.1
+# Environment=SUBSPACE_WS_PORT=8137
+# Environment=SUBSPACE_DATA_DIR=%h/.local/share/subspace
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,166 @@
+name: Build and push image
+
+# - Push to main: compute the next version from conventional commits since the
+#   last X.Y.Z tag, push an annotated [auto-release] tag, then build and push
+#   the image. If two runs compute the same version, the second tag push fails
+#   and that run stops. Put [skip release] in the merge commit to opt out.
+# - Push of a numeric tag: build that tag. Tags made by auto-release are
+#   skipped, because the main run that made them builds them.
+# - workflow_dispatch: rebuild the release tag at the selected ref, e.g. after
+#   a run pushed its tag but failed to build.
+#
+# Repository variable REGISTRY (e.g. registry.example.com) sets where the image
+# goes: <REGISTRY>/<owner>/<repo>. Secrets REGISTRY_USERNAME and
+# REGISTRY_PASSWORD authenticate to it.
+on:
+  push:
+    tags:
+      - '[0-9]*'
+    branches:
+      - main
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: buildkit
+    # Time in the queue counts against this limit.
+    timeout-minutes: 180
+    env:
+      DOCKER_CONFIG: /tmp/docker
+      REGISTRY: ${{ vars.REGISTRY }}
+      IMAGE: ${{ vars.REGISTRY }}/${{ github.repository }}
+      RELEASE_EMAIL: auto-release@noreply.wlritchi.com
+
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          # The release tag push at the end uses this header too.
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          # Full history and tags: the version bump reads commits since the
+          # last release tag.
+          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
+          git checkout "${GITHUB_REF}"
+
+      - name: Resolve version
+        run: |
+          set -eu
+          : > /tmp/skip
+          : > /tmp/pushtag
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if ! TAG="$(git describe --tags --exact-match --match '[0-9]*' HEAD 2>/dev/null)"; then
+              echo "ERROR: workflow_dispatch needs HEAD at a numeric release tag" >&2
+              exit 1
+            fi
+          elif [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            # Match the tagger too, not only the subject: a lightweight tag's
+            # subject is its commit message.
+            if [ "$(git for-each-ref --format='%(objecttype) %(taggeremail)' "refs/tags/${TAG}")" = "tag <${RELEASE_EMAIL}>" ] \
+                && git for-each-ref --format='%(contents:subject)' "refs/tags/${TAG}" | grep -q '^\[auto-release\]'; then
+              echo "Tag ${TAG} was made by auto-release; skipping."
+              echo 1 > /tmp/skip
+            fi
+          else
+            if git log -1 --format=%B | grep -qi '\[skip release\]'; then
+              echo "[skip release] in HEAD commit; not releasing."
+              echo 1 > /tmp/skip
+              exit 0
+            fi
+            # Only tags on main's history count toward the next version.
+            LAST="$(git tag -l --merged HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+            if [ -n "${LAST}" ]; then RANGE="${LAST}..HEAD"; else LAST=0.0.0; RANGE=HEAD; fi
+            SUBJECTS="$(git log --format=%s ${RANGE})"
+            BODIES="$(git log --format=%B ${RANGE})"
+            if [ -z "${SUBJECTS}" ]; then
+              echo "No commits since ${LAST}; nothing to release."
+              echo 1 > /tmp/skip
+              exit 0
+            fi
+            MAJOR="${LAST%%.*}"; REST="${LAST#*.}"; MINOR="${REST%%.*}"; PATCH="${LAST##*.}"
+            BUMP="patch"
+            if printf '%s\n' "${SUBJECTS}" | grep -qE '^feat(\([^)]*\))?!?:'; then BUMP="minor"; fi
+            if printf '%s\n' "${SUBJECTS}" | grep -qE '^[a-z]+(\([^)]*\))?!:' \
+                || printf '%s\n' "${BODIES}" | grep -q '^BREAKING CHANGE'; then
+              BUMP="major"
+            fi
+            # Before 1.0.0, a breaking change bumps the minor version. Push a
+            # 1.0.0 tag by hand to leave 0.x.
+            if [ "${MAJOR}" = 0 ] && [ "${BUMP}" = major ]; then BUMP="minor"; fi
+            case "${BUMP}" in
+              major) TAG="$((MAJOR + 1)).0.0" ;;
+              minor) TAG="${MAJOR}.$((MINOR + 1)).0" ;;
+              patch) TAG="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            esac
+            echo "Auto-release: ${LAST} -> ${TAG} (${BUMP})"
+            git config user.name "auto-release"
+            git config user.email "${RELEASE_EMAIL}"
+            # The tag is pushed after registry login, so a missing registry
+            # setting fails the run before it claims a version.
+            git tag -a "${TAG}" -m "[auto-release] ${TAG}" \
+              -m "$(printf '%s\n' "${SUBJECTS}" | sed 's/^/- /')"
+            echo 1 > /tmp/pushtag
+          fi
+          printf '%s\n' "${TAG}" > /tmp/version
+
+      - name: Registry login
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          if grep -q 1 /tmp/skip; then exit 0; fi
+          set -eu
+          : "${REGISTRY:?set the REGISTRY repository variable}"
+          : "${REGISTRY_USERNAME:?set the REGISTRY_USERNAME secret}"
+          : "${REGISTRY_PASSWORD:?set the REGISTRY_PASSWORD secret}"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{"https://%s":{"username":"%s","password":"%s"},"%s":{"username":"%s","password":"%s"}}}' \
+            "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" \
+            "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" > "$DOCKER_CONFIG/config.json"
+
+      - name: Push release tag
+        run: |
+          if ! grep -q 1 /tmp/pushtag; then exit 0; fi
+          set -eu
+          TAG="$(cat /tmp/version)"
+          git push origin "refs/tags/${TAG}"
+          echo "Pushed tag ${TAG}"
+
+      - name: Build and push image
+        run: |
+          if grep -q 1 /tmp/skip; then exit 0; fi
+          set -eu
+          VERSION="$(cat /tmp/version)"
+          REFS="${IMAGE}:${VERSION}"
+          # :latest only for the highest X.Y.Z tag, so a rebuild of an old
+          # release does not move it back. All tags count here, not only those
+          # on main's history.
+          if printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            HIGHEST="$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+            if [ "${VERSION}" = "${HIGHEST}" ]; then
+              REFS="${REFS},${IMAGE}:latest"
+            fi
+          fi
+          CACHE="type=registry,ref=${IMAGE}:buildcache"
+          # name= takes all refs as one quoted, comma-separated value; a second
+          # name= key replaces the first.
+          # cmdline=builtin: use the built-in Dockerfile frontend and ignore
+          # the `# syntax=` line. That line starts the frontend in a separate
+          # container, which this runner cannot do.
+          buildctl-daemonless.sh build \
+            --frontend dockerfile.v0 \
+            --opt cmdline=builtin \
+            --local context=. \
+            --local dockerfile=. \
+            --opt build-arg:VERSION="${VERSION}" \
+            --opt build-arg:VCS_REF="$(git rev-parse --short HEAD)" \
+            --opt build-arg:BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --import-cache "${CACHE}" \
+            --export-cache "${CACHE},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+            --output "type=image,\"name=${REFS}\",push=true,oci-mediatypes=true"
+          echo "Pushed ${REFS}"

@@ -1,0 +1,85 @@
+name: Tag protocol release
+
+# On a push to main that changes the protocol package, push the next
+# protocol-v<version> tag. scripts/protocol-compat.py compares the package with
+# the last tag and gives the bump: major for a breaking change, minor for a
+# compatible change to the types, patch for anything else. A commit that
+# touches protocol/ and is marked breaking (`!` or BREAKING CHANGE) also forces
+# a major bump, for changes in meaning that the types do not show.
+# [skip release] in the merge commit opts out. The first tag is pushed by hand.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'protocol/src/**'
+      - 'protocol/pyproject.toml'
+
+jobs:
+  tag:
+    runs-on: docker
+    timeout-minutes: 30
+    env:
+      RELEASE_EMAIL: auto-release@noreply.wlritchi.com
+
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          # The tag push at the end uses this header too.
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
+          git checkout "${GITHUB_REF}"
+
+      - name: Tag
+        run: |
+          set -eu
+          if git log -1 --format=%B | grep -qi '\[skip release\]'; then
+            echo "[skip release] in HEAD commit; not tagging."
+            exit 0
+          fi
+          LAST="$(git tag -l --merged HEAD 'protocol-v*' | sed 's/^protocol-v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          if [ -z "${LAST}" ]; then
+            echo "No protocol-v<version> tag yet. Push the first one by hand."
+            exit 0
+          fi
+          if git diff --quiet "protocol-v${LAST}" HEAD -- protocol/src protocol/pyproject.toml; then
+            echo "No protocol changes since protocol-v${LAST}."
+            exit 0
+          fi
+
+          BUMP="$(python3 scripts/protocol-compat.py "protocol-v${LAST}" 2> /tmp/report)"
+          cat /tmp/report
+          RANGE="protocol-v${LAST}..HEAD"
+          if git log --format=%s "${RANGE}" -- protocol/ | grep -qE '^[a-z]+(\([^)]*\))?!:' \
+              || git log --format=%B "${RANGE}" -- protocol/ | grep -q '^BREAKING CHANGE'; then
+            BUMP="major"
+          fi
+
+          MAJOR="${LAST%%.*}"; REST="${LAST#*.}"; MINOR="${REST%%.*}"; PATCH="${LAST##*.}"
+          case "${BUMP}" in
+            major) VERSION="$((MAJOR + 1)).0.0" ;;
+            minor) VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+            patch) VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            *) echo "ERROR: unexpected bump '${BUMP}'" >&2; exit 1 ;;
+          esac
+          TAG="protocol-v${VERSION}"
+          echo "Protocol release: ${LAST} -> ${VERSION} (${BUMP})"
+
+          git config user.name "auto-release"
+          git config user.email "${RELEASE_EMAIL}"
+          {
+            printf '[auto-release] %s\n\n' "${TAG}"
+            git log --format='- %s' "${RANGE}" -- protocol/
+            if [ -s /tmp/report ]; then printf '\n'; cat /tmp/report; fi
+          } > /tmp/message
+          git tag -a "${TAG}" -F /tmp/message
+          # Fails if another run already pushed this version.
+          git push origin "refs/tags/${TAG}"
+          echo "Pushed tag ${TAG}"

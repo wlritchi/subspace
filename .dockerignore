@@ -1,0 +1,17 @@
+# The server image only COPYs server/, lib/, and protocol/. Keep everything else out
+# of the build context so unrelated edits (tests, docs, CI) don't bust the build cache.
+.git/
+.forgejo/
+.github/
+tests/
+docs/
+*.md
+# hatchling needs the readme to build the protocol package.
+!protocol/README.md
+.claude/
+scripts/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
