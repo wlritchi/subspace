@@ -176,7 +176,7 @@ network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
 | `SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL`  | `20`                  | Open sessions for each credential                                                                                               |
 | `SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE` | `20`                  | Failed authentications for each client address before 429                                                                       |
 | `SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS`      | `60`                  | How long the gateway trusts the server's verdict on a token. A revoked credential can work this much longer through the gateway |
-| `SUBSPACE_GATEWAY_TRUST_FORWARDED`          | off                   | Take the client address from `X-Forwarded-For` (set it only behind a proxy that sets the header)                                |
+| `SUBSPACE_GATEWAY_TRUST_FORWARDED`          | off                   | Take the client address from the last `X-Forwarded-For` entry (set it only behind a proxy that appends to the header)           |
 
 Run it next to the server:
 

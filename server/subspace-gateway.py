@@ -267,7 +267,9 @@ async def _open_core(core_url: str, token: str) -> ClientConnection:
             open_timeout=CORE_TIMEOUT_SECONDS,
         )
     except (OSError, InvalidStatus, TimeoutError) as exc:
-        raise GatewayError(f"cannot reach the subspace server: {exc}") from exc
+        # The details name internal addresses: log them, do not return them.
+        log.warning("cannot reach the subspace server: %s", exc)
+        raise GatewayError("the subspace server is not reachable") from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -331,18 +333,19 @@ class Gateway:
         self.verdicts[key] = TokenVerdict(whoami, now)
         return whoami
 
-    def allow_failure(self, client: str) -> bool:
-        """Count an authentication failure from ``client``. False if the client
-        is over its limit."""
+    def _failures_left(self, client: str, now: float) -> float:
         rate = self.auth_failures_per_minute
-        now = time.monotonic()
         left, last = self.failures.get(client, (rate, now))
-        left = min(rate, left + (now - last) * rate / 60.0)
-        if left < 1.0:
-            self.failures[client] = (left, now)
-            return False
-        self.failures[client] = (left - 1.0, now)
-        return True
+        return min(rate, left + (now - last) * rate / 60.0)
+
+    def blocked(self, client: str) -> bool:
+        """True if ``client`` used up its failed authentications. The gateway
+        then refuses it without asking the core."""
+        return self._failures_left(client, time.monotonic()) < 1.0
+
+    def record_failure(self, client: str) -> None:
+        now = time.monotonic()
+        self.failures[client] = (max(0.0, self._failures_left(client, now) - 1.0), now)
 
     def session(self, token: str, spec: str) -> CoreSession:
         key = (_token_hash(token), spec)
@@ -370,6 +373,9 @@ class Gateway:
             for key, verdict in list(self.verdicts.items()):
                 if now - verdict.checked_at > self.token_cache_seconds:
                     del self.verdicts[key]
+            for client, (_left, last) in list(self.failures.items()):
+                if now - last > 60.0:  # refilled by now
+                    del self.failures[client]
 
 
 GATEWAY = Gateway()
@@ -382,9 +388,15 @@ GATEWAY = Gateway()
 
 def _client_address(scope: Scope) -> str:
     if GATEWAY.trust_forwarded:
-        for name, value in scope.get("headers", []):
-            if name == b"x-forwarded-for":
-                return value.decode("latin-1").split(",")[0].strip()
+        # The last entry is the one that the trusted proxy added. The client
+        # controls the entries before it.
+        forwarded = [
+            value.decode("latin-1")
+            for name, value in scope.get("headers", [])
+            if name == b"x-forwarded-for"
+        ]
+        if forwarded:
+            return forwarded[-1].split(",")[-1].strip()
     client = scope.get("client")
     return client[0] if client else "unknown"
 
@@ -400,6 +412,12 @@ class AuthMiddleware:
         if scope["type"] != "http" or scope["path"] != self.path:
             await self.app(scope, receive, send)
             return
+        client = _client_address(scope)
+        if GATEWAY.blocked(client):
+            await PlainTextResponse("too many failed attempts", status_code=429)(
+                scope, receive, send
+            )
+            return
         request = Request(scope)
         header = request.headers.get("authorization", "")
         token = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
@@ -407,25 +425,22 @@ class AuthMiddleware:
         if _TOKEN_RE.match(token):
             try:
                 whoami = await GATEWAY.verify(token)
-            except GatewayError as exc:
-                await PlainTextResponse(str(exc), status_code=503)(scope, receive, send)
+            except GatewayError:
+                await PlainTextResponse("service unavailable", status_code=503)(
+                    scope, receive, send
+                )
                 return
         if whoami is None:
-            if not GATEWAY.allow_failure(_client_address(scope)):
-                response: Response = PlainTextResponse(
-                    "too many failed attempts", status_code=429
-                )
-            else:
-                log.info(
-                    "refused a token (credential %s)",
-                    _credential_id(token) if token.startswith("ssp_") else "-",
-                )
-                response = PlainTextResponse(
-                    "unauthorized",
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer realm="subspace"'},
-                )
-            await response(scope, receive, send)
+            GATEWAY.record_failure(client)
+            log.info(
+                "refused a token (credential %s)",
+                _credential_id(token) if token.startswith("ssp_") else "-",
+            )
+            await PlainTextResponse(
+                "unauthorized",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="subspace"'},
+            )(scope, receive, send)
             return
         await self.app(scope, receive, send)
 

@@ -260,3 +260,36 @@ def test_revoked_credential(tmp_path: Path) -> None:
                 assert reply.status_code == 401
 
         asyncio.run(scenario())
+
+
+def test_failed_auth_limit_uses_trusted_forwarded_entry(tmp_path: Path) -> None:
+    with _stack(tmp_path, auth_failures_per_minute="2", trust_forwarded="1") as s:
+
+        async def scenario() -> None:
+            body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            bad = {"Authorization": "Bearer ssp_abcdefghijkl_" + "x" * 40}
+            async with httpx2.AsyncClient() as http:
+                codes = []
+                for n in range(4):
+                    # The client controls the first entries; the proxy adds the last.
+                    headers = {**bad, "X-Forwarded-For": f"spoof-{n}, 10.0.0.1"}
+                    reply = await http.post(s.url(), json=body, headers=headers)
+                    codes.append(reply.status_code)
+                assert codes == [401, 401, 429, 429]
+                # A valid token from the blocked address is refused too.
+                reply = await http.post(
+                    s.url("?handle=x"),
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {s.tokens['ci']}",
+                        "X-Forwarded-For": "10.0.0.1",
+                    },
+                )
+                assert reply.status_code == 429
+                # Another address is not affected.
+                reply = await http.post(
+                    s.url(), json=body, headers={**bad, "X-Forwarded-For": "10.0.0.2"}
+                )
+                assert reply.status_code == 401
+
+        asyncio.run(scenario())
