@@ -4,6 +4,7 @@ servers."""
 
 import contextlib
 import http.server
+import importlib.util
 import json
 import os
 import re
@@ -14,6 +15,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import accounts
+import sessions
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = str(ROOT / "server" / "subspace-server.py")
@@ -57,9 +60,8 @@ def server_env(
     forgejo_instances: dict[str, str] | None = None,
     poll_seconds: str = "1",
     warm_ttl: str | None = None,
-    agent_ttl: str | None = None,
+    handle_idle: str | None = None,
     channel_ttl: str | None = None,
-    settle: str | None = None,
 ) -> dict:
     env = _isolated_environ()
     env["SUBSPACE_WS_PORT"] = str(ws_port)
@@ -67,12 +69,10 @@ def server_env(
     env["SUBSPACE_PR_POLL_SECONDS"] = poll_seconds
     if warm_ttl is not None:
         env["SUBSPACE_PR_WARM_TTL_SECONDS"] = warm_ttl
-    if agent_ttl is not None:
-        env["SUBSPACE_AGENT_TTL_SECONDS"] = agent_ttl
+    if handle_idle is not None:
+        env["SUBSPACE_HANDLE_IDLE_SECONDS"] = handle_idle
     if channel_ttl is not None:
         env["SUBSPACE_CHANNEL_TTL_SECONDS"] = channel_ttl
-    if settle is not None:
-        env["SUBSPACE_RECLAIM_SETTLE_SECONDS"] = settle
     if graphql_url:
         env["GITHUB_GRAPHQL_URL"] = graphql_url
         env["GITHUB_TOKEN"] = "test-token"
@@ -548,3 +548,16 @@ class FakeForgejo:
     def __exit__(self, *exc) -> None:
         if self._server is not None:
             self._server.shutdown()
+
+
+def load_server(data_dir: Path):
+    """Import the server script as a module, with the state that main() loads
+    set up for an empty data directory."""
+    spec = importlib.util.spec_from_file_location("subspace_server", SERVER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ACCOUNTS = accounts.AccountStore(
+        data_dir / "accounts.toml", "test-token", "default"
+    )
+    module.SESSIONS = sessions.SessionRegistry(data_dir)
+    return module

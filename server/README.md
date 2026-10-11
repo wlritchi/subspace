@@ -1,10 +1,11 @@
 # subspace server
 
 A persistent, single-instance WebSocket server that owns notification state for
-every Claude Code session on this machine. The per-session stdio MCP relay
+Claude Code sessions. The per-session stdio MCP relay
 (`mcp/notifications-server.py` in the `notifications` plugin of wlr-cc-plugins)
-connects to it, registers its session id, and exchanges notifications. All persistence and dispatch lives here; the relay is
-stateless.
+and the remote-agent gateway (`subspace-gateway.py`) connect to it, attach to a
+session, and exchange notifications. All persistence and dispatch lives here;
+the relay is stateless.
 
 The relay **never spawns** the server — you run it (manually or via systemd).
 If it isn't running, the relay keeps retrying to connect and the tools report it
@@ -44,7 +45,12 @@ It provides two capabilities:
 | `SUBSPACE_WS_HOST`            | `127.0.0.1`               | WebSocket bind host                           |
 | `SUBSPACE_WS_PORT`            | `8137`                    | WebSocket port                                |
 | `SUBSPACE_DATA_DIR`           | `$XDG_DATA_HOME/subspace` | Where callbacks and PR state are persisted    |
-| `SUBSPACE_TOKEN`              | auto (`<DATA_DIR>/token`) | Shared secret authenticating relay→server     |
+| `SUBSPACE_TOKEN`              | auto (`<DATA_DIR>/token`) | Master token: access to the default account   |
+| `SUBSPACE_DEFAULT_ACCOUNT`    | `default`                 | Id of the default account (choose it once)    |
+| `SUBSPACE_ACCOUNTS_FILE`      | `<DATA_DIR>/accounts.toml`| Accounts and credentials (optional)           |
+| `SUBSPACE_ACCOUNTS_CHECK_SECONDS` | `5`                   | How often to reload the accounts file and check credentials |
+| `SUBSPACE_HANDLE_IDLE_SECONDS` | `900`                    | A handle whose session has had no connection this long can be registered by another session without `takeover` |
+| `SUBSPACE_SESSION_TTL_DAYS`   | `30`                      | Remove a session (handle, memberships, PR subscriptions, callbacks) after this long with no connection |
 | `GITHUB_TOKEN`                | —                         | Token for PR polling (`gh auth token`)        |
 | `GITHUB_API_URL`              | `https://api.github.com`  | API base (set for GitHub Enterprise / tests)  |
 | `GITHUB_GRAPHQL_URL`          | `{GITHUB_API_URL}/graphql`| GraphQL endpoint (override for Enterprise)    |
@@ -65,6 +71,62 @@ connections without it are rejected. Local relays must read the same secret:
 either link `~/.claude/notifications/token` to the server's token file, or set
 `SUBSPACE_TOKEN` for the server and `NOTIFICATIONS_TOKEN` for the relays to the
 same value.
+
+## Accounts, sessions, and handles
+
+See `docs/specs/2026-10-10-identity.md` for the design.
+
+- **Account.** The token that a client connects with selects an account. The
+  master token always selects the default account, which has every permission
+  and every channel unless the accounts file defines it. Every other account is
+  defined in the accounts file.
+- **Session.** A client attaches to a session in its account with a session id
+  that it supplies. All state (channel memberships, unread messages, PR
+  subscriptions, callbacks) belongs to the session.
+- **Handle.** A session can register a handle so that other sessions can
+  address it. Inside an account a handle is bare (`reviewer`); from another
+  account it is `reviewer@ci`. A handle stays with its session until the
+  session releases it, another session takes it with `takeover`, or the session
+  has had no connection for `SUBSPACE_HANDLE_IDLE_SECONDS`.
+
+### The accounts file
+
+```toml
+[[account]]
+id = "ci"                        # kebab-case
+label = "CI reviewers"
+channels = ["ci", "ops-*"]       # names or prefixes; omit for every channel
+permissions = ["messaging"]      # messaging, schedule, pr
+max_severity = "normal"          # posts and DMs are lowered to this
+
+[account.limits]                 # for each session; these are the defaults
+posts_per_minute = 30
+channels = 10
+pr_subscriptions = 0
+callbacks = 0
+
+[[account.credential]]
+id = "k3j9x2m4p7qa"
+secret_sha256 = "…"
+expires_at = 2027-01-01T00:00:00Z  # optional
+```
+
+Make a credential with `scripts/new-credential.py <account>`. It prints the
+token once and the `[[account.credential]]` block to add. The server reloads the
+file when it changes. When a credential is removed or expires, the server closes
+its connections. A file that is not valid stops the server at startup; at a
+later reload, the server logs the error and keeps the previous accounts.
+
+The `pr` permission gives access to every repository that the server's GitHub
+and Forgejo tokens can see. Do not give it to an account that you do not trust
+with those repositories.
+
+### Migration to session keys
+
+The first start of this version moves the data directory to session keys in the
+default account, and writes `<DATA_DIR>/identity-version`. The old agent records
+stay in `<DATA_DIR>/agents.v1/`. Remove that directory when you no longer need
+it. `SUBSPACE_AGENT_TTL_SECONDS` and `SUBSPACE_RECLAIM_SETTLE_SECONDS` are gone.
 
 ### Migrating from the `notifications` server
 

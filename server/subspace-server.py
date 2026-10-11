@@ -4,8 +4,10 @@
 subspace server
 
 A persistent, single-instance WebSocket server that owns notification state for
-all Claude sessions on this machine. Per-session stdio MCP relays connect over
-localhost, register their session id, and exchange notifications.
+Claude sessions. Clients (the per-session stdio MCP relay, or the remote-agent
+gateway) authenticate with a credential, which selects an account, attach to a
+session in that account, and exchange notifications. See
+../docs/specs/2026-10-10-identity.md.
 
 It provides two capabilities:
   - scheduled one-shot callbacks (proof-of-concept; ../lib/scheduler.py)
@@ -24,9 +26,12 @@ Config (env):  SUBSPACE_WS_HOST (default 127.0.0.1)
                SUBSPACE_WS_PORT (default 8137)
                SUBSPACE_DATA_DIR (default $XDG_DATA_HOME/subspace)
                SUBSPACE_TOKEN (default: auto-created <DATA_DIR>/token)
+               SUBSPACE_DEFAULT_ACCOUNT (default "default")
+               SUBSPACE_ACCOUNTS_FILE (default <DATA_DIR>/accounts.toml)
                SUBSPACE_PR_WARM_TTL_SECONDS (default 1800)
                SUBSPACE_PR_CHECK_SUMMARY_THRESHOLD (default 5; 0 disables)
-               SUBSPACE_AGENT_TTL_SECONDS (default 900)
+               SUBSPACE_HANDLE_IDLE_SECONDS (default 900)
+               SUBSPACE_SESSION_TTL_DAYS (default 30)
                SUBSPACE_CHANNEL_TTL_SECONDS (default 86400)
                SUBSPACE_CHANNEL_HISTORY (default 20)
                GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com)
@@ -41,7 +46,7 @@ Config (env):  SUBSPACE_WS_HOST (default 127.0.0.1)
 # ///
 
 import asyncio
-import hmac
+import itertools
 import json
 import logging
 import os
@@ -59,15 +64,17 @@ from websockets.exceptions import ConnectionClosed
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
-import agent_registry  # noqa: E402
+import accounts  # noqa: E402
 import forgejo_client  # noqa: E402
 import github_client  # noqa: E402
 import messaging  # noqa: E402
 import message_topic  # noqa: E402
+import migrate_identity  # noqa: E402
 import pr_errors  # noqa: E402
 import pr_monitor  # noqa: E402
 import pr_schedule  # noqa: E402
 import scheduler  # noqa: E402
+import sessions  # noqa: E402
 import settings  # noqa: E402
 import storage  # noqa: E402
 
@@ -78,13 +85,15 @@ AUTH_BACKOFF_LEVEL = 14
 # How long an unsubscribed (subscriber-less, non-terminal) tracker is kept warm
 # before the reaper deletes it, so a quick re-subscribe reuses its cached state.
 WARM_TTL_DEFAULT_SECONDS = 1800.0
-# How long an offline agent keeps its directory name reserved before a colliding
-# register_agent may reclaim it. <=0 reclaims immediately once the session is gone.
-AGENT_TTL_DEFAULT_SECONDS = 900.0
-# How long a name's offline holder must stay quiet before a matching reclaim_key may
-# bypass the grace — long enough to outlast a roll's reconnect blip so a same-key bg
-# spare can't hijack a live agent that only briefly dropped. STOPGAP; see agent_registry.
-RECLAIM_SETTLE_DEFAULT_SECONDS = 60.0
+# How long a handle stays with a session that has no connection before another
+# session in the account can register it without takeover.
+HANDLE_IDLE_DEFAULT_SECONDS = 900.0
+# How long a session with no connection is kept before the reaper removes it.
+SESSION_TTL_DEFAULT_DAYS = 30.0
+# The largest message body that post and dm accept, in UTF-8 bytes.
+MAX_BODY_BYTES = 16 * 1024
+# How often to check the accounts file for changes and credentials for expiry.
+ACCOUNTS_CHECK_SECONDS = 5.0
 # How long a memberless+silent message topic (channel or DM) is kept before the
 # reaper deletes it, and how many recent messages a join reply renders as scrollback.
 CHANNEL_TTL_DEFAULT_SECONDS = 86400.0
@@ -104,24 +113,34 @@ def _warm_ttl_seconds() -> float:
     return WARM_TTL_DEFAULT_SECONDS
 
 
-def _agent_ttl_seconds() -> float:
-    raw = os.environ.get("SUBSPACE_AGENT_TTL_SECONDS")
+def _handle_idle_seconds() -> float:
+    raw = os.environ.get("SUBSPACE_HANDLE_IDLE_SECONDS")
     if raw:
         try:
             return float(raw)
         except ValueError:
             pass
-    return AGENT_TTL_DEFAULT_SECONDS
+    return HANDLE_IDLE_DEFAULT_SECONDS
 
 
-def _reclaim_settle_seconds() -> float:
-    raw = os.environ.get("SUBSPACE_RECLAIM_SETTLE_SECONDS")
+def _session_ttl_seconds() -> float:
+    raw = os.environ.get("SUBSPACE_SESSION_TTL_DAYS")
     if raw:
         try:
-            return float(raw)
+            return float(raw) * 86400.0
         except ValueError:
             pass
-    return RECLAIM_SETTLE_DEFAULT_SECONDS
+    return SESSION_TTL_DEFAULT_DAYS * 86400.0
+
+
+def _accounts_check_seconds() -> float:
+    raw = os.environ.get("SUBSPACE_ACCOUNTS_CHECK_SECONDS")
+    if raw:
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            pass
+    return ACCOUNTS_CHECK_SECONDS
 
 
 def _channel_ttl_seconds() -> float:
@@ -144,54 +163,20 @@ def _channel_history_n() -> int:
     return CHANNEL_HISTORY_DEFAULT
 
 
-# session id -> its current connection
-CONNECTIONS: dict[str, "Connection"] = {}
-# superseded session id -> {name, generation}: a pending "an heir has appeared"
-# notice, shipped if/when that session reconnects (docs/specs/2026-07-09 slice d).
-# In-memory only: a ceremony, not a delivery contract.
-SUPERSEDED: dict[str, dict] = {}
+# Session key -> the connections attached to it, oldest first.
+CONNECTIONS: dict[str, list["Connection"]] = {}
+# Every open connection, attached or not, for the credential checks.
+ALL_CONNECTIONS: set["Connection"] = set()
 # "owner/repo#number" -> PRTracker
 TRACKERS: dict[str, pr_monitor.PRTracker] = {}
-# The agent directory (Phase A): names -> records, persisted under <data_dir>/agents.
-REGISTRY: agent_registry.AgentRegistry = agent_registry.AgentRegistry(
-    settings.data_dir()
-)
-# Message topics (Phase B): topic key ("chan:<name>" / "dm:<names>") -> MessageTopic,
-# persisted under <data_dir>/msg/<safe_key>/ (mirrors how TRACKERS is loaded).
-TOPICS: dict[str, message_topic.MessageTopic] = {
-    topic.key: topic for topic in message_topic.load_all_topics(settings.data_dir())
-}
-
-
-def _migrate_topic_members() -> None:
-    """One-time member re-keying for topics that predate the name-keyed identity
-    model (docs/specs/2026-07-09): member keys written by older servers are session
-    ids. A key matching a registry record's session_id is renamed to that record's
-    name; a key that is already a registered name is kept; anything else is a ghost
-    (a session that died without a name holder to inherit its state) and is dropped
-    — its acked state is meaningless without a successor. Runs at startup, before
-    any connection is served, and persists what it changes."""
-    sid_to_name = {r.session_id: r.name for r in REGISTRY.list()}
-    names = set(sid_to_name.values())
-    for topic in TOPICS.values():
-        changed = False
-        for member in sorted(topic.members):
-            if member in names:
-                continue
-            new = sid_to_name.get(member)
-            if new is not None:
-                topic.rekey_member(member, new)
-                message_topic.delete_subscriber(settings.data_dir(), topic, member)
-                message_topic.save_subscriber(settings.data_dir(), topic, new)
-            else:
-                topic.leave(member)
-                message_topic.delete_subscriber(settings.data_dir(), topic, member)
-            changed = True
-        if changed:
-            message_topic.save_state(settings.data_dir(), topic)
-
-
-_migrate_topic_members()
+# The rest of the state loads in main(), after the identity migration.
+ACCOUNTS: accounts.AccountStore
+SESSIONS: sessions.SessionRegistry
+# Message topics: topic key ("chan:<name>" / "dm:<...>") -> MessageTopic,
+# persisted under <data_dir>/msg/<safe_key>/.
+TOPICS: dict[str, message_topic.MessageTopic] = {}
+# Session key -> (tokens, last refill time) for the post rate limit.
+POST_BUCKETS: dict[str, tuple[float, float]] = {}
 
 
 def _next_ordinal_path() -> Path:
@@ -219,11 +204,11 @@ def _init_next_ordinal() -> int:
     return max(_load_next_ordinal(), 1 + max_seen)
 
 
-# Server-global, monotonic message-handle counter (Phase C addendum). The lib stays
-# counter-agnostic; the server allocates an ordinal per post and passes it into
-# MessageTopic.post, so every channel/DM/reaction message gets a stable, globally
-# unique `#N` handle agents can pass back to react / message_status.
-_NEXT_ORDINAL: int = _init_next_ordinal()
+# Server-global, monotonic message-handle counter. The lib stays counter-agnostic;
+# the server allocates an ordinal per post and passes it into MessageTopic.post, so
+# every channel/DM/reaction message gets a stable, globally unique `#N` handle
+# agents can pass back to react / message_status. Set in main().
+_NEXT_ORDINAL: int = 0
 
 
 def _alloc_ordinal() -> int:
@@ -362,14 +347,13 @@ def _build_forgejo_instances(env: dict[str, str], default_url: str) -> dict:
     return instances
 
 
-# Shared secret each relay must present (Authorization: Bearer <token>) to connect.
-# Computed once at startup; relays compute the same value from SUBSPACE_DATA_DIR.
+# The master token. It always gives access to the default account. Set in main().
 TOKEN = ""
 
 
-def _session_live(session_id: str) -> bool:
-    """Liveness predicate the registry uses for name-reclaim decisions."""
-    return session_id in CONNECTIONS
+def _live(key: str) -> bool:
+    """True if at least one connection is attached to the session."""
+    return bool(CONNECTIONS.get(key))
 
 
 def _now_utc() -> datetime:
@@ -386,17 +370,17 @@ def _iso(epoch: float) -> str:
 
 
 def _build_callback_notification(
-    entry: dict, session_id: str, now: float
+    entry: dict, key: str, now: float
 ) -> tuple[str, dict[str, str]]:
     due = float(entry.get("due_at", now))
-    created_for = entry.get("session_id", "?")
+    created_for = sessions.split_key(str(entry.get("session_id", "")))[1] or "?"
     late = int(now - due)
     recovered = (
         " (recovered after restart)" if late >= RECOVERED_THRESHOLD_SECONDS else ""
     )
     content = (
         f"Scheduled notification fired{recovered}. callback_id={entry.get('id')} "
-        f"session_id={session_id} (scheduled for {created_for}) "
+        f"session_id={sessions.split_key(key)[1]} (scheduled for {created_for}) "
         f"due_at={_iso(due)} now={_iso(now)} late_by={late}s"
     )
     meta = {
@@ -413,11 +397,19 @@ def _build_callback_notification(
 
 
 class Connection:
-    def __init__(self, websocket) -> None:
+    def __init__(self, websocket, account_id: str, credential_id: str) -> None:
         self.ws = websocket
-        self.session_id: str | None = None
+        self.account_id: str = account_id
+        self.credential_id: str = credential_id
+        # The session key this connection is attached to, or None.
+        self.session_key: str | None = None
         self.inflight: set[str] = set()  # notification ids sent, awaiting ack
         self.wake = asyncio.Event()  # set to nudge the dispatch loop to deliver now
+        self.dispatch_task: asyncio.Task | None = None
+
+    @property
+    def account(self) -> accounts.Account | None:
+        return ACCOUNTS.get(self.account_id)
 
 
 async def _safe_send(conn: Connection, payload: dict) -> bool:
@@ -428,48 +420,145 @@ async def _safe_send(conn: Connection, payload: dict) -> bool:
         return False
 
 
-def _wake(session_id: str | None) -> None:
-    """Nudge a session's dispatch loop to deliver newly-available notifications.
-    Setting an asyncio.Event is sync and safe to call from anywhere in the loop."""
-    if not session_id:
+async def _send_notify(conn: Connection, payload: dict) -> bool:
+    """Send a NOTIFY frame. While more than one connection is attached to the
+    session, the meta carries the count, so that the client can warn that
+    delivery is split."""
+    count = len(CONNECTIONS.get(conn.session_key or "", ()))
+    if count > 1:
+        payload = {**payload, "meta": {**payload["meta"], "connections": count}}
+    return await _safe_send(conn, payload)
+
+
+def _wake(key: str | None) -> None:
+    """Nudge the dispatch loops of a session's connections to deliver newly
+    available notifications. Setting an asyncio.Event is sync and safe anywhere."""
+    if not key:
         return
-    conn = CONNECTIONS.get(session_id)
-    if conn is not None:
+    for conn in CONNECTIONS.get(key, ()):
         conn.wake.set()
 
 
 def _wake_subscribers(tracker: pr_monitor.PRTracker) -> None:
     """Wake every connected subscriber of a tracker after new events are appended."""
-    for sid in tracker.subscribers:
-        _wake(sid)
+    for key in tracker.subscribers:
+        _wake(key)
 
 
-def _next_callback_timeout(session_id: str, now: float) -> float | None:
+def _session_key_for(conn: Connection, msg: dict) -> str | None:
+    """The session a request acts for: the attached session, else the frame's
+    ``session_id`` in the connection's account. None if there is neither."""
+    if conn.session_key:
+        return conn.session_key
+    session_id = msg.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    try:
+        sessions.validate_session_id(session_id)
+    except sessions.SessionError:
+        return None
+    return sessions.session_key(conn.account_id, session_id)
+
+
+_NOTICE_SEQ = itertools.count(1)
+
+
+async def _announce_connections(key: str) -> None:
+    """Tell every connection of a session how many connections it has, after the
+    count goes above one or back to one."""
+    conns = list(CONNECTIONS.get(key, ()))
+    count = len(conns)
+    if count > 1:
+        content = (
+            f"⚠️ {count} connections are attached to this session. Delivery can be "
+            "split or duplicated between them: a message that one connection acks "
+            "does not reach the others. This is usually a mistake, for example two "
+            "runs that use the same session id or name."
+        )
+    else:
+        content = (
+            "Only one connection is attached to this session now. Delivery is no "
+            "longer split."
+        )
+    payload = {
+        "type": proto.NOTIFY,
+        "id": f"connections:{next(_NOTICE_SEQ)}",
+        "content": content,
+        "meta": {
+            "kind": "multiple_connections",
+            "connections": count,
+            "level": "direct",
+            "threshold": "direct",
+        },
+    }
+    for conn in conns:
+        await _safe_send(conn, payload)
+
+
+async def _attach(conn: Connection, key: str) -> None:
+    """Attach a connection to a session, and detach it from its previous one."""
+    if conn.session_key == key:
+        return
+    await _detach(conn)
+    now = time.time()
+    conns = CONNECTIONS.setdefault(key, [])
+    conns.append(conn)
+    conn.session_key = key
+    conn.inflight.clear()
+    SESSIONS.ensure(key, now)
+    SESSIONS.touch(key, now, persist=True)
+    for tracker in TRACKERS.values():
+        if key in tracker.subscribers:
+            tracker.wake.set()  # resume polling for this session's PRs
+    if conn.dispatch_task is None:
+        conn.dispatch_task = asyncio.create_task(_dispatch_loop(conn))
+    else:
+        conn.wake.set()
+    if len(conns) > 1:
+        await _announce_connections(key)
+
+
+async def _detach(conn: Connection) -> None:
+    key = conn.session_key
+    if key is None:
+        return
+    conn.session_key = None
+    conns = CONNECTIONS.get(key, [])
+    if conn in conns:
+        conns.remove(conn)
+    if not conns:
+        CONNECTIONS.pop(key, None)
+    # The handle idle rule and session expiry count from here.
+    SESSIONS.touch(key, time.time(), persist=True)
+    if len(conns) == 1:
+        await _announce_connections(key)
+
+
+def _next_callback_timeout(key: str, now: float) -> float | None:
     """Seconds until this session's soonest not-yet-due scheduled callback, so the
     loop can sleep until it comes due; None if none are pending (wait for a wake)."""
-    upcoming = [
-        float(e.get("due_at", 0.0)) - now for e in scheduler.pending(session_id)
-    ]
+    upcoming = [float(e.get("due_at", 0.0)) - now for e in scheduler.pending(key)]
     future = [d for d in upcoming if d > 0]
     return min(future) if future else None
 
 
 async def _dispatch_loop(conn: Connection) -> None:
-    """Deliver undelivered notifications (callbacks + PR events) for this session.
+    """Deliver undelivered notifications (callbacks, PR events, messages) to the
+    session that this connection is attached to.
 
     Event-driven: each pass delivers everything currently deliverable, then blocks
     on the wake event until either new content arrives (_wake) or the soonest
     not-yet-due scheduled callback comes due. Idle with nothing pending costs zero CPU."""
     while True:
-        session_id = conn.session_id
+        key = conn.session_key
         timeout: float | None = None
-        if session_id:
+        if key:
             now = time.time()
-            for entry in scheduler.due_callbacks(session_id, now):
+            for entry in scheduler.due_callbacks(key, now):
                 callback_id = str(entry.get("id", ""))
                 if callback_id and callback_id not in conn.inflight:
-                    content, meta = _build_callback_notification(entry, session_id, now)
-                    if not await _safe_send(
+                    content, meta = _build_callback_notification(entry, key, now)
+                    if not await _send_notify(
                         conn,
                         {
                             "type": proto.NOTIFY,
@@ -481,13 +570,13 @@ async def _dispatch_loop(conn: Connection) -> None:
                         return
                     conn.inflight.add(callback_id)
             for tracker in list(TRACKERS.values()):
-                if session_id not in tracker.subscribers:
+                if key not in tracker.subscribers:
                     continue
                 # If events were dropped from the cache while this subscriber was
                 # away, surface a one-time "history truncated" notice ahead of the
                 # surviving events, so they know to check the PR for what was lost.
-                missed = tracker.missed.get(session_id, 0)
-                trunc_id = f"trunc:{tracker.storage_key}:{session_id}"
+                missed = tracker.missed.get(key, 0)
+                trunc_id = f"trunc:{tracker.storage_key}"
                 if missed > 0 and trunc_id not in conn.inflight:
                     content = (
                         f"⚠️ {tracker.key}: {missed} earlier update(s) were dropped "
@@ -500,7 +589,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                         "kind": "pr_truncated",
                         "pr": tracker.key,
                     }
-                    if not await _safe_send(
+                    if not await _send_notify(
                         conn,
                         {
                             "type": proto.NOTIFY,
@@ -511,7 +600,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                     ):
                         return
                     conn.inflight.add(trunc_id)
-                acked = tracker.acked.get(session_id, set())
+                acked = tracker.acked.get(key, set())
                 for event in tracker.events:
                     event_id = event["id"]
                     if event_id in acked:
@@ -525,12 +614,12 @@ async def _dispatch_loop(conn: Connection) -> None:
                         "content": event["content"],
                         "meta": event["meta"],
                     }
-                    if not await _safe_send(conn, payload):
+                    if not await _send_notify(conn, payload):
                         return
                     conn.inflight.add(nid)
-            if not await _deliver_messages(conn, session_id):
+            if not await _deliver_messages(conn, key):
                 return
-            timeout = _next_callback_timeout(session_id, now)
+            timeout = _next_callback_timeout(key, now)
         try:
             await asyncio.wait_for(conn.wake.wait(), timeout)
         except asyncio.TimeoutError:
@@ -538,228 +627,311 @@ async def _dispatch_loop(conn: Connection) -> None:
         conn.wake.clear()
 
 
+async def _handle_schedule(websocket, conn: Connection, msg: dict) -> None:
+    key = _session_key_for(conn, msg)
+    if key is None:
+        await _send(websocket, proto.ERROR, msg, error="no session id")
+        return
+    if (err := _limit_error(conn, key, "callbacks")) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
+    delay = max(0, int(msg.get("delay_seconds", 300)))
+    callback_id = scheduler.schedule(
+        key, time.time() + delay, kind=str(msg.get("kind", "scheduled"))
+    )
+    _wake(key)  # let the dispatch loop schedule its wake for the new due time
+    await _send(
+        websocket, proto.SCHEDULED, msg, id=callback_id, due_at=time.time() + delay
+    )
+
+
+# Frame type -> the account permission that it needs. Other frames need none.
+_FRAME_PERMISSIONS: dict[str, str] = {
+    proto.SCHEDULE: "schedule",
+    proto.LIST: "schedule",
+    proto.SUBSCRIBE_PR: "pr",
+    proto.UNSUBSCRIBE_PR: "pr",
+    proto.REFRESH_PR: "pr",
+    proto.LIST_PR_SUBSCRIPTIONS: "pr",
+    proto.SUBSCRIBE_FORGEJO_PR: "pr",
+    proto.UNSUBSCRIBE_FORGEJO_PR: "pr",
+    proto.REFRESH_FORGEJO_PR: "pr",
+    proto.LIST_FORGEJO_PR_SUBSCRIPTIONS: "pr",
+    proto.LIST_AGENTS: "messaging",
+    proto.SET_AVAILABILITY: "messaging",
+    proto.JOIN_CHANNEL: "messaging",
+    proto.LEAVE_CHANNEL: "messaging",
+    proto.POST: "messaging",
+    proto.DM: "messaging",
+    proto.SET_THRESHOLD: "messaging",
+    proto.SET_CHANNEL_TOPIC: "messaging",
+    proto.LIST_CHANNELS: "messaging",
+    proto.LIST_SUBSCRIPTIONS: "messaging",
+    proto.REACT: "messaging",
+    proto.MESSAGE_STATUS: "messaging",
+}
+
+
 async def _handle(websocket) -> None:
-    # Auth gate: validate the shared token once, at connect. The connection is
-    # trusted for its lifetime afterwards (we never re-check per message). Use a
-    # constant-time compare so a rejected connection's timing can't leak the token.
+    # Authenticate once, at connect. The account and the credential stay with the
+    # connection. _credential_check_loop closes it if the credential goes away.
+    ACCOUNTS.reload_if_changed()
     provided = websocket.request.headers.get(proto.AUTH_HEADER) or ""
-    if not hmac.compare_digest(provided, proto.auth_header_value(TOKEN)):
+    auth = ACCOUNTS.authenticate(provided, time.time())
+    if auth is None:
         await websocket.close(code=proto.UNAUTHORIZED_CLOSE_CODE, reason="unauthorized")
         return
-    conn = Connection(websocket)
-    dispatch_task: asyncio.Task | None = None
+    conn = Connection(websocket, *auth)
+    ALL_CONNECTIONS.add(conn)
     try:
         async for raw in websocket:
             try:
                 msg = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 continue
-            kind = msg.get("type")
-
-            if kind == proto.REGISTER:
-                new_sid = msg.get("session_id") or None
-                if (
-                    conn.session_id
-                    and CONNECTIONS.get(conn.session_id) is conn
-                    and conn.session_id != new_sid
-                ):
-                    del CONNECTIONS[conn.session_id]
-                conn.session_id = new_sid
-                if new_sid:
-                    CONNECTIONS[new_sid] = conn
-                    for tracker in TRACKERS.values():
-                        if new_sid in tracker.subscribers:
-                            tracker.wake.set()  # resume polling for this session's PRs
-                    if dispatch_task is None:
-                        dispatch_task = asyncio.create_task(_dispatch_loop(conn))
-                    if new_sid in SUPERSEDED:
-                        # A session whose name was taken over while it was away:
-                        # tell it an heir exists before it wonders why it's deaf.
-                        await _send_heir_notice(conn, new_sid)
-
-            elif kind == proto.SCHEDULE:
-                await _handle_schedule(websocket, conn, msg)
-
-            elif kind == proto.ACK:
-                _handle_ack(conn, msg)
-
-            elif kind == proto.LIST:
-                session_id = msg.get("session_id") or conn.session_id
-                items = (
-                    [
-                        {
-                            "id": e.get("id"),
-                            "due_at": e.get("due_at"),
-                            "kind": e.get("kind"),
-                        }
-                        for e in scheduler.pending(session_id)
-                    ]
-                    if session_id
-                    else []
-                )
-                await _send(websocket, proto.LIST_RESULT, msg, items=items)
-
-            elif kind == proto.SUBSCRIBE_PR:
-                await _handle_subscribe(websocket, conn, msg)
-
-            elif kind == proto.UNSUBSCRIBE_PR:
-                _handle_unsubscribe(conn, msg)
-                await _send(websocket, proto.UNSUBSCRIBED, msg, pr=_msg_key(msg))
-
-            elif kind == proto.LIST_PR_SUBSCRIPTIONS:
-                await _handle_list_pr_subscriptions(websocket, conn, msg)
-
-            elif kind == proto.SUBSCRIBE_FORGEJO_PR:
-                await _handle_subscribe(websocket, conn, msg, provider="forgejo")
-
-            elif kind == proto.UNSUBSCRIBE_FORGEJO_PR:
-                _handle_unsubscribe(conn, msg, provider="forgejo")
-                _uinst = _msg_instance(msg)  # named-only echo; default stays v1-shaped
-                await _send(
-                    websocket,
-                    proto.UNSUBSCRIBED,
-                    msg,
-                    pr=_msg_key(msg),
-                    **({"instance": _uinst} if _uinst else {}),
-                )
-
-            elif kind == proto.LIST_FORGEJO_PR_SUBSCRIPTIONS:
-                await _handle_list_pr_subscriptions(
-                    websocket, conn, msg, provider="forgejo"
-                )
-
-            elif kind == proto.REFRESH_PR:
-                await _handle_refresh(websocket, conn, msg)
-
-            elif kind == proto.REFRESH_FORGEJO_PR:
-                await _handle_refresh(websocket, conn, msg, provider="forgejo")
-
-            elif kind == proto.REGISTER_AGENT:
-                await _handle_register_agent(websocket, conn, msg)
-
-            elif kind == proto.UNREGISTER_AGENT:
-                await _handle_unregister_agent(websocket, conn, msg)
-
-            elif kind == proto.LIST_AGENTS:
-                await _handle_list_agents(websocket, conn, msg)
-
-            elif kind == proto.SET_AVAILABILITY:
-                await _handle_set_availability(websocket, conn, msg)
-
-            elif kind == proto.JOIN_CHANNEL:
-                await _handle_join_channel(websocket, conn, msg)
-
-            elif kind == proto.LEAVE_CHANNEL:
-                await _handle_leave_channel(websocket, conn, msg)
-
-            elif kind == proto.POST:
-                await _handle_post(websocket, conn, msg)
-
-            elif kind == proto.DM:
-                await _handle_dm(websocket, conn, msg)
-
-            elif kind == proto.SET_THRESHOLD:
-                await _handle_set_threshold(websocket, conn, msg)
-
-            elif kind == proto.SET_CHANNEL_TOPIC:
-                await _handle_set_channel_topic(websocket, conn, msg)
-
-            elif kind == proto.LIST_CHANNELS:
-                await _handle_list_channels(websocket, conn, msg)
-
-            elif kind == proto.LIST_SUBSCRIPTIONS:
-                await _handle_list_subscriptions(websocket, conn, msg)
-
-            elif kind == proto.REACT:
-                await _handle_react(websocket, conn, msg)
-
-            elif kind == proto.MESSAGE_STATUS:
-                await _handle_message_status(websocket, conn, msg)
-
-            else:
-                # No silent drops: an unknown type means a newer relay is speaking a verb
-                # this server predates. Reply ERROR so the skew fails loudly on the relay
-                # (which otherwise blocks on a reply that never comes) instead of hanging.
-                await _send(
-                    websocket,
-                    proto.ERROR,
-                    msg,
-                    error=f"unknown message type: {kind}",
-                )
+            if not isinstance(msg, dict):
+                continue
+            if conn.session_key:
+                SESSIONS.touch(conn.session_key, time.time(), persist=False)
+            await _handle_frame(conn, msg)
     except ConnectionClosed:
         pass
     finally:
-        if dispatch_task is not None:
-            dispatch_task.cancel()
-        # Stamp last_seen so the name-reclaim grace clock starts from now; presence
-        # flips to offline automatically once the connection leaves CONNECTIONS.
-        if conn.session_id:
-            REGISTRY.touch(conn.session_id, time.time())
-        if conn.session_id and CONNECTIONS.get(conn.session_id) is conn:
-            del CONNECTIONS[conn.session_id]
+        ALL_CONNECTIONS.discard(conn)
+        if conn.dispatch_task is not None:
+            conn.dispatch_task.cancel()
+        await _detach(conn)
 
 
-async def _handle_schedule(websocket, conn: Connection, msg: dict) -> None:
-    session_id = msg.get("session_id") or conn.session_id
-    if not session_id:
-        await _send(websocket, proto.ERROR, msg, error="no session id")
+async def _handle_frame(conn: Connection, msg: dict) -> None:
+    websocket = conn.ws
+    kind = msg.get("type")
+    account = conn.account
+    if account is None:  # removed from the accounts file since connect
+        await websocket.close(
+            code=proto.UNAUTHORIZED_CLOSE_CODE, reason="account removed"
+        )
         return
-    delay = max(0, int(msg.get("delay_seconds", 300)))
-    callback_id = scheduler.schedule(
-        session_id, time.time() + delay, kind=str(msg.get("kind", "scheduled"))
-    )
-    _wake(session_id)  # let the dispatch loop schedule its wake for the new due time
+    permission = _FRAME_PERMISSIONS.get(kind) if isinstance(kind, str) else None
+    if permission is not None and permission not in account.permissions:
+        await _send(websocket, proto.ERROR, msg, error=f"forbidden: {permission}")
+        return
+
+    if kind == proto.REGISTER:
+        await _handle_register(conn, msg)
+
+    elif kind == proto.WHOAMI:
+        await _handle_whoami(conn, msg)
+
+    elif kind == proto.SCHEDULE:
+        await _handle_schedule(websocket, conn, msg)
+
+    elif kind == proto.ACK:
+        _handle_ack(conn, msg)
+
+    elif kind == proto.LIST:
+        key = _session_key_for(conn, msg)
+        items = (
+            [
+                {
+                    "id": e.get("id"),
+                    "due_at": e.get("due_at"),
+                    "kind": e.get("kind"),
+                }
+                for e in scheduler.pending(key)
+            ]
+            if key
+            else []
+        )
+        await _send(websocket, proto.LIST_RESULT, msg, items=items)
+
+    elif kind == proto.SUBSCRIBE_PR:
+        await _handle_subscribe(websocket, conn, msg)
+
+    elif kind == proto.UNSUBSCRIBE_PR:
+        _handle_unsubscribe(conn, msg)
+        await _send(websocket, proto.UNSUBSCRIBED, msg, pr=_msg_key(msg))
+
+    elif kind == proto.LIST_PR_SUBSCRIPTIONS:
+        await _handle_list_pr_subscriptions(websocket, conn, msg)
+
+    elif kind == proto.SUBSCRIBE_FORGEJO_PR:
+        await _handle_subscribe(websocket, conn, msg, provider="forgejo")
+
+    elif kind == proto.UNSUBSCRIBE_FORGEJO_PR:
+        _handle_unsubscribe(conn, msg, provider="forgejo")
+        _uinst = _msg_instance(msg)  # named-only echo; default stays v1-shaped
+        await _send(
+            websocket,
+            proto.UNSUBSCRIBED,
+            msg,
+            pr=_msg_key(msg),
+            **({"instance": _uinst} if _uinst else {}),
+        )
+
+    elif kind == proto.LIST_FORGEJO_PR_SUBSCRIPTIONS:
+        await _handle_list_pr_subscriptions(websocket, conn, msg, provider="forgejo")
+
+    elif kind == proto.REFRESH_PR:
+        await _handle_refresh(websocket, conn, msg)
+
+    elif kind == proto.REFRESH_FORGEJO_PR:
+        await _handle_refresh(websocket, conn, msg, provider="forgejo")
+
+    elif kind == proto.REGISTER_AGENT:
+        await _handle_register_agent(websocket, conn, msg)
+
+    elif kind == proto.UNREGISTER_AGENT:
+        await _handle_unregister_agent(websocket, conn, msg)
+
+    elif kind == proto.LIST_AGENTS:
+        await _handle_list_agents(websocket, conn, msg)
+
+    elif kind == proto.SET_AVAILABILITY:
+        await _handle_set_availability(websocket, conn, msg)
+
+    elif kind == proto.JOIN_CHANNEL:
+        await _handle_join_channel(websocket, conn, msg)
+
+    elif kind == proto.LEAVE_CHANNEL:
+        await _handle_leave_channel(websocket, conn, msg)
+
+    elif kind == proto.POST:
+        await _handle_post(websocket, conn, msg)
+
+    elif kind == proto.DM:
+        await _handle_dm(websocket, conn, msg)
+
+    elif kind == proto.SET_THRESHOLD:
+        await _handle_set_threshold(websocket, conn, msg)
+
+    elif kind == proto.SET_CHANNEL_TOPIC:
+        await _handle_set_channel_topic(websocket, conn, msg)
+
+    elif kind == proto.LIST_CHANNELS:
+        await _handle_list_channels(websocket, conn, msg)
+
+    elif kind == proto.LIST_SUBSCRIPTIONS:
+        await _handle_list_subscriptions(websocket, conn, msg)
+
+    elif kind == proto.REACT:
+        await _handle_react(websocket, conn, msg)
+
+    elif kind == proto.MESSAGE_STATUS:
+        await _handle_message_status(websocket, conn, msg)
+
+    else:
+        # No silent drops: an unknown type means a newer client is speaking a verb
+        # this server predates. Reply ERROR so the skew fails loudly on the client
+        # (which otherwise blocks on a reply that never comes) instead of hanging.
+        await _send(
+            websocket,
+            proto.ERROR,
+            msg,
+            error=f"unknown message type: {kind}",
+        )
+
+
+async def _handle_register(conn: Connection, msg: dict) -> None:
+    """Attach the connection to a session. A session id ``@<handle>`` attaches to
+    the session that holds the handle in this account, or else to a new session
+    with that id, which then takes the handle."""
+    session_id = msg.get("session_id") or None
+    if session_id is None:
+        await _detach(conn)
+        return
+    try:
+        if not isinstance(session_id, str):
+            raise sessions.InvalidSessionId(f"invalid session id {session_id!r}")
+        sessions.validate_session_id(session_id)
+        handle = ""
+        if session_id.startswith(sessions.HANDLE_SESSION_PREFIX):
+            handle = session_id[len(sessions.HANDLE_SESSION_PREFIX) :]
+            sessions.validate_name(handle)
+    except sessions.SessionError as exc:
+        await _send(conn.ws, proto.ERROR, msg, error=str(exc))
+        return
+    if handle:
+        holder = SESSIONS.by_handle(conn.account_id, handle)
+        if holder is not None:
+            await _attach(conn, holder.key)
+            return
+    key = sessions.session_key(conn.account_id, session_id)
+    await _attach(conn, key)
+    if handle and SESSIONS.by_handle(conn.account_id, handle) is None:
+        SESSIONS.register_handle(
+            key,
+            handle,
+            now=time.time(),
+            is_live=_live,
+            idle=_handle_idle_seconds(),
+        )
+        _wake(key)
+
+
+async def _handle_whoami(conn: Connection, msg: dict) -> None:
+    account = conn.account
+    assert account is not None  # _handle_frame checked it
+    key = conn.session_key
+    record = SESSIONS.get(key) if key else None
+    limits = {
+        name: getattr(account.limits, name)
+        for name in accounts.Limits.__dataclass_fields__
+    }
     await _send(
-        websocket, proto.SCHEDULED, msg, id=callback_id, due_at=time.time() + delay
+        conn.ws,
+        proto.WHOAMI_RESULT,
+        msg,
+        account=account.id,
+        label=account.label,
+        default_account=ACCOUNTS.default_id,
+        permissions=sorted(account.permissions),
+        channels=list(account.channels) if account.channels is not None else None,
+        max_severity=account.max_severity,
+        limits=limits,
+        session_id=sessions.split_key(key)[1] if key else None,
+        handle=record.handle if record is not None else "",
+        connections=len(CONNECTIONS.get(key, ())) if key else 0,
     )
 
 
 def _handle_ack(conn: Connection, msg: dict) -> None:
     nid = msg.get("id")
-    if not nid:
+    key = conn.session_key
+    if not isinstance(nid, str) or not nid or key is None:
         return
-    # Any ack means this session's relay just surfaced a delivery into a runnable
+    # Any ack means this session's client just surfaced a delivery into a runnable
     # context — stamp last_acked for the context-wedge liveness signal (a connected
     # session that stops acking while messages pend is the wedge fingerprint).
-    if conn.session_id:
-        REGISTRY.mark_acked(conn.session_id, time.time())
-    if isinstance(nid, str) and nid.startswith("trunc:"):
-        # trunc:{storage_key}:{sid} — the trailing session id never contains ':', so
-        # rpartition(':') peels it off cleanly, leaving the storage key (which may carry
-        # a "<provider>:" prefix for non-github PRs, plus '/' and '#') intact for lookup.
-        # Acking the notice clears the missed counter until the next truncation.
-        key, _, session_id = nid[len("trunc:") :].rpartition(":")
-        tracker = TRACKERS.get(key)
-        if tracker is not None and session_id in tracker.subscribers:
-            tracker.missed[session_id] = 0
-            pr_monitor.save_subscriber(tracker, session_id)
+    SESSIONS.mark_acked(key, time.time())
+    if nid.startswith("trunc:"):
+        # trunc:{storage_key}. Acking the notice clears the missed counter until
+        # the next truncation.
+        tracker = TRACKERS.get(nid[len("trunc:") :])
+        if tracker is not None and key in tracker.subscribers:
+            tracker.missed[key] = 0
+            pr_monitor.save_subscriber(tracker, key)
         conn.inflight.discard(nid)
-    elif isinstance(nid, str) and nid.startswith("pr:"):
-        key, _, event_id = nid[3:].rpartition(":")
-        tracker = TRACKERS.get(key)
-        if tracker is not None and conn.session_id and conn.session_id in tracker.acked:
-            tracker.acked[conn.session_id].add(event_id)
+    elif nid.startswith("pr:"):
+        storage_key, _, event_id = nid[3:].rpartition(":")
+        tracker = TRACKERS.get(storage_key)
+        if tracker is not None and key in tracker.acked:
+            tracker.acked[key].add(event_id)
             conn.inflight.discard(nid)
-            pr_monitor.save_subscriber(tracker, conn.session_id)
-            _finalize_terminal(tracker, conn.session_id)
-    elif isinstance(nid, str) and nid.startswith("msg:"):
+            pr_monitor.save_subscriber(tracker, key)
+            _finalize_terminal(tracker, key)
+    elif nid.startswith("msg:"):
         # nid is the message id "msg:<topic_key>:<seq>". The topic key itself carries
         # a ':' ("chan:"/"dm:") but the trailing seq never does, so rpartition(':')
         # peels the seq off and the remainder (after the "msg:" prefix) is the key.
         topic_key, _, _seq = nid[len("msg:") :].rpartition(":")
         topic = TOPICS.get(topic_key)
-        # Membership is keyed by agent NAME (name = service, session = process), so
-        # the acking session is resolved to its registered name first. A session that
-        # has been displaced from its name resolves to no record and cannot ack —
-        # that is the generation fencing falling out of delivery-time resolution.
-        record = REGISTRY.get_by_session(conn.session_id) if conn.session_id else None
-        if topic is not None and record is not None and record.name in topic.members:
-            topic.acked.setdefault(record.name, set()).add(nid)
+        if topic is not None and key in topic.members:
+            topic.acked.setdefault(key, set()).add(nid)
             conn.inflight.discard(nid)
-            message_topic.save_subscriber(settings.data_dir(), topic, record.name)
+            message_topic.save_subscriber(settings.data_dir(), topic, key)
     else:
-        if conn.session_id:
-            scheduler.delete(conn.session_id, nid)
+        scheduler.delete(key, nid)
         conn.inflight.discard(nid)
 
 
@@ -819,9 +991,9 @@ def _msg_storage_key(msg: dict, provider: str) -> str:
 async def _handle_subscribe(
     websocket, conn: Connection, msg: dict, provider: str = "github"
 ) -> None:
-    session_id = conn.session_id or msg.get("session_id")
+    key = _session_key_for(conn, msg)
     owner, repo, number = msg.get("owner"), msg.get("repo"), msg.get("number")
-    if not session_id or not owner or not repo or number is None:
+    if not key or not owner or not repo or number is None:
         await _send(
             websocket, proto.ERROR, msg, error="missing session id or PR reference"
         )
@@ -831,10 +1003,14 @@ async def _handle_subscribe(
         await _send(websocket, proto.ERROR, msg, error=err)
         return
     client = _pr_client(provider, instance)
-    key = pr_monitor.pr_key(owner, repo, number)  # display ref for replies/errors
+    pr_ref = pr_monitor.pr_key(owner, repo, number)  # display ref for replies/errors
     # TRACKERS/dir key — alias-tagged for a named forgejo instance, unprefixed default.
     skey = pr_monitor.storage_key(provider, owner, repo, number, instance)
     tracker = TRACKERS.get(skey)
+    if tracker is None or key not in tracker.subscribers:
+        if (err := _limit_error(conn, key, "pr_subscriptions")) is not None:
+            await _send(websocket, proto.ERROR, msg, error=err)
+            return
 
     if tracker is None:
         tracker = pr_monitor.PRTracker(
@@ -850,7 +1026,7 @@ async def _handle_subscribe(
             summary = await tracker.initial_poll()
         except Exception as exc:  # noqa: BLE001 - report any fetch failure to the agent
             await _send(
-                websocket, proto.ERROR, msg, error=f"could not fetch {key}: {exc}"
+                websocket, proto.ERROR, msg, error=f"could not fetch {pr_ref}: {exc}"
             )
             return
         TRACKERS[skey] = tracker
@@ -870,7 +1046,7 @@ async def _handle_subscribe(
             websocket,
             proto.SUBSCRIBED,
             msg,
-            pr=key,
+            pr=pr_ref,
             summary=summary,
             merged=tracker.merged,
             closed=True,
@@ -878,24 +1054,22 @@ async def _handle_subscribe(
         )
         return
 
-    tracker.subscribers.add(session_id)
+    tracker.subscribers.add(key)
     tracker.idle_since = None  # reactivated; clear any warm marker
     pr_monitor.save_state(
         tracker
     )  # persist so a restart in the gap can't re-idle/reap it
-    tracker.acked[session_id] = set(
-        tracker.event_ids
-    )  # join without replaying old events
-    tracker.missed[session_id] = 0  # caught up by definition; no truncation to report
-    pr_monitor.save_subscriber(tracker, session_id)
+    tracker.acked[key] = set(tracker.event_ids)  # join without replaying old events
+    tracker.missed[key] = 0  # caught up by definition; no truncation to report
+    pr_monitor.save_subscriber(tracker, key)
     tracker.wake.set()  # resume polling for this PR
-    _wake(session_id)  # deliver any catch-up / future events immediately
+    _wake(key)  # deliver any catch-up / future events immediately
     inst = {"instance": instance} if instance else {}  # named-only echo (see above)
     await _send(
         websocket,
         proto.SUBSCRIBED,
         msg,
-        pr=key,
+        pr=pr_ref,
         summary=summary,
         merged=tracker.merged,
         closed=False,
@@ -904,14 +1078,19 @@ async def _handle_subscribe(
 
 
 def _handle_unsubscribe(conn: Connection, msg: dict, provider: str = "github") -> None:
-    session_id = conn.session_id or msg.get("session_id")
-    skey = _msg_storage_key(msg, provider)
-    tracker = TRACKERS.get(skey)
-    if tracker is not None and session_id in tracker.subscribers:
-        tracker.subscribers.discard(session_id)
-        tracker.acked.pop(session_id, None)
-        tracker.missed.pop(session_id, None)
-        pr_monitor.delete_subscriber(tracker, session_id)
+    key = _session_key_for(conn, msg)
+    tracker = TRACKERS.get(_msg_storage_key(msg, provider))
+    if tracker is not None and key is not None:
+        _unsubscribe(tracker, key)
+
+
+def _unsubscribe(tracker: pr_monitor.PRTracker, key: str) -> None:
+    if key in tracker.subscribers:
+        skey = tracker.storage_key
+        tracker.subscribers.discard(key)
+        tracker.acked.pop(key, None)
+        tracker.missed.pop(key, None)
+        pr_monitor.delete_subscriber(tracker, key)
         if not tracker.subscribers:
             # Keep a non-terminal tracker warm (polling auto-suspends with no
             # subscribers) so a quick re-subscribe reuses its cached snapshot; the
@@ -927,12 +1106,12 @@ def _handle_unsubscribe(conn: Connection, msg: dict, provider: str = "github") -
 async def _handle_list_pr_subscriptions(
     websocket, conn: Connection, msg: dict, provider: str = "github"
 ) -> None:
-    session_id = conn.session_id or msg.get("session_id")
+    key = _session_key_for(conn, msg)
     items = [
         {
             "pr": t.key,  # human-facing ref (owner/repo#number), not the storage key
             "merged": t.merged,
-            "pending": len(t.unacked_for(session_id)),
+            "pending": len(t.unacked_for(key)),
             # Named-instance alias so the relay can render "<alias>:owner/repo#n";
             # omitted for the default instance (and github) so those items stay v1-shaped.
             **(
@@ -942,7 +1121,7 @@ async def _handle_list_pr_subscriptions(
             ),
         }
         for t in TRACKERS.values()
-        if session_id in t.subscribers and t.provider == provider
+        if key in t.subscribers and t.provider == provider
     ]
     await _send(websocket, proto.SUBSCRIPTIONS_RESULT, msg, items=items)
 
@@ -969,7 +1148,7 @@ async def _handle_refresh(
     reason: str | None = None
     if tracker.terminal:
         reason = "merged" if tracker.merged else "closed or gone"
-    elif not any(s in CONNECTIONS for s in tracker.subscribers):
+    elif not any(_live(k) for k in tracker.subscribers):
         reason = "no connected subscribers"
     else:
         throttle_until = (
@@ -989,175 +1168,211 @@ async def _handle_refresh(
 
 
 # --------------------------------------------------------------------------- #
-# agent directory handling (Phase A)
+# handles: the agent directory
 # --------------------------------------------------------------------------- #
 
 
+def _agent_view(record: sessions.SessionRecord, reader_account: str) -> dict:
+    """A session record as the wire AgentRecord, for a reader in ``reader_account``.
+    The session id is visible only in the same account. Deprecated fields get stub
+    values."""
+    return {
+        "name": sessions.display_handle(record, reader_account),
+        "session_id": record.session_id if record.account == reader_account else "",
+        "description": record.description,
+        "capabilities": record.capabilities,
+        "working_dir": "",
+        "default_threshold": record.default_threshold,
+        "registered_at": record.registered_at,
+        "last_seen": record.last_seen,
+        "reclaim_key_hash": "",
+        "generation": 1,
+        "last_acked": record.last_acked,
+        "account": record.account,
+    }
+
+
 async def _handle_register_agent(websocket, conn: Connection, msg: dict) -> None:
-    session_id = conn.session_id or msg.get("session_id")
-    if not session_id:
+    key = _session_key_for(conn, msg)
+    if not key:
         await _send(websocket, proto.ERROR, msg, error="no session id")
         return
     name = msg.get("name")
-    if not name:
+    if not name or not isinstance(name, str):
         await _send(websocket, proto.ERROR, msg, error="missing agent name")
         return
-    prior = _registry_by_name(name)  # pre-register holder, for succession detection
     try:
-        record = REGISTRY.register(
-            session_id,
+        record, displaced = SESSIONS.register_handle(
+            key,
             name,
             now=time.time(),
-            is_session_live=_session_live,
-            ttl=_agent_ttl_seconds(),
-            settle=_reclaim_settle_seconds(),
+            is_live=_live,
+            idle=_handle_idle_seconds(),
+            takeover=bool(msg.get("takeover")),
             description=msg.get("description") or "",
             capabilities=msg.get("capabilities") or "",
-            working_dir=msg.get("working_dir") or "",
             default_threshold=msg.get("default_threshold"),
-            reclaim_key=msg.get("reclaim_key"),
         )
-    except agent_registry.AgentRegistryError as exc:
+    except sessions.SessionError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
-    # Taking a name grants its topic memberships (membership is name-keyed), so any
-    # messages the name accrued while unheld — or that a displaced predecessor never
-    # surfaced — are deliverable NOW. Nudge this session's dispatch loop; without
-    # this, a successor would wait for the next unrelated wake.
-    _wake(record.session_id)
-    if prior is not None and prior.session_id != record.session_id:
-        await _announce_succession(record, prior.session_id)
-    await _send(websocket, proto.AGENT_OK, msg, agent=record.to_dict())
-
-
-async def _announce_succession(
-    record: agent_registry.AgentRecord, prior_sid: str
-) -> None:
-    """Surface a name transfer (docs/specs/2026-07-09 slice d): a fleet-visible,
-    ambient post in the well-known #system channel — knowing a handoff happened
-    explains behavior the way knowing a pod rolled explains a cold cache — plus a
-    direct heir notice to the superseded session if it is still connected, enabling
-    an explicit predecessor->heir handoff (the predecessor can DM the name it used
-    to hold; delivery-time resolution routes that to the heir)."""
-    gen = record.generation
-    topic = _get_or_create_topic("chan:system", "channel")
-    message = topic.post(
-        "system",
-        now=time.time(),
-        body=f"⟳ succession: {record.name} gen {gen - 1}→{gen}",
-        intent="fyi",
-        severity="low",
-        ordinal=_alloc_ordinal(),
+    if displaced is not None:
+        await _send_handle_lost(displaced, name, conn.account_id)
+    await _send(
+        websocket, proto.AGENT_OK, msg, agent=_agent_view(record, conn.account_id)
     )
-    # Not _persist_post: "system" is an author, not a member — pre-acking it would
-    # write a sub file that load_topic would resurrect as a phantom member.
-    message_topic.append_messages(settings.data_dir(), topic, [message])
-    message_topic.save_state(settings.data_dir(), topic)
-    _wake_topic_members(topic)
-    # Queue the heir notice for the superseded session. A live holder is never
-    # displaced, so the predecessor is by definition NOT connected at succession
-    # time — the notice is held and shipped if/when that session reconnects (a
-    # briefly-dropped predecessor coming back is exactly the case that needs it).
-    SUPERSEDED[prior_sid] = {"name": record.name, "generation": gen}
-    conn = CONNECTIONS.get(prior_sid)
-    if conn is not None:  # belt: ship now if a connection somehow still exists
-        await _send_heir_notice(conn, prior_sid)
 
 
-async def _send_heir_notice(conn: Connection, session_id: str) -> None:
-    """Tell a superseded session that an heir holds its old name, enabling an
-    explicit predecessor->heir handoff. One-shot: dropped from SUPERSEDED once
-    sent (a server restart also clears it — this is a ceremony, not a contract)."""
-    entry = SUPERSEDED.get(session_id)
-    if entry is None:
-        return
-    name, gen = entry["name"], entry["generation"]
+async def _send_handle_lost(key: str, handle: str, account_id: str) -> None:
+    """Tell a session whose handle another session took. Only connected sessions
+    get the notice."""
     payload = {
         "type": proto.NOTIFY,
-        "id": f"succession:{name}:{gen}",
+        "id": f"handle_lost:{next(_NOTICE_SEQ)}",
         "content": (
-            f"⟳ an heir has appeared: '{name}' is now gen {gen}, held by another "
-            "session. You no longer hold this name — you cannot send or ack as it, "
-            "and a DM to it reaches your successor. To hand off in-flight work, "
-            "re-register under a different name and message your old one."
+            f"⟳ Another session took over your name '{handle}'. You no longer hold "
+            "it: you cannot send messages until you register a name, and DMs to "
+            f"'{handle}' now reach the other session. Your channel memberships and "
+            "your unread messages stay with this session."
         ),
-        "meta": {"kind": "succession", "level": "direct", "threshold": "direct"},
+        "meta": {
+            "kind": "handle_lost",
+            "handle": handle,
+            "level": "direct",
+            "threshold": "direct",
+        },
     }
-    if await _safe_send(conn, payload):
-        conn.inflight.add(payload["id"])
-        SUPERSEDED.pop(session_id, None)
+    for conn in CONNECTIONS.get(key, ()):
+        await _send_notify(conn, payload)
 
 
 async def _handle_unregister_agent(websocket, conn: Connection, msg: dict) -> None:
-    session_id = conn.session_id or msg.get("session_id")
-    if not session_id:
+    """Release the session's handle and leave every channel and DM."""
+    key = _session_key_for(conn, msg)
+    if not key:
         await _send(websocket, proto.ERROR, msg, error="no session id")
         return
-    record = REGISTRY.unregister(session_id)
+    before = SESSIONS.release_handle(key)
+    if before is not None:
+        _leave_all_topics(key)
     await _send(
         websocket,
         proto.AGENT_OK,
         msg,
-        agent=record.to_dict() if record is not None else None,
+        agent=_agent_view(before, conn.account_id) if before is not None else None,
     )
 
 
+def _leave_all_topics(key: str) -> None:
+    for topic in list(TOPICS.values()):
+        if key in topic.members:
+            topic.leave(key)
+            message_topic.delete_subscriber(settings.data_dir(), topic, key)
+            message_topic.save_state(settings.data_dir(), topic)
+
+
 async def _handle_set_availability(websocket, conn: Connection, msg: dict) -> None:
-    session_id = conn.session_id or msg.get("session_id")
-    if not session_id:
+    key = _session_key_for(conn, msg)
+    if not key:
         await _send(websocket, proto.ERROR, msg, error="no session id")
         return
     try:
-        record = REGISTRY.set_availability(session_id, msg.get("default_threshold"))
-    except agent_registry.AgentRegistryError as exc:
+        record = SESSIONS.set_threshold(key, msg.get("default_threshold") or "")
+    except sessions.SessionError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
-    await _send(websocket, proto.AGENT_OK, msg, agent=record.to_dict())
+    await _send(
+        websocket, proto.AGENT_OK, msg, agent=_agent_view(record, conn.account_id)
+    )
 
 
 async def _handle_list_agents(websocket, conn: Connection, msg: dict) -> None:
     agents = [
-        {**record.to_dict(), "connected": record.session_id in CONNECTIONS}
-        for record in REGISTRY.list()
+        {**_agent_view(record, conn.account_id), "connected": _live(record.key)}
+        for record in SESSIONS.list()
+        if record.handle
     ]
     await _send(websocket, proto.AGENT_LIST, msg, agents=agents)
 
 
 # --------------------------------------------------------------------------- #
-# agent messaging (Phase B): channels + DMs over the message-topic primitive
+# agent messaging: channels + DMs over the message-topic primitive
 # --------------------------------------------------------------------------- #
 
 
 async def _resolve_sender(
     websocket, conn: Connection, msg: dict
-) -> tuple[str | None, agent_registry.AgentRecord | None]:
-    """Resolve (session_id, agent record) for a messaging request, or (None, None)
-    after sending an ERROR. Every messaging op requires the caller to be a registered
-    agent: that is what guarantees a display name (for `from`/mentions/DM addressing)
-    and a global wake-threshold default."""
-    session_id = conn.session_id or msg.get("session_id")
-    if not session_id:
+) -> tuple[str | None, sessions.SessionRecord | None]:
+    """Resolve (session key, record) for a messaging request, or (None, None)
+    after sending an ERROR. A messaging request needs a handle: other sessions see
+    it as the sender."""
+    key = _session_key_for(conn, msg)
+    if not key:
         await _send(websocket, proto.ERROR, msg, error="no session id")
         return None, None
-    record = REGISTRY.get_by_session(session_id)
-    if record is None:
+    record = SESSIONS.get(key)
+    if record is None or not record.handle:
         await _send(websocket, proto.ERROR, msg, error="register_agent first")
         return None, None
-    return session_id, record
+    return key, record
 
 
-def _registry_by_name(name: str) -> agent_registry.AgentRecord | None:
-    for record in REGISTRY.list():
-        if record.name == name:
-            return record
-    return None
+def _resolve_handle(ref: str, own_account: str) -> sessions.SessionRecord | None:
+    """The session that holds ``handle`` or ``handle@account``, or None."""
+    try:
+        account, handle = sessions.parse_handle_ref(ref.removeprefix("@"), own_account)
+    except sessions.SessionError:
+        return None
+    return SESSIONS.by_handle(account, handle)
 
 
-def _member_names(topic: message_topic.MessageTopic) -> list[str]:
-    """A topic's member names, sorted. Membership is keyed by agent name (a pre-
-    migration session-id key would render raw, but startup migration converts or
-    drops those)."""
-    return sorted(topic.members)
+def _qualified(record: sessions.SessionRecord) -> str:
+    return f"{record.handle}@{record.account}"
+
+
+def _member_display(key: str, reader_account: str) -> str:
+    """How a topic member appears to a reader: its handle, or a placeholder for a
+    session that holds none."""
+    record = SESSIONS.get(key)
+    if record is not None and record.handle:
+        return sessions.display_handle(record, reader_account)
+    account, session_id = sessions.split_key(key)
+    if account == reader_account:
+        return f"(session {session_id})"
+    return f"(unnamed@{account})"
+
+
+def _sender_display(message: message_topic.Message, reader_account: str) -> str:
+    """The sender as a reader sees it: the handle it held when it posted, bare in
+    the reader's account, else qualified."""
+    if "/" not in message.sender:  # "system"
+        return message.sender
+    account = sessions.split_key(message.sender)[0]
+    handle = message.sender_handle or "(unnamed)"
+    return handle if account == reader_account else f"{handle}@{account}"
+
+
+def _sender_account(message: message_topic.Message) -> str:
+    return sessions.split_key(message.sender)[0] if "/" in message.sender else ""
+
+
+def _mentions_display(message: message_topic.Message, reader_account: str) -> list[str]:
+    """Mentions are session keys for handles that resolved at post time, and raw
+    strings otherwise."""
+    return [
+        _member_display(m, reader_account) if "/" in m else m for m in message.mentions
+    ]
+
+
+def _message_view(message: message_topic.Message, reader_account: str) -> dict:
+    view = message.to_dict()
+    del view["sender_handle"]
+    return {
+        **view,
+        "sender": _sender_display(message, reader_account),
+        "mentions": _mentions_display(message, reader_account),
+        "account": _sender_account(message),
+    }
 
 
 def _channel_name(topic: message_topic.MessageTopic) -> str:
@@ -1189,7 +1404,9 @@ def _handle_prefix(message: message_topic.Message) -> str:
 
 
 def _render_reaction(
-    topic: message_topic.MessageTopic, message: message_topic.Message
+    topic: message_topic.MessageTopic,
+    message: message_topic.Message,
+    reader_account: str,
 ) -> str:
     """Render a reaction against the message it targets, e.g.
     `#150 [#room] agent-b reacted "👍" to #147 (agent-a's "<snippet>")`. The line leads
@@ -1197,93 +1414,97 @@ def _render_reaction(
     been compacted out of the log, fall back to a generic `… to an earlier message`."""
     prefix = _topic_prefix(topic)
     lead = _handle_prefix(message)
+    sender = _sender_display(message, reader_account)
     target = next((m for m in topic.messages if m.id == message.target), None)
     if target is None:
-        return (
-            f'{lead}{prefix} {message.sender} reacted "{message.body}" '
-            "to an earlier message"
-        )
+        return f'{lead}{prefix} {sender} reacted "{message.body}" to an earlier message'
     target_handle = _msg_handle(target)
     ref = f"{target_handle} " if target_handle else ""
     return (
-        f'{lead}{prefix} {message.sender} reacted "{message.body}" to '
-        f'{ref}({target.sender}\'s "{_snippet(target.body)}")'
+        f'{lead}{prefix} {sender} reacted "{message.body}" to '
+        f"{ref}({_sender_display(target, reader_account)}'s "
+        f'"{_snippet(target.body)}")'
     )
 
 
 def _render_message(
-    topic: message_topic.MessageTopic, message: message_topic.Message, addressed: bool
+    topic: message_topic.MessageTopic,
+    message: message_topic.Message,
+    addressed: bool,
+    reader_account: str,
 ) -> str:
     """The one-line rendering a recipient sees. Every line leads with the message's
     `#N` handle (omitted only for a legacy/unset ordinal). DMs read
     `#N [dm] sender: body`; channels read `#N [#name] sender: body`; an addressed (DM /
     mentioned / @here) message gets a trailing ` (→ you)` marker so the recipient can
-    tell it was aimed at them. A reaction renders against its target instead (see
+    tell it was aimed at them. A sender in another account shows as
+    `handle@account`. A reaction renders against its target instead (see
     `_render_reaction`)."""
     if message.intent == "reaction":
-        return _render_reaction(topic, message)
+        return _render_reaction(topic, message, reader_account)
     marker = " (→ you)" if addressed else ""
     return (
         f"{_handle_prefix(message)}{_topic_prefix(topic)} "
-        f"{message.sender}: {message.body}{marker}"
+        f"{_sender_display(message, reader_account)}: {message.body}{marker}"
     )
 
 
 def _wake_topic_members(topic: message_topic.MessageTopic) -> None:
     """Nudge every member's dispatch loop after a new message is appended, so each
-    delivers it on the next pass (mirrors _wake_subscribers for PR trackers).
-    Members are names; each is resolved to whichever session currently holds it —
-    delivery-time resolution is what routes a thread to a name's successor."""
-    for name in topic.members:
-        record = _registry_by_name(name)
-        if record is not None:
-            _wake(record.session_id)
+    delivers it on the next pass (mirrors _wake_subscribers for PR trackers)."""
+    for key in topic.members:
+        _wake(key)
 
 
-async def _deliver_messages(conn: Connection, session_id: str) -> bool:
+async def _deliver_messages(conn: Connection, key: str) -> bool:
     """Ship every not-yet-acked message in every topic this session belongs to.
 
     Sender-side loudness only: each NOTIFY is stamped with the per-recipient `level`
-    (compute_level) and `threshold` (the per-topic override or the agent's default) so
-    the shim can make the surface-vs-hold decision. The server never gates — it ships
-    eagerly, exactly as the PR path does. Returns False if the send failed (so the
-    dispatch loop tears down), True otherwise."""
-    record = REGISTRY.get_by_session(session_id)
-    if record is None:  # unregistered session: no name, so no memberships
-        return True
+    (compute_level) and `threshold` (the per-topic override or the session's default)
+    so the client can make the surface-vs-hold decision. The server never gates — it
+    ships eagerly, exactly as the PR path does. Returns False if the send failed (so
+    the dispatch loop tears down), True otherwise."""
+    record = SESSIONS.get(key)
+    default_threshold = (
+        record.default_threshold if record is not None else sessions.DEFAULT_THRESHOLD
+    )
+    reader_account = sessions.split_key(key)[0]
     for topic in list(TOPICS.values()):
-        if record.name not in topic.members:
+        if key not in topic.members:
             continue
-        acked = topic.acked.get(record.name, set())
+        acked = topic.acked.get(key, set())
         threshold = messaging.effective_threshold(
-            topic.thresholds.get(record.name), record.default_threshold
+            topic.thresholds.get(key), default_threshold
         )
         is_dm = topic.kind == "dm"
         for message in topic.messages:
             if message.id in acked or message.id in conn.inflight:
                 continue
-            addressed = is_dm or record.name in message.mentions
+            addressed = is_dm or key in message.mentions
             level = messaging.compute_level(
                 severity=message.severity,
                 addressed=addressed,
                 intent=message.intent,
             )
+            meta: dict[str, object] = {
+                "kind": "message",
+                "context": topic.key,
+                "from": _sender_display(message, reader_account),
+                "intent": message.intent,
+                "severity": message.severity,
+                "mentions": _mentions_display(message, reader_account),
+                "level": level,
+                "threshold": threshold,
+            }
+            if sender_account := _sender_account(message):
+                meta["account"] = sender_account
             payload = {
                 "type": proto.NOTIFY,
                 "id": message.id,
-                "content": _render_message(topic, message, addressed),
-                "meta": {
-                    "kind": "message",
-                    "context": topic.key,
-                    "from": message.sender,
-                    "intent": message.intent,
-                    "severity": message.severity,
-                    "mentions": list(message.mentions),
-                    "level": level,
-                    "threshold": threshold,
-                },
+                "content": _render_message(topic, message, addressed, reader_account),
+                "meta": meta,
             }
-            if not await _safe_send(conn, payload):
+            if not await _send_notify(conn, payload):
                 return False
             conn.inflight.add(message.id)
     return True
@@ -1297,100 +1518,183 @@ def _get_or_create_topic(key: str, kind: str) -> message_topic.MessageTopic:
     return topic
 
 
+def _limit_error(conn: Connection, key: str, limit: str) -> str | None:
+    """An error string if the session is at its account's ``limit``, else None.
+    For posts_per_minute, a None result also spends one post."""
+    account = conn.account
+    if account is None:
+        return "account removed"
+    value: int | None = getattr(account.limits, limit)
+    if value is None:
+        return None
+    if limit == "posts_per_minute":
+        now = time.time()
+        tokens, last = POST_BUCKETS.get(key, (float(value), now))
+        tokens = min(float(value), tokens + (now - last) * value / 60.0)
+        if tokens < 1.0:
+            POST_BUCKETS[key] = (tokens, now)
+            return f"rate limited: at most {value} posts and DMs a minute"
+        POST_BUCKETS[key] = (tokens - 1.0, now)
+        return None
+    if limit == "channels":
+        used = sum(
+            1 for t in TOPICS.values() if t.kind == "channel" and key in t.members
+        )
+    elif limit == "pr_subscriptions":
+        used = sum(1 for t in TRACKERS.values() if key in t.subscribers)
+    elif limit == "callbacks":
+        used = len(scheduler.pending(key))
+    else:
+        raise ValueError(f"unknown limit {limit!r}")
+    if used >= value:
+        return f"limit reached: {limit} is {value} for this account"
+    return None
+
+
+def _channel_error(conn: Connection, channel: str) -> str | None:
+    """An error string if the account cannot use ``channel``, else None."""
+    account = conn.account
+    if account is None or not account.allows_channel(channel):
+        return f"forbidden: channel {channel!r}"
+    return None
+
+
 async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None:
         return
     try:
-        key = messaging.channel_key(msg.get("channel") or "")
+        channel_key = messaging.channel_key(msg.get("channel") or "")
         threshold = msg.get("threshold")
         if threshold is not None:
             messaging.validate_threshold(threshold)
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
-    created = key not in TOPICS
-    topic = _get_or_create_topic(key, "channel")
+    if (err := _channel_error(conn, msg["channel"])) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
+    topic = TOPICS.get(channel_key)
+    if topic is None or key not in topic.members:
+        if (err := _limit_error(conn, key, "channels")) is not None:
+            await _send(websocket, proto.ERROR, msg, error=err)
+            return
+    created = channel_key not in TOPICS
+    topic = _get_or_create_topic(channel_key, "channel")
     requested_topic = msg.get("topic")
     if requested_topic and (created or not topic.messages):
         topic.topic = requested_topic
-    topic.join(record.name, now=time.time(), threshold=threshold)
+    topic.join(key, now=time.time(), threshold=threshold)
     message_topic.save_state(settings.data_dir(), topic)
-    message_topic.save_subscriber(settings.data_dir(), topic, record.name)
+    message_topic.save_subscriber(settings.data_dir(), topic, key)
     await _send(
         websocket,
         proto.CHANNEL_JOINED,
         msg,
         channel=_channel_name(topic),
-        members=_member_names(topic),
+        members=sorted(_member_display(m, conn.account_id) for m in topic.members),
         topic=topic.topic,
-        history=[m.to_dict() for m in topic.history_tail(_channel_history_n())],
+        history=[
+            _message_view(m, conn.account_id)
+            for m in topic.history_tail(_channel_history_n())
+        ],
     )
 
 
 async def _handle_leave_channel(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None:
         return
     try:
-        key = messaging.channel_key(msg.get("channel") or "")
+        channel_key = messaging.channel_key(msg.get("channel") or "")
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
-    topic = TOPICS.get(key)
-    if topic is not None and record.name in topic.members:
-        topic.leave(record.name)
-        message_topic.delete_subscriber(settings.data_dir(), topic, record.name)
+    topic = TOPICS.get(channel_key)
+    if topic is not None and key in topic.members:
+        topic.leave(key)
+        message_topic.delete_subscriber(settings.data_dir(), topic, key)
         message_topic.save_state(settings.data_dir(), topic)
     await _send(websocket, proto.AGENT_OK, msg)
 
 
-def _validate_message_fields(msg: dict, default_intent: str) -> tuple[str, str]:
-    """Validate and return (intent, severity) for a post/dm, raising MessagingError."""
+def _validate_message_fields(
+    conn: Connection, msg: dict, default_intent: str
+) -> tuple[str, str]:
+    """Validate a post/dm and return (intent, severity), with the severity lowered
+    to the account's maximum. Raises MessagingError."""
     intent = msg.get("intent") or default_intent
     severity = msg.get("severity") or "normal"
     messaging.validate_intent(intent)
     messaging.validate_severity(severity)
+    body = msg.get("body") or ""
+    if not isinstance(body, str):
+        raise messaging.MessagingError("body must be a string")
+    if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+        raise messaging.MessagingError(
+            f"message body too long: at most {MAX_BODY_BYTES} bytes"
+        )
+    account = conn.account
+    if account is not None:
+        severity = account.cap_severity(severity)
     return intent, severity
 
 
 def _persist_post(
     topic: message_topic.MessageTopic,
-    sender_name: str,
+    sender_key: str,
     message: message_topic.Message,
 ) -> None:
     """Common persistence after authoring a message: the sender pre-acks its own post
     (no self-delivery), the log is appended, and state/subscriber are flushed."""
-    topic.acked.setdefault(sender_name, set()).add(message.id)
+    topic.acked.setdefault(sender_key, set()).add(message.id)
     message_topic.append_messages(settings.data_dir(), topic, [message])
     message_topic.save_state(settings.data_dir(), topic)
-    message_topic.save_subscriber(settings.data_dir(), topic, sender_name)
+    message_topic.save_subscriber(settings.data_dir(), topic, sender_key)
 
 
 async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None or record is None:
         return
     try:
-        key = messaging.channel_key(msg.get("channel") or "")
-        intent, severity = _validate_message_fields(msg, "fyi")
+        channel_key = messaging.channel_key(msg.get("channel") or "")
+        intent, severity = _validate_message_fields(conn, msg, "fyi")
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
+    if (err := _channel_error(conn, msg["channel"])) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
+    topic = TOPICS.get(channel_key)
+    if topic is None or key not in topic.members:
+        if (err := _limit_error(conn, key, "channels")) is not None:
+            await _send(websocket, proto.ERROR, msg, error=err)
+            return
+    if (err := _limit_error(conn, key, "posts_per_minute")) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
+    mentions: list[str] = []
+    for ref in msg.get("mentions") or ():
+        if not isinstance(ref, str):
+            continue
+        target = _resolve_handle(ref, conn.account_id)
+        mentions.append(target.key if target is not None else ref)
     now = time.time()
-    topic = _get_or_create_topic(key, "channel")
-    if record.name not in topic.members:  # posting auto-joins the sender
-        topic.join(record.name, now=now)
+    topic = _get_or_create_topic(channel_key, "channel")
+    if key not in topic.members:  # posting auto-joins the sender
+        topic.join(key, now=now)
     message = topic.post(
-        record.name,
+        key,
         now=now,
         body=msg.get("body") or "",
+        sender_handle=record.handle,
         intent=intent,
         severity=severity,
-        mentions=tuple(msg.get("mentions") or ()),
+        mentions=tuple(mentions),
         ordinal=_alloc_ordinal(),
     )
-    _persist_post(topic, record.name, message)
+    _persist_post(topic, key, message)
     _wake_topic_members(topic)
     await _send(
         websocket,
@@ -1403,14 +1707,30 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
     )
 
 
+def _dm_topic(participants: list[sessions.SessionRecord]) -> message_topic.MessageTopic:
+    """The DM thread for exactly these sessions. A new thread's key is made from
+    the qualified handles, with a ``#N`` suffix if an older thread (for other
+    sessions that held the same handles) already uses it."""
+    keys = {r.key for r in participants}
+    for topic in TOPICS.values():
+        if topic.kind == "dm" and topic.members == keys:
+            return topic
+    base = messaging.dm_key([_qualified(r) for r in participants])
+    topic_key, n = base, 1
+    while topic_key in TOPICS:
+        n += 1
+        topic_key = f"{base}#{n}"
+    return _get_or_create_topic(topic_key, "dm")
+
+
 async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None or record is None:
         return
     to = msg.get("to")
     to = [to] if isinstance(to, str) else list(to or [])
     try:
-        intent, severity = _validate_message_fields(msg, "request")
+        intent, severity = _validate_message_fields(conn, msg, "request")
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
@@ -1419,30 +1739,32 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
             websocket, proto.ERROR, msg, error="dm needs at least one recipient"
         )
         return
-    recipients: list[agent_registry.AgentRecord] = []
-    for name in to:
-        target = _registry_by_name(name)
+    participants: dict[str, sessions.SessionRecord] = {key: record}
+    for ref in to:
+        target = _resolve_handle(ref, conn.account_id) if isinstance(ref, str) else None
         if target is None:
-            await _send(websocket, proto.ERROR, msg, error=f"unknown agent {name!r}")
+            await _send(websocket, proto.ERROR, msg, error=f"unknown agent {ref!r}")
             return
-        recipients.append(target)
-    participants = sorted({record.name, *(r.name for r in recipients)})
-    key = messaging.dm_key(participants)
+        participants[target.key] = target
+    if (err := _limit_error(conn, key, "posts_per_minute")) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
     now = time.time()
-    topic = _get_or_create_topic(key, "dm")
-    for name in participants:  # a DM thread's members are its participant NAMES
-        if name not in topic.members:
-            topic.join(name, now=now)
-            message_topic.save_subscriber(settings.data_dir(), topic, name)
+    topic = _dm_topic(list(participants.values()))
+    for member in participants:  # a DM thread's members are its participant sessions
+        if member not in topic.members:
+            topic.join(member, now=now)
+            message_topic.save_subscriber(settings.data_dir(), topic, member)
     message = topic.post(
-        record.name,
+        key,
         now=now,
         body=msg.get("body") or "",
+        sender_handle=record.handle,
         intent=intent,
         severity=severity,
         ordinal=_alloc_ordinal(),
     )
-    _persist_post(topic, record.name, message)
+    _persist_post(topic, key, message)
     _wake_topic_members(topic)
     await _send(
         websocket,
@@ -1456,8 +1778,8 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
 
 
 async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None:
         return
     threshold = msg.get("threshold")
     try:
@@ -1467,24 +1789,27 @@ async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:
         return
     context = msg.get("context") or ""
     topic = TOPICS.get(context)
-    if topic is None or record.name not in topic.members:
+    if topic is None or key not in topic.members:
         await _send(websocket, proto.ERROR, msg, error=f"not a member of {context!r}")
         return
-    topic.thresholds[record.name] = threshold
-    message_topic.save_subscriber(settings.data_dir(), topic, record.name)
+    topic.thresholds[key] = threshold
+    message_topic.save_subscriber(settings.data_dir(), topic, key)
     await _send(websocket, proto.AGENT_OK, msg)
 
 
 async def _handle_set_channel_topic(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None:
         return
     try:
-        key = messaging.channel_key(msg.get("channel") or "")
+        channel_key = messaging.channel_key(msg.get("channel") or "")
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
-    topic = TOPICS.get(key)
+    if (err := _channel_error(conn, msg["channel"])) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
+    topic = TOPICS.get(channel_key)
     if topic is None:
         await _send(
             websocket,
@@ -1499,6 +1824,7 @@ async def _handle_set_channel_topic(websocket, conn: Connection, msg: dict) -> N
 
 
 async def _handle_list_channels(websocket, conn: Connection, msg: dict) -> None:
+    account = conn.account
     channels = [
         {
             "name": _channel_name(topic),
@@ -1508,30 +1834,32 @@ async def _handle_list_channels(websocket, conn: Connection, msg: dict) -> None:
         }
         for topic in TOPICS.values()
         if topic.kind == "channel"
+        and account is not None
+        and account.allows_channel(_channel_name(topic))
     ]
     await _send(websocket, proto.CHANNEL_LIST, msg, channels=channels)
 
 
 async def _handle_list_subscriptions(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None or record is None:
         return
     subscriptions = [
         {
             "context": topic.key,
             "kind": topic.kind,
             "threshold": messaging.effective_threshold(
-                topic.thresholds.get(record.name), record.default_threshold
+                topic.thresholds.get(key), record.default_threshold
             ),
         }
         for topic in TOPICS.values()
-        if record.name in topic.members
+        if key in topic.members
     ]
     await _send(websocket, proto.SUBSCRIPTION_LIST, msg, subscriptions=subscriptions)
 
 
 # --------------------------------------------------------------------------- #
-# receipts + reactions (Phase C): both ride the Phase B message-topic primitive
+# receipts + reactions: both ride the message-topic primitive
 # --------------------------------------------------------------------------- #
 
 
@@ -1580,8 +1908,8 @@ def _resolve_target(
 
 
 async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None or record is None:
         return
     raw_target = msg.get("target") or ""
     reaction = msg.get("reaction") or ""
@@ -1592,7 +1920,7 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
         )
         return
     topic, target_message = resolved
-    if record.name not in topic.members:  # reacting does not auto-join
+    if key not in topic.members:  # reacting does not auto-join
         await _send(websocket, proto.ERROR, msg, error=f"not a member of {topic.key!r}")
         return
     try:
@@ -1600,27 +1928,31 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
+    if (err := _limit_error(conn, key, "posts_per_minute")) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
     # A reaction is a real message (intent="reaction", target=<resolved id>) on the
     # normal post path: it persists, appears in scrollback/catch_up, and ships at ambient
     # (forced by compute_level), so it is seen but never wakes — not even the author. It
     # gets its own handle too (uniform). target is the resolved full id so reactions_for
     # / the render lookup key correctly even when the agent reacted via a #N handle.
     message = topic.post(
-        record.name,
+        key,
         now=time.time(),
         body=reaction,
+        sender_handle=record.handle,
         intent="reaction",
         target=target_message.id,
         ordinal=_alloc_ordinal(),
     )
-    _persist_post(topic, record.name, message)
+    _persist_post(topic, key, message)
     _wake_topic_members(topic)
     await _send(websocket, proto.AGENT_OK, msg, id=message.id)
 
 
 async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None:
-    session_id, record = await _resolve_sender(websocket, conn, msg)
-    if record is None:
+    key, record = await _resolve_sender(websocket, conn, msg)
+    if key is None:
         return
     raw_target = msg.get("target") or ""
     resolved = _resolve_target(raw_target)
@@ -1630,32 +1962,29 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
         )
         return
     topic, target_msg = resolved
-    if record.name not in topic.members:
+    if key not in topic.members:
         await _send(websocket, proto.ERROR, msg, error=f"not a member of {topic.key!r}")
         return
     # delivery_status / reactions_for key on the resolved message's full id, regardless
-    # of whether the agent referenced it by #N handle or full id.
-    target = target_msg.id
-    # Members are names, so delivery_status already yields names. The message's own
+    # of whether the agent referenced it by #N handle or full id. The message's own
     # author pre-acks its post, so excluding it keeps the receipt an honest tally of
     # *recipients*.
-    delivered_names, pending_names = topic.delivery_status(target)
-    delivered = [n for n in delivered_names if n != target_msg.sender]
-    pending = [n for n in pending_names if n != target_msg.sender]
+    target = target_msg.id
+    delivered_keys, pending_keys = topic.delivery_status(target)
+    delivered = [k for k in delivered_keys if k != target_msg.sender]
+    pending = [k for k in pending_keys if k != target_msg.sender]
 
-    def _recipient_info(names: list[str]) -> dict:
+    def _recipient_info(keys: list[str]) -> dict:
         """Per-recipient liveness so the sender can tell 'delivered into a running
-        session' from 'delivered to an agent idle since X' (docs/specs/2026-07-09
-        slice c). Additive field: old relays render the plain name lists."""
+        session' from 'delivered to an agent idle since X'. `last_acked` lets the
+        client flag a connected recipient that does not ack a pending message as
+        possibly context-wedged."""
         info: dict = {}
-        for n in names:
-            rec = _registry_by_name(n)
-            info[n] = {
-                "connected": rec is not None and rec.session_id in CONNECTIONS,
+        for k in keys:
+            rec = SESSIONS.get(k)
+            info[_member_display(k, conn.account_id)] = {
+                "connected": _live(k),
                 "last_seen": rec.last_seen if rec is not None else None,
-                # Last surfaced-a-push time; lets the relay flag a connected-but-not-
-                # acking recipient with a pending message as possibly context-wedged
-                # (docs/specs/2026-07-14). Additive; older relays ignore it.
                 "last_acked": rec.last_acked if rec is not None else None,
             }
         return info
@@ -1664,10 +1993,14 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
         websocket,
         proto.MESSAGE_STATUS_RESULT,
         msg,
-        delivered=delivered,
-        pending=pending,
+        delivered=[_member_display(k, conn.account_id) for k in delivered],
+        pending=[_member_display(k, conn.account_id) for k in pending],
         recipients=_recipient_info(delivered + pending),
-        reactions=[{"by": s, "reaction": b} for s, b in topic.reactions_for(target)],
+        reactions=[
+            {"by": _sender_display(m, conn.account_id), "reaction": m.body}
+            for m in topic.messages
+            if m.intent == "reaction" and m.target == target
+        ],
     )
 
 
@@ -1750,8 +2083,40 @@ async def _reaper_loop() -> None:
         ]
         interval = max(1.0, min([*halves, 300.0]))
         await asyncio.sleep(interval)
+        _reap_expired_sessions(time.time())
         _reap_idle_trackers(time.time())
         _reap_idle_topics(time.time())
+
+
+def _reap_expired_sessions(now: float) -> list[str]:
+    """Remove sessions that have had no connection for the session TTL: their
+    handle, topic memberships, PR subscriptions, and callbacks. Returns the keys
+    removed."""
+    removed = SESSIONS.expired(now, _session_ttl_seconds(), _live)
+    for key in removed:
+        _leave_all_topics(key)
+        for tracker in list(TRACKERS.values()):
+            _unsubscribe(tracker, key)
+        scheduler.delete_session(key)
+        POST_BUCKETS.pop(key, None)
+        SESSIONS.remove(key)
+    return removed
+
+
+async def _credential_check_loop() -> None:
+    """Reload the accounts file when it changes, and close every connection whose
+    credential or account is no longer valid."""
+    while True:
+        await asyncio.sleep(_accounts_check_seconds())
+        ACCOUNTS.reload_if_changed()
+        now = time.time()
+        for conn in list(ALL_CONNECTIONS):
+            if ACCOUNTS.get(conn.account_id) is None or not ACCOUNTS.credential_valid(
+                conn.account_id, conn.credential_id, now
+            ):
+                await conn.ws.close(
+                    code=proto.UNAUTHORIZED_CLOSE_CODE, reason="credential revoked"
+                )
 
 
 def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:
@@ -1771,7 +2136,7 @@ async def _wait_or_wake(tracker: pr_monitor.PRTracker, seconds: float) -> None:
 async def _tracker_loop(tracker: pr_monitor.PRTracker) -> None:
     """Poll a PR while at least one subscriber is connected; suspend otherwise."""
     while True:
-        if not any(s in CONNECTIONS for s in tracker.subscribers):
+        if not any(_live(k) for k in tracker.subscribers):
             tracker.wake.clear()
             await tracker.wake.wait()  # resumed when a subscribed session reconnects
             continue
@@ -1914,9 +2279,25 @@ class _ProbeHandshakeFilter(logging.Filter):
         return True
 
 
+def _load_state() -> None:
+    """Migrate the data directory if needed, then load accounts, sessions, and
+    message topics."""
+    global ACCOUNTS, SESSIONS, TOPICS, _NEXT_ORDINAL
+    data_dir = settings.data_dir()
+    default_id = accounts.default_account_id()
+    migrate_identity.migrate(data_dir, default_id)
+    ACCOUNTS = accounts.AccountStore(
+        accounts.accounts_path(data_dir), TOKEN, default_id
+    )
+    SESSIONS = sessions.SessionRegistry(data_dir)
+    TOPICS = {topic.key: topic for topic in message_topic.load_all_topics(data_dir)}
+    _NEXT_ORDINAL = _init_next_ordinal()
+
+
 async def main() -> None:
     global GH, FJ, FJ_INSTANCES, TOKEN
     TOKEN = settings.token()  # auto-creates <SUBSPACE_DATA_DIR>/token if needed
+    _load_state()
     GH = github_client.GitHubClient()
     # Forgejo is optional: only served when an instance URL is configured. A server
     # without it rejects forgejo_* subscriptions (and skips any forgejo trackers on
@@ -1939,6 +2320,7 @@ async def main() -> None:
         TRACKERS[tracker.storage_key] = tracker
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
     asyncio.create_task(_reaper_loop())
+    asyncio.create_task(_credential_check_loop())
 
     # Graceful shutdown. k8s terminates pods with SIGTERM, whose default Python
     # disposition kills the process outright — the `async with serve(...)` block never

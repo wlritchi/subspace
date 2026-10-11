@@ -21,6 +21,21 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.#-]", "_", name)
 
 
+_KEY_SAFE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def key_filename(key: str) -> str:
+    """An injective filesystem-safe filename component for a session key.
+
+    Unlike ``safe_name``, two different keys never give the same name: each
+    character outside ``[A-Za-z0-9_.-]`` becomes ``%XX`` (its UTF-8 bytes in
+    hex), and ``%`` itself is encoded.
+    """
+    return _KEY_SAFE.sub(
+        lambda m: "".join(f"%{b:02X}" for b in m.group().encode("utf-8")), key
+    )
+
+
 def atomic_write(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` atomically.
 

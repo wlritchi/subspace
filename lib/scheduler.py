@@ -1,5 +1,5 @@
 # vim: filetype=python
-"""Persistent store of scheduled callback notifications, keyed by session id.
+"""Persistent store of scheduled callback notifications, keyed by session key.
 
 Proof-of-concept persistence for scheduled callbacks. Each scheduled
 callback is a small JSON file under a per-session directory, so the schedule
@@ -16,14 +16,13 @@ stdlib only.
 
 import json
 import os
-import re
+import shutil
 import time
 import uuid
 from pathlib import Path
 
 import settings
-
-_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
+import storage
 
 
 def store_dir() -> Path:
@@ -32,7 +31,7 @@ def store_dir() -> Path:
 
 
 def _session_dir(session_id: str) -> Path:
-    return store_dir() / _UNSAFE.sub("_", session_id)
+    return store_dir() / storage.key_filename(session_id)
 
 
 def schedule(
@@ -97,3 +96,8 @@ def delete(session_id: str, callback_id: str) -> None:
 def mark_dispatched(entry: dict) -> None:
     """Remove a callback by entry dict."""
     delete(str(entry.get("session_id", "")), str(entry.get("id", "")))
+
+
+def delete_session(session_id: str) -> None:
+    """Remove every callback for `session_id`."""
+    shutil.rmtree(_session_dir(session_id), ignore_errors=True)

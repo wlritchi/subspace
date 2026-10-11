@@ -6,9 +6,20 @@ server copies it into the reply. ``register`` and ``ack`` get no reply.
 ``notify`` frames are pushed by the server and carry no ``req_id``.
 
 To connect, a client sends ``Authorization: Bearer <token>`` in the WebSocket
-handshake. If the token is wrong, the server closes the connection with code
-1008. If the server does not know a frame ``type``, it replies with an
-``error`` frame.
+handshake. The token selects an account: the master token selects the default
+account, and an ``ssp_`` credential selects the account that it belongs to. If
+the token is wrong, the server closes the connection with code 1008, also later
+if the credential is revoked. If the server does not know a frame ``type``, it
+replies with an ``error`` frame. A frame that needs a permission that the
+account does not have gets an ``error`` frame with ``forbidden: <permission>``.
+
+A session is identified by its account and a session id that the client
+supplies (1-128 characters in 0x21-0x7E). A handle is a kebab-case name that a
+session registers so that other sessions can address it. Inside an account a
+handle is written bare (``reviewer``); from another account it is written
+``reviewer@ci``. Fields that name a session or a handle (``AgentRecord.name``,
+``Message.sender``, ``MessageMeta.from``, member lists) use the form that is
+correct for the reader.
 
 A minor version adds optional fields, frame types, or values of a type that
 is marked ``Open``. Each side ignores fields it does not know, and a client
@@ -79,6 +90,7 @@ LIST_CHANNELS: Final = "list_channels"
 LIST_SUBSCRIPTIONS: Final = "list_subscriptions"
 REACT: Final = "react"
 MESSAGE_STATUS: Final = "message_status"
+WHOAMI: Final = "whoami"
 
 # Server -> client
 NOTIFY: Final = "notify"
@@ -95,6 +107,7 @@ POSTED: Final = "posted"
 CHANNEL_LIST: Final = "channel_list"
 SUBSCRIPTION_LIST: Final = "subscription_list"
 MESSAGE_STATUS_RESULT: Final = "message_status_result"
+WHOAMI_RESULT: Final = "whoami_result"
 ERROR: Final = "error"
 
 # --------------------------------------------------------------------------- #
@@ -103,18 +116,27 @@ ERROR: Final = "error"
 
 
 class AgentRecord(TypedDict):
+    # The session's handle, bare or qualified for the reader.
     name: str
+    # Empty when the session is in another account than the reader.
     session_id: str
     description: str
     capabilities: str
+    # Deprecated: always "".
     working_dir: str
     default_threshold: Threshold
+    # When the session took its handle.
     registered_at: float
     last_seen: float
+    # Deprecated: always "".
     reclaim_key_hash: str
+    # Deprecated: always 1.
     generation: int
-    # 0.0 means the agent has not acknowledged a delivery since it registered.
+    # 0.0 means the session has not acknowledged a delivery since the server
+    # started.
     last_acked: float
+    # The account of the session.
+    account: NotRequired[str]
 
 
 class AgentListEntry(AgentRecord):
@@ -126,7 +148,7 @@ class Message(TypedDict):
 
     id: str  # "msg:<context>:<seq>"
     seq: int
-    sender: str  # agent name, or "system"
+    sender: str  # handle (bare or qualified for the reader), or "system"
     body: str
     intent: Intent | Literal["reaction"]
     severity: Severity
@@ -136,6 +158,8 @@ class Message(TypedDict):
     target: str
     # The global "#N" handle. 0 means the message has none.
     ordinal: int
+    # The sender's account. "" for "system".
+    account: NotRequired[str]
 
 
 class ScheduledItem(TypedDict):
@@ -238,19 +262,49 @@ MessageMeta = TypedDict(
         "mentions": list[str],
         "level": Level,
         "threshold": Threshold,
+        # The sender's account. Absent for "system".
+        "account": NotRequired[str],
+        "connections": NotRequired[int],
     },
 )
 
 
 class SuccessionMeta(TypedDict):
-    """Another session registered this session's agent name."""
+    """Deprecated: the server no longer sends it."""
 
     kind: Literal["succession"]
     level: Literal["direct"]
     threshold: Literal["direct"]
 
 
-NotifyMeta = CallbackMeta | PrTruncatedMeta | PrEventMeta | MessageMeta | SuccessionMeta
+class MultipleConnectionsMeta(TypedDict):
+    """The number of connections attached to this session went above one, or
+    back to one. While it is above one, delivery can be split between them."""
+
+    kind: Literal["multiple_connections"]
+    connections: int
+    level: Literal["direct"]
+    threshold: Literal["direct"]
+
+
+class HandleLostMeta(TypedDict):
+    """Another session in the account took this session's handle."""
+
+    kind: Literal["handle_lost"]
+    handle: str
+    level: Literal["direct"]
+    threshold: Literal["direct"]
+
+
+NotifyMeta = (
+    CallbackMeta
+    | PrTruncatedMeta
+    | PrEventMeta
+    | MessageMeta
+    | SuccessionMeta
+    | MultipleConnectionsMeta
+    | HandleLostMeta
+)
 
 # --------------------------------------------------------------------------- #
 # Client -> server frames
@@ -258,7 +312,13 @@ NotifyMeta = CallbackMeta | PrTruncatedMeta | PrEventMeta | MessageMeta | Succes
 
 
 class Register(TypedDict):
-    """Bind this connection to a session. No reply."""
+    """Attach this connection to a session in its account. No reply, except an
+    ``error`` for a session id that is not valid.
+
+    A session id ``@<handle>`` attaches to the session that holds the handle,
+    or to a new session with that id, which then takes the handle. ``None``
+    detaches the connection.
+    """
 
     type: Literal["register"]
     session_id: str | None
@@ -375,22 +435,31 @@ class ListForgejoPrSubscriptions(TypedDict):
 
 
 class RegisterAgent(TypedDict):
-    """Reply: ``agent_ok`` with ``agent``."""
+    """Register ``name`` as this session's handle. Reply: ``agent_ok`` with
+    ``agent``.
+
+    If another session in the account holds the handle, this fails unless
+    ``takeover`` is true or that session has had no connection for the
+    server's handle idle time. State does not move with the handle.
+    """
 
     type: Literal["register_agent"]
     req_id: ReqId
     session_id: str
-    name: str
+    name: str  # bare handle
     description: NotRequired[str]
     capabilities: NotRequired[str]
+    # Deprecated: ignored.
     working_dir: NotRequired[str]
     default_threshold: NotRequired[Threshold]  # default "direct"
-    # Lets a later session with the same key take over this name. 1-256 chars.
+    # Deprecated: ignored.
     reclaim_key: NotRequired[str]
+    takeover: NotRequired[bool]
 
 
 class UnregisterAgent(TypedDict):
-    """Reply: ``agent_ok`` with ``agent`` (None if not registered)."""
+    """Release the handle and leave every channel and DM. Reply: ``agent_ok``
+    with ``agent`` (None if the session held no handle)."""
 
     type: Literal["unregister_agent"]
     req_id: ReqId
@@ -444,10 +513,11 @@ class Post(TypedDict):
     req_id: ReqId
     session_id: str
     channel: str
-    body: str
+    body: str  # at most 16 KiB of UTF-8
     intent: NotRequired[Intent]  # default "fyi"
-    severity: NotRequired[Severity]  # default "normal"
-    mentions: NotRequired[list[str]]
+    # Default "normal". The server lowers it to the account's maximum.
+    severity: NotRequired[Severity]
+    mentions: NotRequired[list[str]]  # handles, bare or "handle@account"
 
 
 class Dm(TypedDict):
@@ -456,10 +526,11 @@ class Dm(TypedDict):
     type: Literal["dm"]
     req_id: ReqId
     session_id: str
-    to: list[str]
-    body: str
+    to: list[str]  # handles, bare or "handle@account"
+    body: str  # at most 16 KiB of UTF-8
     intent: NotRequired[Intent]  # default "request"
-    severity: NotRequired[Severity]  # default "normal"
+    # Default "normal". The server lowers it to the account's maximum.
+    severity: NotRequired[Severity]
 
 
 class SetThreshold(TypedDict):
@@ -468,7 +539,7 @@ class SetThreshold(TypedDict):
     type: Literal["set_threshold"]
     req_id: ReqId
     session_id: str
-    context: str  # "chan:<name>" or "dm:<a,b,...>"
+    context: str  # a topic key from list_subscriptions
     threshold: Threshold
 
 
@@ -517,6 +588,13 @@ class MessageStatus(TypedDict):
     target: str
 
 
+class Whoami(TypedDict):
+    """Describe this connection's account and session. Reply: ``whoami_result``."""
+
+    type: Literal["whoami"]
+    req_id: ReqId
+
+
 ClientFrame = (
     Register
     | Ack
@@ -544,6 +622,7 @@ ClientFrame = (
     | ListSubscriptions
     | React
     | MessageStatus
+    | Whoami
 )
 
 # --------------------------------------------------------------------------- #
@@ -666,6 +745,35 @@ class MessageStatusResult(TypedDict):
     reactions: list[Reaction]
 
 
+Permission = Literal["messaging", "schedule", "pr"]
+
+
+class AccountLimits(TypedDict):
+    """Limits for each session. None means no limit."""
+
+    posts_per_minute: int | None
+    channels: int | None
+    pr_subscriptions: int | None
+    callbacks: int | None
+
+
+class WhoamiResult(TypedDict):
+    type: Literal["whoami_result"]
+    req_id: ReqId
+    account: str
+    label: str
+    default_account: str
+    permissions: list[Annotated[Permission, Open]]
+    # Channel name patterns ("name", "prefix*"). None means every channel.
+    channels: list[str] | None
+    max_severity: Severity
+    limits: Annotated[AccountLimits, Open]
+    # None if the connection is not attached to a session.
+    session_id: str | None
+    handle: str  # "" if the session holds none
+    connections: int  # connections attached to the session
+
+
 class Error(TypedDict):
     """A failed request. ``req_id`` is present if the request had one."""
 
@@ -689,5 +797,6 @@ ServerFrame = (
     | ChannelList
     | SubscriptionList
     | MessageStatusResult
+    | WhoamiResult
     | Error
 )

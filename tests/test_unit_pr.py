@@ -4,16 +4,15 @@ GraphQL snapshot + diff, the timeline-driven facet diff rules, identity-addresse
 ids, and the split on-disk storage."""
 
 import asyncio
-import importlib.util
 import json
 import random
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import anyio
 import httpx
 import pytest
+from _harness import load_server
 
 import _harness as h
 import github_client as gc
@@ -1214,12 +1213,8 @@ class TestMissedOnCompaction:
 
 
 @pytest.fixture(scope="module")
-def server():
-    path = Path(__file__).resolve().parent.parent / "server" / "subspace-server.py"
-    spec = importlib.util.spec_from_file_location("subspace_server", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def server(tmp_path_factory):
+    return load_server(tmp_path_factory.mktemp("server"))
 
 
 class _FakeWS:
@@ -1235,7 +1230,7 @@ def test_truncation_notice_delivered_once_then_ack_resets(
 ):
     monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
     key, sid = "o/r#1", "sidA"
-    trunc_id = f"trunc:{key}:{sid}"
+    trunc_id = f"trunc:{key}"
     tracker = pm.PRTracker("o", "r", 1, None)
     tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
     tracker.subscribers.add(sid)
@@ -1247,8 +1242,8 @@ def test_truncation_notice_delivered_once_then_ack_resets(
 
     async def scenario():
         ws = _FakeWS()
-        conn = server.Connection(ws)
-        conn.session_id = sid
+        conn = server.Connection(ws, "default", "master")
+        conn.session_key = sid
         task = asyncio.create_task(server._dispatch_loop(conn))
         for _ in range(200):  # let one delivery pass run, then it blocks on its wake
             if ws.sent:
@@ -1453,10 +1448,10 @@ class TestRefresh:
 
         tracker.poll_once = poll_once
         ws = _FakeWS()
-        conn = server.Connection(ws)
-        conn.session_id = sid
+        conn = server.Connection(ws, "default", "master")
+        conn.session_key = sid
         monkeypatch.setitem(server.TRACKERS, tracker.storage_key, tracker)
-        monkeypatch.setitem(server.CONNECTIONS, sid, conn)
+        monkeypatch.setitem(server.CONNECTIONS, sid, [conn])
         return tracker, conn, ws, polls, calls, gate
 
     async def _run(self, server, tracker, body):
@@ -1542,7 +1537,7 @@ class TestRefresh:
             await server._handle_refresh(ws, conn, _refresh_msg())
             assert ws.sent[-1]["polled"] is False
             assert ws.sent[-1]["reason"] == "no connected subscribers"
-            server.CONNECTIONS["sidA"] = conn
+            server.CONNECTIONS["sidA"] = [conn]
 
             tracker.terminal, tracker.merged = True, True
             await server._handle_refresh(ws, conn, _refresh_msg())

@@ -9,12 +9,10 @@ the PR tracker it has no server/WebSocket dependency: the clock is injected
 ordering, retention, and the per-subscriber acked sets are fully testable without
 spawning anything.
 
-Member keys are opaque strings owned by the caller. Historically they were session
-ids; as of the name-keyed identity model (docs/specs/2026-07-09) the server keys
-members by agent NAME and resolves name -> live session only at delivery time, so a
-successor session inherits its predecessor's membership/acked state by construction.
-This module is agnostic either way — ``rekey_member`` supports the server's one-time
-sid->name migration of pre-existing topics.
+Member keys are opaque strings owned by the caller. The server uses session keys
+(``"<account>/<session id>"``, docs/specs/2026-10-10-identity.md). A message's
+``sender`` is the sender's session key (or ``"system"``), and ``sender_handle`` is
+the handle the sender held when it posted.
 
 Persistence mirrors ``pr_monitor``'s split layout under
 ``<data_dir>/msg/<safe_key>/``: ``state.json`` (kind/topic/members/next_seq/
@@ -39,6 +37,7 @@ MAX_CACHED_MESSAGES = 200
 class Message:
     id: str
     seq: int
+    # The sender's session key, or "system".
     sender: str
     body: str
     intent: str = "fyi"
@@ -49,6 +48,8 @@ class Message:
     # Server-global, monotonic message handle (Phase C addendum). 0 == unset/legacy;
     # the server allocates and passes it in, the lib stays counter-agnostic.
     ordinal: int = 0
+    # The handle the sender held when it posted.
+    sender_handle: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +63,7 @@ class Message:
             "created_at": self.created_at,
             "target": self.target,
             "ordinal": self.ordinal,
+            "sender_handle": self.sender_handle,
         }
 
     @classmethod
@@ -77,6 +79,7 @@ class Message:
             created_at=float(data.get("created_at", 0.0)),
             target=data.get("target", ""),
             ordinal=int(data.get("ordinal", 0)),
+            sender_handle=data.get("sender_handle", ""),
         )
 
 
@@ -115,10 +118,11 @@ class MessageTopic:
 
     def post(
         self,
-        sender_sid: str,
+        sender: str,
         *,
         now: float,
         body: str,
+        sender_handle: str = "",
         intent: str = "fyi",
         severity: str = "normal",
         mentions: tuple[str, ...] = (),
@@ -136,7 +140,7 @@ class MessageTopic:
         message = Message(
             id=f"msg:{self.key}:{seq}",
             seq=seq,
-            sender=sender_sid,
+            sender=sender,
             body=body,
             intent=intent,
             severity=severity,
@@ -144,6 +148,7 @@ class MessageTopic:
             created_at=now,
             target=target,
             ordinal=ordinal,
+            sender_handle=sender_handle,
         )
         self.messages.append(message)
         self.next_seq = seq + 1
@@ -182,8 +187,7 @@ class MessageTopic:
 
     def rekey_member(self, old: str, new: str) -> None:
         """Move one member's state (membership, acked set, missed count, threshold
-        override) from key ``old`` to key ``new`` — the server's one-time sid->name
-        migration primitive. If ``new`` is already a member its state wins and
+        override) from key ``old`` to key ``new``. The identity migration uses it. If ``new`` is already a member its state wins and
         ``old``'s is discarded (the live entry is fresher by construction); the caller
         persists (save_subscriber under ``new``, delete_subscriber of ``old``,
         save_state)."""
@@ -286,13 +290,13 @@ def save_subscriber(data_dir: Path, topic: MessageTopic, member: str) -> None:
     if override is not None:
         record["threshold"] = override
     storage.atomic_write(
-        _topic_dir(data_dir, topic.key) / f"sub-{storage.safe_name(member)}.json",
+        _topic_dir(data_dir, topic.key) / f"sub-{storage.key_filename(member)}.json",
         json.dumps(record),
     )
 
 
 def delete_subscriber(data_dir: Path, topic: MessageTopic, member: str) -> None:
-    path = _topic_dir(data_dir, topic.key) / f"sub-{storage.safe_name(member)}.json"
+    path = _topic_dir(data_dir, topic.key) / f"sub-{storage.key_filename(member)}.json"
     path.unlink(missing_ok=True)
 
 

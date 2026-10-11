@@ -13,12 +13,11 @@ Covers the additive multi-instance seam, keeping the default instance byte-ident
 The server is imported by path (its filename is a hyphenated script), the same idiom as
 test_unit_pr / test_unit_core."""
 
-import importlib.util
 import json
-from pathlib import Path
 
 import anyio
 import pytest
+from _harness import load_server
 
 import forgejo_client as fc
 import pr_monitor as pm
@@ -30,12 +29,8 @@ import pr_monitor as pm
 
 
 @pytest.fixture(scope="module")
-def server():
-    path = Path(__file__).resolve().parent.parent / "server" / "subspace-server.py"
-    spec = importlib.util.spec_from_file_location("subspace_server", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def server(tmp_path_factory):
+    return load_server(tmp_path_factory.mktemp("server"))
 
 
 # --------------------------------------------------------------------------- #
@@ -385,9 +380,9 @@ class TestServerHandlersInstance:
 
         async def scenario():
             ws = _FakeWS()
-            conn = server.Connection(ws)
-            conn.session_id = "sidA"
-            server.CONNECTIONS["sidA"] = conn
+            conn = server.Connection(ws, "default", "master")
+            conn.session_key = "sidA"
+            server.CONNECTIONS["sidA"] = [conn]
             await server._handle_subscribe(
                 ws,
                 conn,
@@ -430,8 +425,8 @@ class TestServerHandlersInstance:
 
         async def scenario():
             ws = _FakeWS()
-            conn = server.Connection(ws)
-            conn.session_id = "sidA"
+            conn = server.Connection(ws, "default", "master")
+            conn.session_key = "sidA"
             await server._handle_subscribe(
                 ws,
                 conn,
@@ -484,8 +479,8 @@ class TestServerHandlersInstance:
 
         async def scenario():
             ws = _FakeWS()
-            conn = server.Connection(ws)
-            conn.session_id = "sidA"
+            conn = server.Connection(ws, "default", "master")
+            conn.session_key = "sidA"
             await server._handle_list_pr_subscriptions(
                 ws, conn, {"session_id": "sidA", "req_id": 9}, provider="forgejo"
             )
@@ -545,9 +540,9 @@ class TestAuthErrorNaming:
         async def scenario():
             import asyncio
 
-            conn = server.Connection(_FakeWS())
-            conn.session_id = "sidA"
-            server.CONNECTIONS["sidA"] = conn
+            conn = server.Connection(_FakeWS(), "default", "master")
+            conn.session_key = "sidA"
+            server.CONNECTIONS["sidA"] = [conn]
             loop_task = asyncio.ensure_future(server._tracker_loop(t))
             for _ in range(200):
                 if t.auth_notified:

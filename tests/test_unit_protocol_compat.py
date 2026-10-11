@@ -64,8 +64,8 @@ def test_docstring_change_is_patch() -> None:
             id="optional field on a client frame",
         ),
         pytest.param(
-            '    channel: str\n    body: str\n    intent: NotRequired[Intent]  # default "fyi"',
-            '    channel: NotRequired[str]\n    body: str\n    intent: NotRequired[Intent]  # default "fyi"',
+            '    channel: str\n    body: str  # at most 16 KiB of UTF-8\n    intent: NotRequired[Intent]  # default "fyi"',
+            '    channel: NotRequired[str]\n    body: str  # at most 16 KiB of UTF-8\n    intent: NotRequired[Intent]  # default "fyi"',
             id="client field becomes optional",
         ),
         pytest.param(
@@ -74,9 +74,9 @@ def test_docstring_change_is_patch() -> None:
             id="value added to an Open type",
         ),
         pytest.param(
-            "NotifyMeta = CallbackMeta |",
+            "NotifyMeta = (\n    CallbackMeta\n",
             'class NewMeta(TypedDict):\n    kind: Literal["new"]\n\n\n'
-            "NotifyMeta = NewMeta | CallbackMeta |",
+            "NotifyMeta = (\n    NewMeta\n    | CallbackMeta\n",
             id="variant added to an Open union",
         ),
         pytest.param(
@@ -133,8 +133,8 @@ def test_compatible_change_is_minor(old: str, new: str) -> None:
             id="value removed from a type the server accepts",
         ),
         pytest.param(
-            "    | MessageStatus\n)",
-            ")",
+            "    | MessageStatus\n    | Whoami\n)",
+            "    | Whoami\n)",
             "message_status: the server no longer accepts this frame",
             id="client frame removed",
         ),
@@ -170,8 +170,8 @@ def test_breaking_change_is_major(old: str, new: str, expected: str) -> None:
 def test_open_does_not_loosen_what_the_server_accepts() -> None:
     # Post.intent is client-sent; marking it Open must not hide a removed value.
     new_source = _edit(
-        '    intent: NotRequired[Intent]  # default "fyi"\n    severity: NotRequired[Severity]  # default "normal"\n    mentions',
-        '    intent: NotRequired[Annotated[Literal["fyi"], Open]]\n    severity: NotRequired[Severity]  # default "normal"\n    mentions',
+        '    intent: NotRequired[Intent]  # default "fyi"\n    # Default "normal".',
+        '    intent: NotRequired[Annotated[Literal["fyi"], Open]]\n    # Default "normal".',
     )
     report = _compare(new_source)
     assert any(
