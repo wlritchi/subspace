@@ -306,6 +306,27 @@ def test_lost_batch_comes_back_after_gateway_restart(tmp_path: Path) -> None:
             asyncio.run(second())
 
 
+def test_idle_reap_acks_the_pulled_batch(tmp_path: Path) -> None:
+    with _stack(tmp_path, idle_seconds="1") as s:
+
+        async def scenario() -> None:
+            alice = await s.local("ir-s1", "ir-alice")
+            async with s.mcp("?handle=ir-bot") as bot:
+                await _text(bot, "whoami")
+                await alice.request(
+                    {"type": proto.DM, "to": ["ir-bot@ci"], "body": "seen once"}
+                )
+                await asyncio.sleep(0.3)
+                assert "seen once" in await _text(bot, "catch_up")
+                # The gateway reaps the idle session. The client saw the batch,
+                # so it must not come back.
+                await asyncio.sleep(3.0)
+                assert "No new notifications." in await _text(bot, "catch_up")
+            await alice.close()
+
+        asyncio.run(scenario())
+
+
 def test_revoked_credential(tmp_path: Path) -> None:
     with _stack(tmp_path, token_cache_seconds="0.2") as s:
 

@@ -370,9 +370,12 @@ does not ack them.
 
 The gateway keeps the WebSocket open for an idle lease (for example 10
 minutes) after the last MCP request, then closes it. After that, the session
-is offline. Its messages stay unacked in the core, and the core sends them
-again when the session next attaches. A gateway restart therefore loses
-nothing.
+is offline. Before it closes, the gateway acks the batch that the last pull
+returned: the agent got that batch, and a request for it again (`redeliver`)
+comes at once, not after the lease. Messages that the agent did not pull stay
+unacked in the core, and the core sends them again when the session next
+attaches. A gateway restart therefore loses nothing, but can send the last
+batch again.
 
 `message_status` already reports `last_acked`. For a remote agent, that value
 shows when it last pulled.

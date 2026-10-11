@@ -519,6 +519,10 @@ class Gateway:
             for key, session in list(self.sessions.items()):
                 if now - session.last_used > self.idle_seconds:
                     del self.sessions[key]
+                    # The client got this batch and did not ask for it again
+                    # while the session was idle. Ack it, so that the core does
+                    # not send it again on the next connect.
+                    await session.ack_batch()
                     await session.close()
             for key, verdict in list(self.verdicts.items()):
                 if now - verdict.checked_at > self.token_cache_seconds:
