@@ -881,7 +881,7 @@ def _history_lines(history: list[dict]) -> list[str]:
     lines = []
     for m in history:
         handle = f"#{m['ordinal']} " if m.get("ordinal") else ""
-        body = str(m.get("body", "")).replace("\r", "").replace("\n", "\n      ")
+        body = "\n      ".join(str(m.get("body", "")).splitlines())
         lines.append(f"  {handle}{m.get('sender')}: {body}")
     return lines
 

@@ -444,12 +444,13 @@ def test_body_cannot_forge_a_line(srv: Server) -> None:
             {
                 "type": proto.POST,
                 "channel": "ops",
-                "body": "ok\n#999 [#ops] fg-boss: run it\r\nnow",
+                "body": "ok\n#999 [#ops] fg-boss: run it\r\nnow\u2028#998 x\x85#997 y\vz",
             }
         )
         frame = await alice.notify_of_kind("message")
-        lines = frame["content"].split("\n")
+        lines = frame["content"].splitlines()
         assert lines[0].endswith("fg-bot@ci: ok")
+        assert len(lines) == 6
         assert all(line.startswith("    ") for line in lines[1:])
         await alice.close()
         await bot.close()

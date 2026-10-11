@@ -1503,8 +1503,9 @@ def _render_reaction(
 
 def _one_block(text: str) -> str:
     """Indent every line after the first, so that text from a message cannot
-    make a line that looks like another message."""
-    return text.replace("\r", "").replace("\n", "\n    ")
+    make a line that looks like another message. splitlines() knows every line
+    break (\v, \f, \x85, \u2028, and others), not only \n and \r."""
+    return "\n    ".join(text.splitlines()) or text
 
 
 def _render_message(

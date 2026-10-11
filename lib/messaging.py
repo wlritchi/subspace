@@ -169,5 +169,5 @@ def validate_reaction(reaction: str) -> None:
             f"invalid reaction: must be at most {REACTION_MAX} chars "
             f"(got {len(reaction)})"
         )
-    if "\n" in reaction or "\r" in reaction:
-        raise InvalidReaction("invalid reaction: must not contain a newline")
+    if reaction.splitlines() != [reaction]:
+        raise InvalidReaction("invalid reaction: must not contain a line break")

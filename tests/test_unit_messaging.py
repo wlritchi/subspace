@@ -180,6 +180,9 @@ def test_valid_reactions(good: str) -> None:
         "x" * (m.REACTION_MAX + 1),  # too long
         "a\nb",  # contains a newline
         "\n",  # newline only
+        "ok\u2028done",  # Unicode line separator
+        "ok\x85",  # next line (NEL)
+        "a\rb",  # carriage return
     ],
 )
 def test_invalid_reactions(bad: str) -> None:
