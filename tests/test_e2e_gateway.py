@@ -5,6 +5,7 @@ docs/specs/2026-10-10-remote-agent-mcp.md."""
 
 import asyncio
 import contextlib
+import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import httpx2
 import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
+from websockets.sync.server import ServerConnection, serve
 
 import subspace_protocol as proto
 from _harness import free_port, gateway_process, server_env, server_process
@@ -113,6 +115,31 @@ def test_http_auth(stack: Stack) -> None:
             assert reply.status_code == 403
 
     asyncio.run(scenario())
+
+
+def test_core_going_away_is_not_a_refusal() -> None:
+    def going_away(ws: ServerConnection) -> None:
+        ws.recv()
+        ws.close(1001, "going away")
+
+    core_port = free_port()
+    gateway_port = free_port()
+    with serve(going_away, "127.0.0.1", core_port) as core:
+        threading.Thread(target=core.serve_forever, daemon=True).start()
+        with gateway_process(core_port, gateway_port):
+
+            async def scenario() -> None:
+                body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+                headers = {"Authorization": "Bearer ssp_abcdefghijkl_" + "x" * 40}
+                url = f"http://127.0.0.1:{gateway_port}/mcp"
+                async with httpx2.AsyncClient() as http:
+                    # A second try must not get a cached refusal (401).
+                    for _ in range(2):
+                        reply = await http.post(url, json=body, headers=headers)
+                        assert reply.status_code == 503, reply.text
+
+            asyncio.run(scenario())
+        core.shutdown()
 
 
 def test_tools_follow_permissions(stack: Stack) -> None:

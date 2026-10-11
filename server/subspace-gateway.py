@@ -413,8 +413,11 @@ class Gateway:
                     whoami = reply
             finally:
                 await ws.close()
-        except ConnectionClosed:
-            whoami = None
+        except ConnectionClosed as exc:
+            # The core refuses a token with this close code. Any other close
+            # (for example, the core stops) is not a verdict: do not cache it.
+            if exc.rcvd is None or exc.rcvd.code != proto.UNAUTHORIZED_CLOSE_CODE:
+                raise GatewayError("the subspace server closed") from exc
         self.verdicts[key] = TokenVerdict(whoami, now)
         return whoami
 
