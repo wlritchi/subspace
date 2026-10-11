@@ -187,10 +187,10 @@ class MessageTopic:
 
     def rekey_member(self, old: str, new: str) -> None:
         """Move one member's state (membership, acked set, missed count, threshold
-        override) from key ``old`` to key ``new``. The identity migration uses it. If ``new`` is already a member its state wins and
-        ``old``'s is discarded (the live entry is fresher by construction); the caller
-        persists (save_subscriber under ``new``, delete_subscriber of ``old``,
-        save_state)."""
+        override) from key ``old`` to key ``new``. If ``new`` is already a member,
+        its state wins and ``old``'s is discarded (the live entry is fresher by
+        construction). The caller persists (save_subscriber under ``new``,
+        delete_subscriber of ``old``, save_state)."""
         if old not in self.members or old == new:
             return
         self.members.discard(old)
