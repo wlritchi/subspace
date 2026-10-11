@@ -26,6 +26,7 @@ Config (env):  SUBSPACE_GATEWAY_HOST (default 127.0.0.1)
                SUBSPACE_GATEWAY_ALLOWED_ORIGINS (comma-separated; default none)
                SUBSPACE_GATEWAY_IDLE_SECONDS (default 600)
                SUBSPACE_GATEWAY_WAIT_MAX_SECONDS (default 30)
+               SUBSPACE_GATEWAY_CORE_RETRY_SECONDS (default 10)
                SUBSPACE_GATEWAY_MAX_BODY_BYTES (default 65536)
                SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL (default 20)
                SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE (default 20)
@@ -123,6 +124,9 @@ TOKEN_CACHE_SECONDS = 60.0
 MCP_SESSION_IDLE_SECONDS = 1800.0
 # How long to wait for the core to answer one request.
 CORE_TIMEOUT_SECONDS = 10.0
+# Default time to try again while the core cannot be reached. A core restart
+# that is shorter than this does not make a request fail.
+CORE_RETRY_SECONDS = 10.0
 # Limits for one catch_up batch, the same as the relay's.
 CATCHUP_MAX_ITEMS = 25
 CATCHUP_MAX_CHARS = 50_000
@@ -188,9 +192,11 @@ class CoreSession:
         token: str,
         spec: str,
         on_revoked: Callable[[str], None],
+        retry_seconds: float = 0.0,
     ) -> None:
         self.core_url: str = core_url
         self.token: str = token
+        self.retry_seconds: float = retry_seconds
         # The session id that the session attaches with, or "@<handle>".
         self.spec: str = spec
         # The session id that the core attached to. A reconnect uses it, so a
@@ -213,7 +219,7 @@ class CoreSession:
         async with self._lock:
             if self.ws is not None:
                 return
-            ws = await _open_core(self.core_url, self.token)
+            ws = await _open_core(self.core_url, self.token, self.retry_seconds)
             self.ws = ws
             self._recv_task = asyncio.create_task(self._recv(ws))
             await ws.send(
@@ -343,17 +349,27 @@ async def _send_quietly(ws: ClientConnection, frame: dict) -> None:
         pass
 
 
-async def _open_core(core_url: str, token: str) -> ClientConnection:
-    try:
-        return await connect(
-            core_url,
-            additional_headers={proto.AUTH_HEADER: proto.auth_header_value(token)},
-            open_timeout=CORE_TIMEOUT_SECONDS,
-        )
-    except (OSError, InvalidStatus, TimeoutError) as exc:
-        # The details name internal addresses: log them, do not return them.
-        log.warning("cannot reach the subspace server: %s", exc)
-        raise GatewayError("the subspace server is not reachable") from exc
+async def _open_core(
+    core_url: str, token: str, retry_seconds: float = 0.0
+) -> ClientConnection:
+    """Connect to the core. Try again until ``retry_seconds`` pass."""
+    deadline = time.monotonic() + retry_seconds
+    delay = 0.2
+    while True:
+        try:
+            return await connect(
+                core_url,
+                additional_headers={proto.AUTH_HEADER: proto.auth_header_value(token)},
+                open_timeout=CORE_TIMEOUT_SECONDS,
+            )
+        except (OSError, InvalidStatus, TimeoutError) as exc:
+            if time.monotonic() + delay > deadline:
+                # The details name internal addresses: log them, do not return
+                # them.
+                log.warning("cannot reach the subspace server: %s", exc)
+                raise GatewayError("the subspace server is not reachable") from exc
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 1.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +388,9 @@ class Gateway:
         self.core_url: str = _env_str("SUBSPACE_CORE_URL", "ws://127.0.0.1:8137")
         self.idle_seconds: float = _env_float("SUBSPACE_GATEWAY_IDLE_SECONDS", 600.0)
         self.wait_max: float = _env_float("SUBSPACE_GATEWAY_WAIT_MAX_SECONDS", 30.0)
+        self.core_retry_seconds: float = _env_float(
+            "SUBSPACE_GATEWAY_CORE_RETRY_SECONDS", CORE_RETRY_SECONDS
+        )
         self.sessions_per_credential: int = int(
             _env_float("SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL", 20)
         )
@@ -401,25 +420,36 @@ class Gateway:
         verdict = self.verdicts.get(key)
         if verdict is not None and now - verdict.checked_at < self.token_cache_seconds:
             return verdict.whoami
-        whoami: dict | None = None
-        try:
-            ws = await _open_core(self.core_url, token)
+        deadline = now + self.core_retry_seconds
+        while True:
             try:
-                await ws.send(json.dumps({"type": proto.WHOAMI, "req_id": 1}))
-                reply = json.loads(
-                    await asyncio.wait_for(ws.recv(), CORE_TIMEOUT_SECONDS)
-                )
-                if reply.get("type") == proto.WHOAMI_RESULT:
-                    whoami = reply
-            finally:
-                await ws.close()
-        except ConnectionClosed as exc:
-            # The core refuses a token with this close code. Any other close
-            # (for example, the core stops) is not a verdict: do not cache it.
-            if exc.rcvd is None or exc.rcvd.code != proto.UNAUTHORIZED_CLOSE_CODE:
-                raise GatewayError("the subspace server closed") from exc
+                whoami = await self._whoami(token, deadline - time.monotonic())
+                break
+            except ConnectionClosed as exc:
+                # The core refuses a token with this close code. Any other close
+                # (for example, the core stops) is not a verdict: do not cache it.
+                if (
+                    exc.rcvd is not None
+                    and exc.rcvd.code == proto.UNAUTHORIZED_CLOSE_CODE
+                ):
+                    whoami = None
+                    break
+                if time.monotonic() >= deadline:
+                    raise GatewayError("the subspace server closed") from exc
+                await asyncio.sleep(0.2)
         self.verdicts[key] = TokenVerdict(whoami, now)
         return whoami
+
+    async def _whoami(self, token: str, retry_seconds: float) -> dict | None:
+        ws = await _open_core(self.core_url, token, retry_seconds)
+        try:
+            await ws.send(json.dumps({"type": proto.WHOAMI, "req_id": 1}))
+            reply = json.loads(await asyncio.wait_for(ws.recv(), CORE_TIMEOUT_SECONDS))
+        except TimeoutError as exc:
+            raise GatewayError("the subspace server did not answer") from exc
+        finally:
+            await ws.close()
+        return reply if reply.get("type") == proto.WHOAMI_RESULT else None
 
     def known_valid(self, token: str) -> bool:
         """True if the core accepted the token within the cache time."""
@@ -476,7 +506,9 @@ class Gateway:
                 f"too many sessions for this credential (at most "
                 f"{self.sessions_per_credential} at a time)"
             )
-        created = CoreSession(self.core_url, token, spec, self.forget_token)
+        created = CoreSession(
+            self.core_url, token, spec, self.forget_token, self.core_retry_seconds
+        )
         self.sessions[key] = created
         return created
 

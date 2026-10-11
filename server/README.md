@@ -175,6 +175,7 @@ network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
 | `SUBSPACE_GATEWAY_ALLOWED_ORIGINS`          | none                  | Browser `Origin` values to accept. Requests with no `Origin` are accepted                                                        |
 | `SUBSPACE_GATEWAY_IDLE_SECONDS`             | `600`                 | Close a session's WebSocket after this long with no request; the session then shows as offline                                   |
 | `SUBSPACE_GATEWAY_WAIT_MAX_SECONDS`         | `30`                  | Longest `wait_for_messages`                                                                                                      |
+| `SUBSPACE_GATEWAY_CORE_RETRY_SECONDS`       | `10`                  | While the server cannot be reached, try again for this long before a request fails (503)                                         |
 | `SUBSPACE_GATEWAY_MAX_BODY_BYTES`           | `65536`               | Largest request body                                                                                                             |
 | `SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL`  | `20`                  | Open sessions for each credential                                                                                                |
 | `SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE` | `20`                  | Failed authentications for each client address before 429                                                                        |

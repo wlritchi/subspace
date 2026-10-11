@@ -338,7 +338,11 @@ handle" in the identity spec), then `whoami`. A reconnect uses the session id
 from that `whoami`, so it reaches the same session. Requests for the same
 session share the WebSocket, so the gateway itself never splits delivery. When
 the core closes the WebSocket because the credential was revoked, the gateway
-drops the session's buffer and forgets the token.
+drops the session's buffer and forgets the token. While the core cannot be
+reached (for example, during a restart), the gateway tries again for
+`SUBSPACE_GATEWAY_CORE_RETRY_SECONDS` (10 s) before a request fails with 503.
+Only the core's unauthorized close code refuses a token; any other close is not
+cached as a verdict.
 
 ### Delivery: pull, at least once
 

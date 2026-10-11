@@ -126,7 +126,7 @@ def test_core_going_away_is_not_a_refusal() -> None:
     gateway_port = free_port()
     with serve(going_away, "127.0.0.1", core_port) as core:
         threading.Thread(target=core.serve_forever, daemon=True).start()
-        with gateway_process(core_port, gateway_port):
+        with gateway_process(core_port, gateway_port, core_retry_seconds="1"):
 
             async def scenario() -> None:
                 body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
@@ -140,6 +140,33 @@ def test_core_going_away_is_not_a_refusal() -> None:
 
             asyncio.run(scenario())
         core.shutdown()
+
+
+def test_gateway_waits_for_a_core_that_starts(tmp_path: Path) -> None:
+    tokens = _accounts_file(tmp_path)
+    core_port = free_port()
+    gateway_port = free_port()
+    env = server_env(core_port, tmp_path)
+    env["SUBSPACE_TOKEN"] = MASTER
+    with (
+        gateway_process(core_port, gateway_port, core_retry_seconds="30"),
+        contextlib.ExitStack() as core,
+    ):
+        stack = Stack(core_port, gateway_port, tmp_path, tokens)
+
+        async def call() -> str:
+            async with stack.mcp("?handle=late-bot") as client:
+                return await _text(client, "whoami")
+
+        async def scenario() -> None:
+            # The request must wait, not fail, while no core runs.
+            pending = asyncio.create_task(call())
+            await asyncio.sleep(1.0)
+            assert not pending.done()
+            await asyncio.to_thread(core.enter_context, server_process(env))
+            assert "handle: late-bot" in await pending
+
+        asyncio.run(scenario())
 
 
 def test_tools_follow_permissions(stack: Stack) -> None:
