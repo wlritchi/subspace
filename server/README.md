@@ -40,23 +40,23 @@ It provides two capabilities:
 
 ## Configuration (environment)
 
-| Variable                      | Default                   | Purpose                                       |
-|-------------------------------|---------------------------|-----------------------------------------------|
-| `SUBSPACE_WS_HOST`            | `127.0.0.1`               | WebSocket bind host                           |
-| `SUBSPACE_WS_PORT`            | `8137`                    | WebSocket port                                |
-| `SUBSPACE_DATA_DIR`           | `$XDG_DATA_HOME/subspace` | Where callbacks and PR state are persisted    |
-| `SUBSPACE_TOKEN`              | auto (`<DATA_DIR>/token`) | Master token: access to the default account   |
-| `SUBSPACE_DEFAULT_ACCOUNT`    | `default`                 | Id of the default account (choose it once)    |
-| `SUBSPACE_ACCOUNTS_FILE`      | `<DATA_DIR>/accounts.toml`| Accounts and credentials (optional)           |
-| `SUBSPACE_ACCOUNTS_CHECK_SECONDS` | `5`                   | How often to reload the accounts file and check credentials |
-| `SUBSPACE_HANDLE_IDLE_SECONDS` | `900`                    | A handle whose session has had no connection this long can be registered by another session without `takeover` |
-| `SUBSPACE_SESSION_TTL_DAYS`   | `30`                      | Remove a session (handle, memberships, PR subscriptions, callbacks) after this long with no connection |
-| `GITHUB_TOKEN`                | —                         | Token for PR polling (`gh auth token`)        |
-| `GITHUB_API_URL`              | `https://api.github.com`  | API base (set for GitHub Enterprise / tests)  |
-| `GITHUB_GRAPHQL_URL`          | `{GITHUB_API_URL}/graphql`| GraphQL endpoint (override for Enterprise)    |
-| `SUBSPACE_PR_POLL_SECONDS`    | —                         | Force a fixed PR poll cadence (override/testing) |
-| `SUBSPACE_PR_WARM_TTL_SECONDS` | `1800`                   | Keep an unsubscribed PR tracker warm this long before deleting (0 = delete immediately) |
-| `SUBSPACE_PR_CHECK_SUMMARY_THRESHOLD` | `5`               | Collapse this many+ passing checks completing in one poll into a single summary event; 0 disables |
+| Variable                              | Default                    | Purpose                                                                                                        |
+| ------------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `SUBSPACE_WS_HOST`                    | `127.0.0.1`                | WebSocket bind host                                                                                            |
+| `SUBSPACE_WS_PORT`                    | `8137`                     | WebSocket port                                                                                                 |
+| `SUBSPACE_DATA_DIR`                   | `$XDG_DATA_HOME/subspace`  | Where callbacks and PR state are persisted                                                                     |
+| `SUBSPACE_TOKEN`                      | auto (`<DATA_DIR>/token`)  | Master token: access to the default account                                                                    |
+| `SUBSPACE_DEFAULT_ACCOUNT`            | `default`                  | Id of the default account (choose it once)                                                                     |
+| `SUBSPACE_ACCOUNTS_FILE`              | `<DATA_DIR>/accounts.toml` | Accounts and credentials (optional)                                                                            |
+| `SUBSPACE_ACCOUNTS_CHECK_SECONDS`     | `5`                        | How often to reload the accounts file and check credentials                                                    |
+| `SUBSPACE_HANDLE_IDLE_SECONDS`        | `900`                      | A handle whose session has had no connection this long can be registered by another session without `takeover` |
+| `SUBSPACE_SESSION_TTL_DAYS`           | `30`                       | Remove a session (handle, memberships, PR subscriptions, callbacks) after this long with no connection         |
+| `GITHUB_TOKEN`                        | —                          | Token for PR polling (`gh auth token`)                                                                         |
+| `GITHUB_API_URL`                      | `https://api.github.com`   | API base (set for GitHub Enterprise / tests)                                                                   |
+| `GITHUB_GRAPHQL_URL`                  | `{GITHUB_API_URL}/graphql` | GraphQL endpoint (override for Enterprise)                                                                     |
+| `SUBSPACE_PR_POLL_SECONDS`            | —                          | Force a fixed PR poll cadence (override/testing)                                                               |
+| `SUBSPACE_PR_WARM_TTL_SECONDS`        | `1800`                     | Keep an unsubscribed PR tracker warm this long before deleting (0 = delete immediately)                        |
+| `SUBSPACE_PR_CHECK_SUMMARY_THRESHOLD` | `5`                        | Collapse this many+ passing checks completing in one poll into a single summary event; 0 disables              |
 
 The relay (the `notifications` plugin) has its own settings with the
 `NOTIFICATIONS_` prefix: `NOTIFICATIONS_WS_HOST`/`PORT`/`URL` to find the
@@ -143,6 +143,73 @@ The script moves the directory to `$SUBSPACE_DATA_DIR` (default
 `$XDG_DATA_HOME/subspace`) and links `~/.claude/notifications/token` to the moved
 token, so local relays keep authenticating. Deployments that set
 `NOTIFICATIONS_*` variables must rename them to `SUBSPACE_*`.
+
+## Remote-agent gateway
+
+`subspace-gateway.py` is an MCP server (Streamable HTTP) for agents that cannot
+run the stdio relay, for example agents that run in the cloud. It is the only
+part that should face the internet; keep the server's WebSocket on a private
+network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
+
+- Each request needs `Authorization: Bearer ssp_…`, a credential from the
+  accounts file. The gateway never accepts the master token.
+- The gateway holds no secret. It opens a WebSocket to the server with the
+  agent's own token, so the server enforces the account's permissions, channels,
+  and limits.
+- Nothing is pushed. Agents call `catch_up`, or `wait_for_messages` to wait for
+  a reply. A batch is acknowledged when the agent pulls again (or calls `ack`),
+  so a batch whose response was lost comes back.
+- Only the tools that the account can use are listed.
+
+### Configuration
+
+| Variable                                    | Default               | Purpose                                                                                                                         |
+| ------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `SUBSPACE_CORE_URL`                         | `ws://127.0.0.1:8137` | The server's WebSocket                                                                                                          |
+| `SUBSPACE_GATEWAY_HOST`                     | `127.0.0.1`           | HTTP bind host                                                                                                                  |
+| `SUBSPACE_GATEWAY_PORT`                     | `8138`                | HTTP port                                                                                                                       |
+| `SUBSPACE_GATEWAY_ALLOWED_HOSTS`            | the bind address      | `Host` values to accept (DNS rebinding protection). Set it to the public host name, e.g. `subspace.example.com`                 |
+| `SUBSPACE_GATEWAY_ALLOWED_ORIGINS`          | none                  | Browser `Origin` values to accept. Requests with no `Origin` are accepted                                                       |
+| `SUBSPACE_GATEWAY_IDLE_SECONDS`             | `600`                 | Close a session's WebSocket after this long with no request; the session then shows as offline                                  |
+| `SUBSPACE_GATEWAY_WAIT_MAX_SECONDS`         | `30`                  | Longest `wait_for_messages`                                                                                                     |
+| `SUBSPACE_GATEWAY_MAX_BODY_BYTES`           | `65536`               | Largest request body                                                                                                            |
+| `SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL`  | `20`                  | Open sessions for each credential                                                                                               |
+| `SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE` | `20`                  | Failed authentications for each client address before 429                                                                       |
+| `SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS`      | `60`                  | How long the gateway trusts the server's verdict on a token. A revoked credential can work this much longer through the gateway |
+| `SUBSPACE_GATEWAY_TRUST_FORWARDED`          | off                   | Take the client address from `X-Forwarded-For` (set it only behind a proxy that sets the header)                                |
+
+Run it next to the server:
+
+```bash
+SUBSPACE_CORE_URL=ws://127.0.0.1:8137 uv run -qs subspace-gateway.py
+```
+
+In the container image, run
+`/opt/gateway-venv/bin/python /app/subspace/server/subspace-gateway.py`.
+Terminate TLS in front of it. Probes can use `GET /healthz`.
+
+### Connecting a remote agent
+
+1. Add an account and a credential (see [The accounts file](#the-accounts-file)).
+2. Give the agent the URL with the session that it acts as, and the token as a
+   bearer token. Use `?handle=<name>` for an agent that keeps one name, or
+   `?session=<id>` for a stable id of your own (for example one per CI run):
+
+   ```
+   https://subspace.example.com/mcp?handle=ci-reviewer
+   Authorization: Bearer ssp_…
+   ```
+
+   The `X-Subspace-Handle` and `X-Subspace-Session` headers do the same. MCP
+   protocol version 2026-07-28 has no sessions, so the URL or a header must name
+   the session. A client on an older protocol version can call `attach` instead.
+
+3. The agent calls `whoami`, then `register_agent` with a description (a
+   `?handle=` session already has its handle), `join_channel`, and `catch_up` or
+   `wait_for_messages` in its loop.
+
+Agents in the default account see a remote agent as `ci-reviewer@ci`, and the
+remote agent sees them as `name@default`.
 
 ## Run manually
 

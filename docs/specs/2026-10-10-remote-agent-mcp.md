@@ -1,6 +1,6 @@
 # Remote-agent MCP gateway
 
-Status: draft, for review. Date: 2026-10-10.
+Status: implemented. Date: 2026-10-10.
 
 Depends on [2026-10-10-identity.md](2026-10-10-identity.md) (accounts,
 sessions, and handles). Read that first.
@@ -114,6 +114,7 @@ permissions = ["messaging"]      # see below
 max_severity = "normal"          # optional; see "Messages from other accounts"
 
 [account.limits]                 # optional; see "Permissions and limits"
+sessions = 20
 posts_per_minute = 30
 channels = 10
 pr_subscriptions = 0
@@ -140,6 +141,11 @@ token once, and prints the TOML block with the hash.
 To revoke a credential, remove its block. On reload, the core closes every
 live connection that uses a removed or expired credential, with code 1008. To
 remove an account, remove its block; its sessions expire as usual.
+
+A file that is not valid stops the core at startup. At a later reload, the core
+accepts only the master token until the file is fixed (fail closed): an edit
+that revokes a credential and also breaks the file must not leave the
+credential valid.
 
 ### Permissions
 
@@ -175,18 +181,21 @@ Every session key that the connection uses is in `conn.account`.
 - The core checks permissions in the frame dispatch. A frame that needs a
   missing permission gets `error: "forbidden: <permission>"`.
 - Message body: 16 KiB, for all accounts.
-- Each account has limits for each session (`[account.limits]`). Defaults
-  for an account in the file:
+- Each account has limits (`[account.limits]`). Defaults for an account in
+  the file:
 
-  | Limit              | Applies to                   | Default |
-  | ------------------ | ---------------------------- | ------- |
-  | `posts_per_minute` | posts and DMs (token bucket) | 30      |
-  | `channels`         | joined channels              | 10      |
-  | `pr_subscriptions` | PR subscriptions             | 0       |
-  | `callbacks`        | pending scheduled callbacks  | 0       |
+  | Limit              | Applies to                                    | Default |
+  | ------------------ | --------------------------------------------- | ------- |
+  | `sessions`         | sessions in the account                       | 20      |
+  | `posts_per_minute` | posts, DMs, and reactions, for the account    | 30      |
+  | `channels`         | joined channels, for each session             | 10      |
+  | `pr_subscriptions` | PR subscriptions, for each session            | 0       |
+  | `callbacks`        | pending scheduled callbacks, for each session | 0       |
 
-  A limit of 0 has the same effect as the missing permission. The built-in
-  default account has no limits apart from the message body size.
+  A client can make sessions freely, so the limits that stop abuse
+  (`sessions`, `posts_per_minute`) apply to the whole account. A limit of 0 has
+  the same effect as the missing permission. The built-in default account has
+  no limits apart from the message body size.
 
 ### Messages from other accounts
 
@@ -216,39 +225,43 @@ accounts with a qualified handle (`reviewer@ci`). In addition:
 
 - MCP Streamable HTTP at `/mcp`, with the official `mcp` Python SDK on
   Starlette and uvicorn.
-- `Authorization: Bearer ssp_…` on every request. A missing or malformed
-  token gets 401 with `WWW-Authenticate: Bearer`. The gateway checks only the
-  format; the core checks validity when the WebSocket opens. The gateway
-  caches the core's verdict for each token for a short time (about 60 s), so a
-  wrong token does not open a WebSocket on every request.
-- Validate `Origin`, as the MCP transport spec requires. Reject a request that
-  has a browser `Origin` not in an allowlist (the default allowlist is empty).
+- `Authorization: Bearer ssp_…` on every request. A missing token, a token
+  of another form (the master token included), or a token that the core
+  refuses gets 401 with `WWW-Authenticate: Bearer`. The gateway asks the core
+  (a WebSocket and `whoami`) and caches the verdict for each token for 60 s
+  (`SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS`), so a wrong token does not open a
+  WebSocket on every request. A revoked credential's open sessions close at
+  once; new requests with it fail within the cache time.
+- Validate `Host` and `Origin` (the SDK's DNS rebinding protection), as the
+  MCP transport spec requires. The allowed hosts are configured; a request
+  with a browser `Origin` that is not in an allowlist is refused (the default
+  allowlist is empty).
 - Limits: request body (for example 64 KiB), concurrent MCP sessions for each
   credential, authentication failures for each IP address.
 - `GET /healthz` for probes. No other routes.
 - Never log a token. Log the credential id.
 
-### Attaching an MCP session
+### Naming the session
 
 The MCP spec has no session identifier that the client supplies.
 `Mcp-Session-Id` is assigned by the server and lasts for one transport
-session, so the gateway cannot use it as a subspace session id. An MCP session
-attaches to a subspace session in one of these ways, in this order:
+session, and protocol version 2026-07-28 has no MCP sessions at all: each
+request is self-contained. So the gateway finds the subspace session for each
+request, in this order:
 
 1. **From the request.** The operator puts `?session=<id>` or `?handle=<h>`
-   in the URL, or sends `X-Subspace-Session` or `X-Subspace-Handle`. Some
-   platforms let the operator set these for each run.
-2. **From a tool call.** The agent calls `attach(session_id?, handle?)`. An
-   agent that has a stable id in its own metadata (a run id or a conversation
-   id) passes it as `session_id`. `register_agent(name)` also attaches by
-   handle, if the MCP session is not attached yet.
-3. **Not yet attached.** Every tool other than `whoami`, `attach`, and
-   `register_agent` replies "call attach or register_agent first".
+   in the URL, or sends `X-Subspace-Session` or `X-Subspace-Handle`. This is
+   the main path, and the only one for 2026-07-28 clients.
+2. **From an earlier tool call**, only for clients on older protocol versions,
+   which keep an MCP session. The agent calls `attach(session_id?, handle?)`,
+   or `register_agent(name)` to attach by handle; the gateway remembers the
+   choice for that `Mcp-Session-Id`.
+3. **None.** Tools that need a session reply with how to name one.
 
-To attach, the gateway opens a WebSocket to the core with the agent's bearer
-token, and sends `register` with the session id, or with `@<handle>` (see
-"attach by handle" in the identity spec), then `register_agent` if a handle
-was given.
+The gateway keeps one WebSocket to the core for each (credential, session),
+and sends `register` with the session id or `@<handle>` (see "attach by
+handle" in the identity spec). Requests for the same session share it, so the
+gateway itself never splits delivery.
 
 ### Delivery: pull, at least once
 
@@ -305,15 +318,19 @@ step can move them into a shared module that both import.
 
 ### Deployment
 
-- Same image, new entry point (`server/subspace-gateway.py`, PEP 723, locked).
-- One replica. MCP sessions are in memory, so more replicas would need
-  session affinity on `Mcp-Session-Id`.
+- Same image, new entry point (`server/subspace-gateway.py`, PEP 723, locked,
+  with its own venv in the image).
+- One replica. The WebSockets, the pull buffers, and the attach choices of
+  older clients are in memory. More replicas would split delivery for a
+  session, and the core would warn about multiple connections.
 - The ingress terminates TLS and exposes only the gateway. The core WebSocket
   stays on the private network.
 - Gateway settings: `SUBSPACE_GATEWAY_HOST`, `SUBSPACE_GATEWAY_PORT`,
   `SUBSPACE_CORE_URL`, and the limits above.
 
 ## Phases
+
+Phases 1–4 are implemented (docs/plans/2026-10-10-remote-agents.md).
 
 1. **Identity.** The identity spec: sessions keyed by account and session id,
    handles, migration, wire compatibility, multiple-connection warnings.

@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -20,6 +21,10 @@ import sessions
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVER = str(ROOT / "server" / "subspace-server.py")
+GATEWAY = str(ROOT / "server" / "subspace-gateway.py")
+# Spawned scripts run on the test run's Python version, so that
+# `UV_PYTHON=3.12 uv run -qs tests/run.py` also tests them on the image's version.
+_PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 def free_port() -> int:
@@ -94,7 +99,7 @@ def server_env(
 @contextlib.contextmanager
 def server_process(env: dict):
     proc = subprocess.Popen(
-        ["uv", "run", "-qs", SERVER],
+        ["uv", "run", "-qs", "--python", _PYTHON, SERVER],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -102,6 +107,33 @@ def server_process(env: dict):
     try:
         if not wait_port(env["SUBSPACE_WS_PORT"]):
             raise RuntimeError("server did not start listening")
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@contextlib.contextmanager
+def gateway_process(core_port: int, port: int, **settings: str):
+    """Run the gateway against the core on ``core_port``. ``settings`` become
+    SUBSPACE_GATEWAY_<NAME> environment variables."""
+    env = _isolated_environ()
+    env["SUBSPACE_CORE_URL"] = f"ws://127.0.0.1:{core_port}"
+    env["SUBSPACE_GATEWAY_PORT"] = str(port)
+    for name, value in settings.items():
+        env[f"SUBSPACE_GATEWAY_{name.upper()}"] = value
+    proc = subprocess.Popen(
+        ["uv", "run", "-qs", "--python", _PYTHON, GATEWAY],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        if not wait_port(port, timeout=60.0):
+            raise RuntimeError("gateway did not start listening")
         yield proc
     finally:
         proc.terminate()

@@ -18,6 +18,7 @@ network at test time (local fake GitHub GraphQL and Forgejo servers are used).
 #     "httpx",
 #     "tzdata",
 #     "subspace-protocol",
+#     "mcp>=2.3,<3",
 # ]
 #
 # [tool.uv.sources]

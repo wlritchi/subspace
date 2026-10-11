@@ -1,9 +1,13 @@
 # syntax=docker/dockerfile:1
 #
 # Image for the subspace server, which the `notifications` Claude Code plugin's relay
-# connects to (PR monitoring + agent messaging). The server is a PEP 723 uv script;
-# its deps are baked from the committed lock (server/subspace-server.py.lock) so the
-# running pod never reaches PyPI.
+# connects to (PR monitoring + agent messaging), and for the remote-agent gateway.
+# Both are PEP 723 uv scripts; their deps are baked from the committed locks
+# (server/*.py.lock) into one venv each, so the running pod never reaches PyPI.
+#
+# The default command runs the server. To run the gateway from the same image:
+#   /opt/gateway-venv/bin/python /app/subspace/server/subspace-gateway.py
+# with SUBSPACE_CORE_URL and SUBSPACE_GATEWAY_ALLOWED_HOSTS set.
 #
 # CI builds and pushes releases (.forgejo/workflows/build.yaml). To build by hand,
 # from the repository root:
@@ -23,19 +27,23 @@ ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1
 # The lock refers to ../protocol relative to the script, so run from server/ and copy
 # the protocol package beside it. --no-editable installs it into the venv as a copy.
 COPY protocol/ ./protocol/
-COPY server/subspace-server.py server/subspace-server.py.lock ./server/
+COPY server/subspace-server.py server/subspace-server.py.lock \
+     server/subspace-gateway.py server/subspace-gateway.py.lock ./server/
 WORKDIR /build/server
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv export --script subspace-server.py --frozen --no-editable -o requirements.txt && \
     uv venv /opt/venv && \
-    uv pip install --python /opt/venv -r requirements.txt
+    uv pip install --python /opt/venv -r requirements.txt && \
+    uv export --script subspace-gateway.py --frozen --no-editable -o gateway-requirements.txt && \
+    uv venv /opt/gateway-venv && \
+    uv pip install --python /opt/gateway-venv -r gateway-requirements.txt
 
 FROM python:3.12-slim-bookworm AS runtime
 ARG VERSION=0.0.0
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 LABEL org.opencontainers.image.title="subspace" \
-      org.opencontainers.image.description="Persistent WS server for the notifications Claude Code plugin (PR monitoring + agent messaging)" \
+      org.opencontainers.image.description="Persistent WS server for the notifications Claude Code plugin (PR monitoring + agent messaging), and its MCP gateway for remote agents" \
       org.opencontainers.image.source="https://github.com/wlritchi/subspace" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
@@ -49,8 +57,10 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
 # k8s runAsNonRoot:true admission check can verify non-root without a runAsUser override.
 RUN groupadd -g 10001 app && useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin app
 COPY --from=build --chown=app:app /opt/venv /opt/venv
+COPY --from=build --chown=app:app /opt/gateway-venv /opt/gateway-venv
 # Preserve the server/lib sibling layout — the server adds ../lib to sys.path at runtime.
 COPY --chown=app:app server/subspace-server.py /app/subspace/server/subspace-server.py
+COPY --chown=app:app server/subspace-gateway.py /app/subspace/server/subspace-gateway.py
 COPY --chown=app:app lib/ /app/subspace/lib/
 # /data is the SUBSPACE_DATA_DIR mount point; created + owned here for non-PVC runs.
 # In k8s the mounted PVC needs securityContext.fsGroup: 10001 to be writable by `app`.
@@ -59,9 +69,11 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     SUBSPACE_WS_HOST=0.0.0.0 \
     SUBSPACE_WS_PORT=8137 \
-    SUBSPACE_DATA_DIR=/data
+    SUBSPACE_DATA_DIR=/data \
+    SUBSPACE_GATEWAY_HOST=0.0.0.0 \
+    SUBSPACE_GATEWAY_PORT=8138
 USER 10001:10001
-EXPOSE 8137
+EXPOSE 8137 8138
 VOLUME ["/data"]
 # Plain `python`: deps live in the venv, so the PEP723 header is inert (no runtime uv resolve).
 ENTRYPOINT ["tini", "--"]

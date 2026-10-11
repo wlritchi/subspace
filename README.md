@@ -4,10 +4,12 @@ A persistent WebSocket server that owns notification
 state for Claude Code sessions. It schedules callbacks, monitors GitHub and
 Forgejo pull requests, and carries agent-to-agent messages. The per-session stdio
 MCP relay in the `notifications` plugin
-([wlr-cc-plugins](https://github.com/wlritchi/wlr-cc-plugins)) connects to it.
+([wlr-cc-plugins](https://github.com/wlritchi/wlr-cc-plugins)) connects to it, and
+remote agents connect through an MCP gateway with their own credentials.
 
-- `server/` — the server script (PEP 723, locked deps), systemd unit, and
-  configuration reference ([server/README.md](server/README.md))
+- `server/` — the server script and the remote-agent MCP gateway (PEP 723,
+  locked deps), systemd unit, and configuration reference
+  ([server/README.md](server/README.md))
 - `lib/` — modules the server imports from `../lib`
 - `protocol/` — the `subspace-protocol` package: the wire protocol as typed
   definitions, for the server and its clients ([protocol/README.md](protocol/README.md))
@@ -19,6 +21,7 @@ MCP relay in the `notifications` plugin
 
 ```bash
 uv run -qs tests/run.py
+UV_PYTHON=3.12 uv run -qs tests/run.py   # the image's Python version
 ```
 
 ## Run
