@@ -219,9 +219,9 @@ remote agent sees them as `name@default`.
 
 ### OAuth connectors
 
-Some UI connectors support only OAuth. With
-`SUBSPACE_GATEWAY_PUBLIC_URL` set, the gateway is also an OAuth authorization
-server with discovery metadata, so these clients find its endpoints.
+Some UI connectors support only OAuth. With `SUBSPACE_GATEWAY_PUBLIC_URL` set,
+the gateway is also an OAuth authorization server with discovery metadata, so
+these clients find its endpoints.
 
 1. The client sends the user's browser to `/authorize`. The gateway shows a
    page where the user pastes an `ssp_…` credential.
@@ -236,9 +236,13 @@ PKCE `S256`. Clients that register themselves (`/register`) get a client id at
 once. The scope (`subspace`) has no effect: the credential's account decides
 the access.
 
-The redirect URI must be in `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS`; the gateway
-refuses others, and logs them. Add the URI that the client uses (its connector
-documentation gives it, or try once and read the refusal). Example:
+`SUBSPACE_GATEWAY_PUBLIC_URL` must be https (loopback excepted). The redirect
+URI must be in `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS`, which takes https
+entries; the gateway refuses others, and logs them. A prefix entry (ending in
+`*`) accepts only plain path segments after the prefix, on the same host and
+port, with no query, and it trusts every page under it: prefer exact entries.
+Add the URI that the client uses (its connector documentation gives it, or try
+once and read the refusal). Example:
 
 ```
 SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS=https://app.example.com/oauth/callback,https://other.example.net/mcp/*

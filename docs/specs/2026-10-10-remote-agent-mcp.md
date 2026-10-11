@@ -257,9 +257,10 @@ accounts with a qualified handle (`reviewer@ci`). In addition:
 
 ### OAuth (token paste)
 
-Added 2026-10-11. Some UI connectors accept only OAuth: they have no field for a static bearer token. When
-`SUBSPACE_GATEWAY_PUBLIC_URL` is set, the gateway is also a small OAuth
-authorization server, built on the MCP SDK's authorize and token handlers:
+Added 2026-10-11. Some UI connectors accept only OAuth: they have no field for
+a static bearer token. When `SUBSPACE_GATEWAY_PUBLIC_URL` is set, the gateway
+is also a small OAuth authorization server, built on the MCP SDK's authorize
+and token handlers:
 
 - **Discovery.** A 401 on `/mcp` names
   `/.well-known/oauth-protected-resource/mcp` (RFC 9728) in
@@ -273,18 +274,33 @@ authorization server, built on the MCP SDK's authorize and token handlers:
   token). If the core accepts it, the browser goes back to the client with a
   code. The page can also refuse (`access_denied`). It has no scripts and
   cannot be framed.
+- **Resource.** If the client sends an RFC 8707 `resource`, it must be this
+  gateway's `/mcp` (a query such as `?handle=` is allowed); otherwise
+  `invalid_target`. Without this check, a hostile MCP server could name the
+  gateway as its authorization server, and a client would give that server the
+  credential that the user pasted.
+- **Browser binding.** The first browser that opens a login page gets a cookie
+  (`__Host-`, `SameSite=Strict`, `HttpOnly`), and only that browser can
+  complete the login. A form `POST` with an `Origin` of another site is
+  refused. So someone who learns a login's id (from a log or browser history)
+  cannot complete it with their own credential.
 - **Token.** `/token` checks PKCE (S256 only) and returns the pasted token as
   the access token, with no expiry and no refresh token. A code works once,
   for 5 minutes.
 - **Clients.** Any client id is a public client (token auth method `none`).
   `/register` (RFC 7591) gives a new client id and stores nothing. A client id
   grants nothing by itself, so there is nothing to register in advance.
-- **Redirect URIs.** The real control. The gateway sends a code only to a
-  redirect URI in `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS` (exact, or a prefix
-  that ends in `*` and includes a path), or to a loopback `http` URI (RFC
-  8252). Others get an error page, not a redirect, and are logged. Without this
-  list, anyone could send a user a link that ends with the user's credential
-  at another site.
+- **Redirect URIs.** The real control: the client that starts a login chooses
+  the PKCE challenge, so a code at a URI that the attacker can read is enough.
+  The gateway sends a code only to a URI in
+  `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS`, or to a loopback `http` URI (RFC
+  8252). Entries are https. An exact entry must match exactly. An entry that
+  ends in `*` is a prefix: same scheme, host, and port, then the path prefix,
+  then only plain path segments (no query, fragment, empty or dot segments,
+  or percent signs). A prefix trusts every page under it. Other URIs get an
+  error page, not a redirect, and are logged.
+- **Transport.** `SUBSPACE_GATEWAY_PUBLIC_URL` must be https, except on
+  loopback; otherwise the gateway does not start.
 
 Why the access token is the credential itself:
 
@@ -294,10 +310,10 @@ Why the access token is the credential itself:
 - The gateway keeps no token state, so a restart signs no one out.
 - Revocation stays in one place: remove the credential from `accounts.toml`.
 
-The login and code stores are in memory and capped (1000 each); a login page
-lasts 10 minutes. `/authorize` needs no credential, so a flood can fill the
-login store for up to 10 minutes. That stops new logins, not existing
-sessions.
+The login and code stores are in memory and capped (1000 each, and 10 open
+logins for each client address); a login lasts 10 minutes. `/authorize` needs
+no credential, so a flood from many addresses can fill the login store for up
+to 10 minutes. That stops new logins, not existing sessions.
 
 ### Naming the session
 
@@ -422,11 +438,11 @@ Phases 1–4 are implemented (docs/plans/2026-10-10-remote-agents.md).
   or a CI workflow. This makes remote agents reachable between runs. Risks:
   SSRF (allowlist schemes and hosts, block private addresses), retries, and a
   cap on the rate.
-- **Session in each tool call.** UI connectors run many conversations through one connector URL, so a handle in the URL
-  names one session for all of them. Instead, each tool gets an optional
-  `handle` or `session` argument, and a call that names no session, on a
-  request with no session state, fails with how to name one. This replaces
-  the URL parameters as the main path.
+- **Session in each tool call.** UI connectors run many conversations through
+  one connector URL, so a handle in the URL names one session for all of them.
+  Instead, each tool gets an optional `handle` or `session` argument, and a
+  call that names no session, on a request with no session state, fails with
+  how to name one. This replaces the URL parameters as the main path.
 - **Server-sent notifications** on the `GET /mcp` stream for clients that
   support them. This is cheap after the gateway exists, but few remote clients
   read the stream.

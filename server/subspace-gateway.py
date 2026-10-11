@@ -58,6 +58,7 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -582,6 +583,9 @@ CODE_SECONDS = 300.0
 # At most this many open logins and unredeemed codes. /authorize needs no
 # credential, so the limit keeps memory bounded.
 MAX_PENDING = 1000
+# At most this many open logins from one client address, so that one address
+# cannot fill the store.
+MAX_LOGINS_PER_ADDRESS = 10
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
@@ -596,6 +600,10 @@ class PendingLogin:
     client_id: str
     params: AuthorizationParams
     created: float
+    address: str
+    # sha256 of the browser cookie that opened the login page first. Only that
+    # browser can complete the login.
+    browser: str | None = None
 
 
 class OAuthClient(OAuthClientInformationFull):
@@ -616,21 +624,90 @@ class OAuthClient(OAuthClientInformationFull):
         return requested_scope.split() if requested_scope else None
 
 
-def _parse_redirect_patterns(raw: list[str]) -> list[str]:
-    """Allowed redirect URIs. An entry that ends in ``*`` is a prefix; it must
-    include a path after the host, so that it cannot match another host."""
-    patterns: list[str] = []
+@dataclass(frozen=True)
+class RedirectPattern:
+    """An allowed redirect URI, or with ``prefix``, a path prefix on one
+    origin."""
+
+    scheme: str
+    netloc: str
+    path: str
+    prefix: bool
+    exact: str = ""
+
+
+# What a prefix pattern accepts after its path: plain path segments only, so
+# that encoded separators, empty segments, and dot segments cannot reach other
+# pages on the host.
+_SAFE_REST_RE = re.compile(r"^[A-Za-z0-9_~-][A-Za-z0-9._~-]*(?:/[A-Za-z0-9._~-]+)*/?\Z")
+
+
+def _parse_redirect_patterns(raw: list[str]) -> list[RedirectPattern]:
+    """Allowed redirect URIs, https only. An entry that ends in ``*`` is a
+    prefix, and must include a path after the host."""
+    patterns: list[RedirectPattern] = []
     for entry in raw:
-        if entry.endswith("*"):
-            prefix = entry[:-1]
-            parsed = urllib.parse.urlsplit(prefix)
-            if parsed.scheme not in ("https", "http") or not parsed.path.startswith(
-                "/"
-            ):
-                log.warning("ignored the redirect URI prefix %r: no path", entry)
-                continue
-        patterns.append(entry)
+        prefix = entry.endswith("*")
+        try:
+            normal = str(AnyUrl(entry[:-1] if prefix else entry))
+        except ValidationError:
+            log.warning("ignored the redirect URI %r: not a URL", entry)
+            continue
+        parsed = urllib.parse.urlsplit(normal)
+        if parsed.scheme != "https":
+            log.warning("ignored the redirect URI %r: not https", entry)
+            continue
+        if prefix and (
+            parsed.query
+            or parsed.fragment
+            or not urllib.parse.urlsplit(entry).path.startswith("/")
+        ):
+            log.warning("ignored the redirect URI prefix %r: no path", entry)
+            continue
+        patterns.append(
+            RedirectPattern(parsed.scheme, parsed.netloc, parsed.path, prefix, normal)
+        )
     return patterns
+
+
+def _prefix_match(pattern: RedirectPattern, uri: str) -> bool:
+    parsed = urllib.parse.urlsplit(uri)
+    if (
+        parsed.scheme != pattern.scheme
+        or parsed.netloc != pattern.netloc
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith(pattern.path)
+    ):
+        return False
+    rest = parsed.path[len(pattern.path) :]
+    if rest.startswith("/") and not pattern.path.endswith("/"):
+        rest = rest[1:]
+    if rest == "":
+        return True
+    return bool(_SAFE_REST_RE.match(rest)) and not any(
+        segment in (".", "..") for segment in rest.split("/")
+    )
+
+
+# The client address of the current request. The SDK calls authorize without
+# the request, so WithAddress sets it.
+_REQUEST_ADDRESS: ContextVar[str] = ContextVar("request_address", default="unknown")
+
+
+class WithAddress:
+    """ASGI wrapper that sets _REQUEST_ADDRESS. A class, because Starlette
+    treats a plain function endpoint as a request handler."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        reset = _REQUEST_ADDRESS.set(_client_address(scope))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _REQUEST_ADDRESS.reset(reset)
 
 
 class OAuthServer:
@@ -646,7 +723,7 @@ class OAuthServer:
         self.public_url: str = os.environ.get("SUBSPACE_GATEWAY_PUBLIC_URL", "").rstrip(
             "/"
         )
-        self.redirect_patterns: list[str] = _parse_redirect_patterns(
+        self.redirect_patterns: list[RedirectPattern] = _parse_redirect_patterns(
             _env_list("SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS", [])
         )
         self.logins: dict[str, PendingLogin] = {}
@@ -670,12 +747,30 @@ class OAuthServer:
             # RFC 8252: a native client on this machine, on any port.
             return True
         for pattern in self.redirect_patterns:
-            if pattern.endswith("*"):
-                if uri.startswith(pattern[:-1]):
+            if pattern.prefix:
+                if _prefix_match(pattern, uri):
                     return True
-            elif uri == pattern:
+            elif uri == pattern.exact:
                 return True
         return False
+
+    def resource_allowed(self, resource: str) -> bool:
+        """True if an RFC 8707 resource indicator names this gateway's /mcp.
+        A query (for example ?handle=) is allowed."""
+        parsed = urllib.parse.urlsplit(resource)
+        if parsed.fragment:
+            return False
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+        return base.lower() == self.resource_url.lower()
+
+    @property
+    def secure(self) -> bool:
+        return self.public_url.startswith("https://")
+
+    @property
+    def cookie_name(self) -> str:
+        # __Host- needs Secure, so plain http (loopback tests) uses another name.
+        return "__Host-subspace-login" if self.secure else "subspace-login"
 
     def _prune(self, now: float) -> None:
         for rid, login in list(self.logins.items()):
@@ -703,12 +798,27 @@ class OAuthServer:
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
     ) -> str:
+        if params.resource is not None and not self.resource_allowed(params.resource):
+            # Otherwise a client that another server sent here would give that
+            # server the credential.
+            log.info("refused an OAuth resource: %s", params.resource)
+            raise AuthorizeError(
+                "invalid_target", "this server issues tokens only for its own /mcp"
+            )
         now = time.monotonic()
         self._prune(now)
         if len(self.logins) >= MAX_PENDING:
             raise AuthorizeError("temporarily_unavailable", "too many open logins")
+        address = _REQUEST_ADDRESS.get()
+        if (
+            sum(1 for login in self.logins.values() if login.address == address)
+            >= MAX_LOGINS_PER_ADDRESS
+        ):
+            raise AuthorizeError(
+                "temporarily_unavailable", "too many open logins from this address"
+            )
         rid = secrets.token_urlsafe(24)
-        self.logins[rid] = PendingLogin(str(client.client_id), params, now)
+        self.logins[rid] = PendingLogin(str(client.client_id), params, now, address)
         return f"{self.public_url}/oauth/login?request={rid}"
 
     async def load_authorization_code(
@@ -794,7 +904,7 @@ button {{ padding: .5rem 1rem; margin: 1rem .5rem 0 0; }}
 your browser goes to:</p>
 <p><code>{redirect}</code></p>
 <p>That application gets the access of the credential that you paste here.
-Continue only if you started this connection, and you trust
+Continue only if you started this connection yourself, just now, from
 <strong>{host}</strong>.</p>
 {error}
 <form method="post" action="login">
@@ -838,21 +948,59 @@ def _redirect(login: PendingLogin, **params: str | None) -> RedirectResponse:
     return RedirectResponse(url, status_code=302, headers=_PAGE_HEADERS)
 
 
+def _open_login(rid: str) -> PendingLogin | None:
+    login = OAUTH.logins.get(rid)
+    if login is None or time.monotonic() - login.created > LOGIN_SECONDS:
+        return None
+    return login
+
+
+def _browser_hash(request: Request) -> str | None:
+    value = request.cookies.get(OAUTH.cookie_name)
+    return hashlib.sha256(value.encode()).hexdigest() if value else None
+
+
+_EXPIRED = "This login expired. Start the connection again."
+_OTHER_BROWSER = "This login is open in another browser. Start the connection again."
+
+
 async def _login(request: Request) -> Response:
     if request.method == "GET":
         rid = request.query_params.get("request", "")
-        login = OAUTH.logins.get(rid)
-        if login is None or time.monotonic() - login.created > LOGIN_SECONDS:
-            return _page("This login expired. Start the connection again.", 400)
-        return _login_page(rid, login)
+        login = _open_login(rid)
+        if login is None:
+            return _page(_EXPIRED, 400)
+        value = request.cookies.get(OAUTH.cookie_name) or secrets.token_urlsafe(32)
+        browser = hashlib.sha256(value.encode()).hexdigest()
+        if login.browser is None:
+            login.browser = browser
+        elif login.browser != browser:
+            return _page(_OTHER_BROWSER, 403)
+        response = _login_page(rid, login)
+        response.set_cookie(
+            OAUTH.cookie_name,
+            value,
+            max_age=int(LOGIN_SECONDS),
+            path="/",
+            secure=OAUTH.secure,
+            httponly=True,
+            samesite="strict",
+        )
+        return response
 
+    origin = request.headers.get("origin")
+    public = urllib.parse.urlsplit(OAUTH.public_url)
+    if origin is not None and origin != f"{public.scheme}://{public.netloc}":
+        return _page("This form was sent from another site.", 403)
     form = await request.form()
     rid = str(form.get("request") or "")
-    login = OAUTH.logins.get(rid)
-    if login is None or time.monotonic() - login.created > LOGIN_SECONDS:
-        return _page("This login expired. Start the connection again.", 400)
+    login = _open_login(rid)
+    if login is None:
+        return _page(_EXPIRED, 400)
+    if login.browser is None or login.browser != _browser_hash(request):
+        return _page(_OTHER_BROWSER, 403)
     if form.get("action") == "deny":
-        del OAUTH.logins[rid]
+        OAUTH.logins.pop(rid, None)
         return _redirect(login, error="access_denied")
 
     client = _client_address(request.scope)
@@ -873,7 +1021,9 @@ async def _login(request: Request) -> Response:
         )
         return _login_page(rid, login, "subspace does not accept that credential.")
 
-    del OAUTH.logins[rid]
+    # Another request for the same login can finish while verify waits.
+    if OAUTH.logins.pop(rid, None) is None:
+        return _page(_EXPIRED, 400)
     try:
         issued = OAUTH.issue_code(login, token)
     except GatewayError as exc:
@@ -990,7 +1140,7 @@ def oauth_routes() -> list[Route]:
         ),
         Route(
             "/authorize",
-            _limited(request_response(AuthorizationHandler(OAUTH).handle)),
+            WithAddress(_limited(request_response(AuthorizationHandler(OAUTH).handle))),
             methods=["GET", "POST"],
         ),
         Route(
@@ -1831,6 +1981,10 @@ def build_app() -> ASGIApp:
         host=host,
     )
     if OAUTH.enabled:
+        public = urllib.parse.urlsplit(OAUTH.public_url)
+        if not OAUTH.secure and public.hostname not in _LOOPBACK_HOSTS:
+            # Credentials and codes must not cross the network in clear text.
+            raise SystemExit("SUBSPACE_GATEWAY_PUBLIC_URL must be https")
         app.router.routes.extend(oauth_routes())
     return AuthMiddleware(app, "/mcp")
 

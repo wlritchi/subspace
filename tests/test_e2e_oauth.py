@@ -50,6 +50,7 @@ async def _authorize(
     challenge: str,
     redirect_uri: str = CALLBACK,
     client_id: str = "subspace",
+    **extra: str,
 ) -> httpx2.Response:
     return await http.get(
         f"{_base(stack)}/authorize",
@@ -61,6 +62,7 @@ async def _authorize(
             "code_challenge_method": "S256",
             "state": "st8",
             "scope": "subspace",
+            **extra,
         },
     )
 
@@ -216,6 +218,14 @@ def test_redirect_allowlist(stack: Stack) -> None:
                 "https://prefix.example/cbx",
                 "https://nopath.example/cb",
                 "https://nopath.example.evil/cb",
+                "https://prefix.example/cb/x?next=https://evil.example",
+                "https://prefix.example/cb/x#frag",
+                "https://prefix.example/cb/..%2f..%2fredirect",
+                "https://prefix.example/cb//evil.example/",
+                "https://prefix.example/cb/a/../../b",
+                "https://prefix.example/cb/%2e%2e/b",
+                "https://prefix.example:8443/cb/x",
+                "http://prefix.example/cb/x",
                 "http://localhost@evil.example/cb",
                 "https://127.0.0.1/cb",
             ):
@@ -290,5 +300,89 @@ def test_access_token_works_on_mcp(stack: Stack) -> None:
             result = await client.call_tool("whoami", {})
             text = "\n".join(getattr(c, "text", "") for c in result.content)
             assert "account: ci" in text
+
+    asyncio.run(scenario())
+
+
+def test_open_logins_per_address(stack: Stack) -> None:
+    async def scenario() -> None:
+        async with httpx2.AsyncClient() as http:
+            _verifier, challenge = _pkce()
+            opened: list[str] = []
+            while True:
+                reply = await _authorize(http, stack, challenge)
+                assert reply.status_code == 302
+                params = urllib.parse.urlsplit(reply.headers["location"])
+                if "/oauth/login" not in params.path:
+                    break
+                opened.append(urllib.parse.parse_qs(params.query)["request"][0])
+                assert len(opened) <= 10
+            # Refused back to the client, which then shows the error.
+            assert dict(urllib.parse.parse_qsl(params.query))["error"] == (
+                "temporarily_unavailable"
+            )
+            # Closing logins frees room for new ones.
+            for rid in opened:
+                await http.get(f"{_base(stack)}/oauth/login?request={rid}")
+                await http.post(
+                    f"{_base(stack)}/oauth/login",
+                    data={"request": rid, "action": "deny"},
+                )
+            reply = await _authorize(http, stack, challenge)
+            assert "/oauth/login?" in reply.headers["location"]
+            rid = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(reply.headers["location"]).query
+            )["request"][0]
+            await http.get(reply.headers["location"])
+            await http.post(
+                f"{_base(stack)}/oauth/login", data={"request": rid, "action": "deny"}
+            )
+
+    asyncio.run(scenario())
+
+
+def test_resource_must_be_this_gateway(stack: Stack) -> None:
+    async def scenario() -> None:
+        async with httpx2.AsyncClient() as http:
+            _verifier, challenge = _pkce()
+            for resource in (
+                f"{_base(stack)}/mcp",
+                f"{_base(stack)}/mcp/",
+                f"{_base(stack)}/mcp?handle=bot",
+            ):
+                reply = await _authorize(http, stack, challenge, resource=resource)
+                assert "/oauth/login?" in reply.headers["location"], resource
+            for resource in ("https://evil.example/mcp", f"{_base(stack)}/other"):
+                reply = await _authorize(http, stack, challenge, resource=resource)
+                assert _query(reply)["error"] == "invalid_target", resource
+
+    asyncio.run(scenario())
+
+
+def test_login_is_bound_to_its_browser(stack: Stack) -> None:
+    async def scenario() -> None:
+        async with httpx2.AsyncClient() as victim, httpx2.AsyncClient() as other:
+            _verifier, challenge = _pkce()
+            authorize = await _authorize(victim, stack, challenge)
+            login_url = authorize.headers["location"]
+            assert (await victim.get(login_url)).status_code == 200
+            rid = urllib.parse.parse_qs(urllib.parse.urlsplit(login_url).query)[
+                "request"
+            ][0]
+            form = {"request": rid, "token": stack.tokens["ci"], "action": "allow"}
+            # Another browser that knows the request id can neither open the
+            # page nor complete the login.
+            assert (await other.get(login_url)).status_code == 403
+            stolen = await other.post(f"{_base(stack)}/oauth/login", data=form)
+            assert stolen.status_code == 403
+            # A form sent from another site is refused.
+            cross = await victim.post(
+                f"{_base(stack)}/oauth/login",
+                data=form,
+                headers={"Origin": "https://evil.example"},
+            )
+            assert cross.status_code == 403
+            done = await victim.post(f"{_base(stack)}/oauth/login", data=form)
+            assert "code" in _query(done)
 
     asyncio.run(scenario())
