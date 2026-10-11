@@ -10,6 +10,10 @@ server with the agent's token, attaches to the agent's session, and turns tool
 calls into protocol frames. Notifications are pulled with catch_up and
 wait_for_messages. See ../docs/specs/2026-10-10-remote-agent-mcp.md.
 
+A UI connector that supports only OAuth signs in on a page where the user
+pastes an ``ssp_`` token. The access token that it gets is that token. This
+needs SUBSPACE_GATEWAY_PUBLIC_URL.
+
 A request names its session with the ``session`` or ``handle`` URL parameter, or
 the ``X-Subspace-Session`` or ``X-Subspace-Handle`` header. A client that keeps
 an MCP session (protocol versions before 2026-07-28) can call attach or
@@ -28,6 +32,9 @@ Config (env):  SUBSPACE_GATEWAY_HOST (default 127.0.0.1)
                SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS (default 60)
                SUBSPACE_GATEWAY_MAX_MCP_SESSIONS (default 1000)
                SUBSPACE_GATEWAY_TRUST_FORWARDED (default 0)
+               SUBSPACE_GATEWAY_PUBLIC_URL (https://host; unset turns off OAuth)
+               SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS (comma-separated; an entry
+                   that ends in * is a prefix; loopback is always allowed)
 """
 
 # /// script
@@ -41,12 +48,15 @@ Config (env):  SUBSPACE_GATEWAY_HOST (default 127.0.0.1)
 import asyncio
 import functools
 import hashlib
+import html
 import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
+import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -54,11 +64,48 @@ from typing import Any
 import subspace_protocol as proto
 import uvicorn
 from mcp.server import MCPServer
+from mcp.server.auth.handlers.authorize import AuthorizationHandler
+from mcp.server.auth.handlers.metadata import (
+    MetadataHandler,
+    ProtectedResourceMetadataHandler,
+)
+from mcp.server.auth.handlers.token import TokenHandler
+from mcp.server.auth.middleware.client_auth import ClientAuthenticator
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    AuthorizeError,
+    RefreshToken,
+    TokenError,
+    construct_redirect_uri,
+)
+from mcp.server.auth.routes import cors_middleware
 from mcp.server.mcpserver import Context
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.transport_security import (
+    RequestBodyLimitMiddleware,
+    TransportSecuritySettings,
+)
+from mcp.shared.auth import (
+    InvalidRedirectUriError,
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+    OAuthToken,
+    ProtectedResourceMetadata,
+)
 from mcp_types import ListToolsResult
+from pydantic import AnyUrl, Field, ValidationError
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import PlainTextResponse, Response
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
+from starlette.routing import Route, request_response
 from starlette.types import ASGIApp, Receive, Scope, Send
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -509,13 +556,459 @@ class AuthMiddleware:
                 "refused a token (credential %s)",
                 _credential_id(token) if token.startswith("ssp_") else "-",
             )
+            challenge = 'Bearer realm="subspace"'
+            if OAUTH.enabled:
+                challenge += f', resource_metadata="{OAUTH.resource_metadata_url}"'
             await PlainTextResponse(
                 "unauthorized",
                 status_code=401,
-                headers={"WWW-Authenticate": 'Bearer realm="subspace"'},
+                headers={"WWW-Authenticate": challenge},
             )(scope, receive, send)
             return
         await self.app(scope, receive, send)
+
+
+# --------------------------------------------------------------------------- #
+# HTTP: OAuth (token paste)
+# --------------------------------------------------------------------------- #
+
+# The client ids that the gateway accepts. A client id grants nothing: the user
+# pastes a credential on the login page, and the redirect URI must be allowed.
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}\Z")
+OAUTH_SCOPE = "subspace"
+# How long a login page stays valid, and how long an issued code stays valid.
+LOGIN_SECONDS = 600.0
+CODE_SECONDS = 300.0
+# At most this many open logins and unredeemed codes. /authorize needs no
+# credential, so the limit keeps memory bounded.
+MAX_PENDING = 1000
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+class IssuedCode(AuthorizationCode):
+    """An authorization code, and the credential that the user pasted for it."""
+
+    credential: str = Field(repr=False)
+
+
+@dataclass
+class PendingLogin:
+    client_id: str
+    params: AuthorizationParams
+    created: float
+
+
+class OAuthClient(OAuthClientInformationFull):
+    """A public client. It can request any scope; the scope has no effect,
+    because the pasted credential's account decides the permissions."""
+
+    def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
+        if redirect_uri is None:
+            raise InvalidRedirectUriError("redirect_uri is required")
+        if not OAUTH.redirect_allowed(str(redirect_uri)):
+            log.info("refused an OAuth redirect URI: %s", redirect_uri)
+            raise InvalidRedirectUriError(
+                f"Redirect URI '{redirect_uri}' is not allowed by this gateway"
+            )
+        return redirect_uri
+
+    def validate_scope(self, requested_scope: str | None) -> list[str] | None:
+        return requested_scope.split() if requested_scope else None
+
+
+def _parse_redirect_patterns(raw: list[str]) -> list[str]:
+    """Allowed redirect URIs. An entry that ends in ``*`` is a prefix; it must
+    include a path after the host, so that it cannot match another host."""
+    patterns: list[str] = []
+    for entry in raw:
+        if entry.endswith("*"):
+            prefix = entry[:-1]
+            parsed = urllib.parse.urlsplit(prefix)
+            if parsed.scheme not in ("https", "http") or not parsed.path.startswith(
+                "/"
+            ):
+                log.warning("ignored the redirect URI prefix %r: no path", entry)
+                continue
+        patterns.append(entry)
+    return patterns
+
+
+class OAuthServer:
+    """An OAuth authorization server whose login page takes an ``ssp_`` token.
+
+    The access token is the pasted token itself, so the gateway keeps no token
+    state, and a credential that is revoked in accounts.toml stops working at
+    once. Clients need no registration: any client id is a public client, and
+    PKCE and the redirect URI allowlist protect the code.
+    """
+
+    def __init__(self) -> None:
+        self.public_url: str = os.environ.get("SUBSPACE_GATEWAY_PUBLIC_URL", "").rstrip(
+            "/"
+        )
+        self.redirect_patterns: list[str] = _parse_redirect_patterns(
+            _env_list("SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS", [])
+        )
+        self.logins: dict[str, PendingLogin] = {}
+        self.codes: dict[str, IssuedCode] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.public_url)
+
+    @property
+    def resource_url(self) -> str:
+        return f"{self.public_url}/mcp"
+
+    @property
+    def resource_metadata_url(self) -> str:
+        return f"{self.public_url}/.well-known/oauth-protected-resource/mcp"
+
+    def redirect_allowed(self, uri: str) -> bool:
+        parsed = urllib.parse.urlsplit(uri)
+        if parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS:
+            # RFC 8252: a native client on this machine, on any port.
+            return True
+        for pattern in self.redirect_patterns:
+            if pattern.endswith("*"):
+                if uri.startswith(pattern[:-1]):
+                    return True
+            elif uri == pattern:
+                return True
+        return False
+
+    def _prune(self, now: float) -> None:
+        for rid, login in list(self.logins.items()):
+            if now - login.created > LOGIN_SECONDS:
+                del self.logins[rid]
+        for code, issued in list(self.codes.items()):
+            if issued.expires_at < time.time():
+                del self.codes[code]
+
+    # --- OAuthAuthorizationServerProvider ----------------------------------
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        if not _CLIENT_ID_RE.match(client_id):
+            return None
+        return OAuthClient(
+            client_id=client_id,
+            token_endpoint_auth_method="none",
+            grant_types=["authorization_code"],
+            response_types=["code"],
+        )
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        pass  # _register answers registrations; nothing is stored
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        now = time.monotonic()
+        self._prune(now)
+        if len(self.logins) >= MAX_PENDING:
+            raise AuthorizeError("temporarily_unavailable", "too many open logins")
+        rid = secrets.token_urlsafe(24)
+        self.logins[rid] = PendingLogin(str(client.client_id), params, now)
+        return f"{self.public_url}/oauth/login?request={rid}"
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> IssuedCode | None:
+        # One use only, also when the PKCE check that follows fails.
+        return self.codes.pop(authorization_code, None)
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: IssuedCode
+    ) -> OAuthToken:
+        return OAuthToken(
+            access_token=authorization_code.credential,
+            scope=" ".join(authorization_code.scopes) or None,
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        return None
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        raise TokenError("unsupported_grant_type", "no refresh tokens are issued")
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        return None  # AuthMiddleware checks access tokens
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        pass
+
+    # --- login page ----------------------------------------------------------
+
+    def issue_code(self, login: PendingLogin, credential: str) -> IssuedCode:
+        self._prune(time.monotonic())
+        if len(self.codes) >= MAX_PENDING:
+            raise GatewayError("too many unredeemed codes; try again later")
+        params = login.params
+        issued = IssuedCode(
+            code=secrets.token_urlsafe(32),
+            scopes=params.scopes or [],
+            expires_at=time.time() + CODE_SECONDS,
+            client_id=login.client_id,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+            resource=params.resource,
+            credential=credential,
+        )
+        self.codes[issued.code] = issued
+        return issued
+
+
+OAUTH = OAuthServer()
+
+# The page has no scripts. It must not be framed (clickjacking).
+_PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+    "frame-ancestors 'none'",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+}
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect to subspace</title>
+<style>
+body {{ font-family: system-ui, sans-serif; max-width: 32rem; margin: 3rem auto;
+  padding: 0 1rem; line-height: 1.5; }}
+code {{ word-break: break-all; }}
+input[type=password] {{ width: 100%; padding: .5rem; box-sizing: border-box; }}
+.error {{ color: #b00020; }}
+button {{ padding: .5rem 1rem; margin: 1rem .5rem 0 0; }}
+</style></head><body>
+<h1>Connect to subspace</h1>
+<p>An application asks for access to a subspace account. After you continue,
+your browser goes to:</p>
+<p><code>{redirect}</code></p>
+<p>That application gets the access of the credential that you paste here.
+Continue only if you started this connection, and you trust
+<strong>{host}</strong>.</p>
+{error}
+<form method="post" action="login">
+<input type="hidden" name="request" value="{request}">
+<label for="token">Credential (<code>ssp_…</code>)</label>
+<input type="password" id="token" name="token" autocomplete="off" autofocus>
+<button type="submit" name="action" value="allow">Continue</button>
+<button type="submit" name="action" value="deny">Cancel</button>
+</form></body></html>
+"""
+
+
+def _page(text: str, status_code: int) -> HTMLResponse:
+    body = (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        "<title>subspace</title></head><body>"
+        f"<p>{html.escape(text)}</p></body></html>"
+    )
+    return HTMLResponse(body, status_code=status_code, headers=_PAGE_HEADERS)
+
+
+def _login_page(rid: str, login: PendingLogin, error: str = "") -> HTMLResponse:
+    redirect = str(login.params.redirect_uri)
+    host = urllib.parse.urlsplit(redirect).netloc
+    return HTMLResponse(
+        _LOGIN_PAGE.format(
+            redirect=html.escape(redirect),
+            host=html.escape(host),
+            request=html.escape(rid),
+            error=f'<p class="error">{html.escape(error)}</p>' if error else "",
+        ),
+        status_code=401 if error else 200,
+        headers=_PAGE_HEADERS,
+    )
+
+
+def _redirect(login: PendingLogin, **params: str | None) -> RedirectResponse:
+    url = construct_redirect_uri(
+        str(login.params.redirect_uri), state=login.params.state, **params
+    )
+    return RedirectResponse(url, status_code=302, headers=_PAGE_HEADERS)
+
+
+async def _login(request: Request) -> Response:
+    if request.method == "GET":
+        rid = request.query_params.get("request", "")
+        login = OAUTH.logins.get(rid)
+        if login is None or time.monotonic() - login.created > LOGIN_SECONDS:
+            return _page("This login expired. Start the connection again.", 400)
+        return _login_page(rid, login)
+
+    form = await request.form()
+    rid = str(form.get("request") or "")
+    login = OAUTH.logins.get(rid)
+    if login is None or time.monotonic() - login.created > LOGIN_SECONDS:
+        return _page("This login expired. Start the connection again.", 400)
+    if form.get("action") == "deny":
+        del OAUTH.logins[rid]
+        return _redirect(login, error="access_denied")
+
+    client = _client_address(request.scope)
+    token = str(form.get("token") or "").strip()
+    if GATEWAY.blocked(client) and not GATEWAY.known_valid(token):
+        return _login_page(rid, login, "Too many failed attempts. Wait a minute.")
+    whoami = None
+    if _TOKEN_RE.match(token):
+        try:
+            whoami = await GATEWAY.verify(token)
+        except GatewayError:
+            return _page("The service is not available. Try again later.", 503)
+    if whoami is None:
+        GATEWAY.record_failure(client)
+        log.info(
+            "OAuth login refused a token (credential %s)",
+            _credential_id(token) if token.startswith("ssp_") else "-",
+        )
+        return _login_page(rid, login, "subspace does not accept that credential.")
+
+    del OAUTH.logins[rid]
+    try:
+        issued = OAUTH.issue_code(login, token)
+    except GatewayError as exc:
+        return _page(str(exc), 503)
+    log.info(
+        "OAuth login for credential %s, redirect to %s",
+        _credential_id(token),
+        urllib.parse.urlsplit(str(login.params.redirect_uri)).netloc,
+    )
+    return _redirect(login, code=issued.code)
+
+
+async def _register(request: Request) -> Response:
+    """Dynamic client registration (RFC 7591), with nothing stored: every
+    client is a public client, and the redirect URIs must be allowed."""
+    try:
+        metadata = OAuthClientMetadata.model_validate_json(await request.body())
+    except ValidationError as exc:
+        return JSONResponse(
+            {"error": "invalid_client_metadata", "error_description": str(exc)},
+            status_code=400,
+        )
+    refused = [
+        str(uri)
+        for uri in metadata.redirect_uris or []
+        if not OAUTH.redirect_allowed(str(uri))
+    ]
+    if refused:
+        log.info("refused an OAuth registration for %s", ", ".join(refused))
+        return JSONResponse(
+            {
+                "error": "invalid_redirect_uri",
+                "error_description": "not allowed by this gateway: "
+                + ", ".join(refused),
+            },
+            status_code=400,
+        )
+    info = OAuthClientInformationFull.model_validate(
+        {
+            **metadata.model_dump(),
+            "client_id": f"dcr-{secrets.token_hex(8)}",
+            "client_id_issued_at": int(time.time()),
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        }
+    )
+    return JSONResponse(
+        info.model_dump(mode="json", exclude_none=True), status_code=201
+    )
+
+
+def _limited(app: ASGIApp) -> ASGIApp:
+    return RequestBodyLimitMiddleware(app, 16384)
+
+
+def _cors_limited(
+    handler: Callable[[Request], Awaitable[Response]], methods: list[str]
+) -> ASGIApp:
+    """For endpoints that browser-based clients call directly."""
+    return CORSMiddleware(
+        _limited(request_response(handler)),
+        allow_origins=["*"],
+        allow_methods=methods,
+        allow_headers=["mcp-protocol-version"],
+    )
+
+
+def oauth_routes() -> list[Route]:
+    issuer = OAUTH.public_url
+    # Strings, not AnyHttpUrl: the models keep an empty path, and clients
+    # compare the issuer as an exact string.
+    metadata = OAuthMetadata.model_validate(
+        {
+            "issuer": issuer,
+            "authorization_endpoint": f"{issuer}/authorize",
+            "token_endpoint": f"{issuer}/token",
+            "registration_endpoint": f"{issuer}/register",
+            "scopes_supported": [OAUTH_SCOPE],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "code_challenge_methods_supported": ["S256"],
+        }
+    )
+    resource = ProtectedResourceMetadataHandler(
+        ProtectedResourceMetadata.model_validate(
+            {
+                "resource": OAUTH.resource_url,
+                "authorization_servers": [issuer],
+                "scopes_supported": [OAUTH_SCOPE],
+                "resource_name": "subspace",
+            }
+        )
+    ).handle
+    token_handler = TokenHandler(OAUTH, ClientAuthenticator(OAUTH))
+    get_options = ["GET", "OPTIONS"]
+    return [
+        Route(
+            "/.well-known/oauth-authorization-server",
+            cors_middleware(MetadataHandler(metadata).handle, get_options),
+            methods=get_options,
+        ),
+        # The RFC 9728 path for /mcp, and the root path that some clients try.
+        Route(
+            "/.well-known/oauth-protected-resource/mcp",
+            cors_middleware(resource, get_options),
+            methods=get_options,
+        ),
+        Route(
+            "/.well-known/oauth-protected-resource",
+            cors_middleware(resource, get_options),
+            methods=get_options,
+        ),
+        Route(
+            "/authorize",
+            _limited(request_response(AuthorizationHandler(OAUTH).handle)),
+            methods=["GET", "POST"],
+        ),
+        Route(
+            "/oauth/login",
+            _limited(request_response(_login)),
+            methods=["GET", "POST"],
+        ),
+        Route(
+            "/token",
+            _cors_limited(token_handler.handle, ["POST", "OPTIONS"]),
+            methods=["POST", "OPTIONS"],
+        ),
+        Route(
+            "/register",
+            _cors_limited(_register, ["POST", "OPTIONS"]),
+            methods=["POST", "OPTIONS"],
+        ),
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -1337,6 +1830,8 @@ def build_app() -> ASGIApp:
         max_sessions=int(_env_float("SUBSPACE_GATEWAY_MAX_MCP_SESSIONS", 1000)),
         host=host,
     )
+    if OAUTH.enabled:
+        app.router.routes.extend(oauth_routes())
     return AuthMiddleware(app, "/mcp")
 
 

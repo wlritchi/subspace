@@ -36,8 +36,9 @@ hostile network and, sometimes, a compromised or prompt-injected remote agent.
 
 ## Non-goals (v1)
 
-- OAuth 2.1 authorization. The claude.ai and ChatGPT UI connectors need it;
-  API-based agents do not. See [Later phases](#later-phases).
+- A full OAuth 2.1 authorization server with its own users and token store.
+  UI connectors get a token-paste flow instead; see
+  [OAuth (token paste)](#oauth-token-paste).
 - Push wake-up of an offline remote agent (webhooks). See
   [Later phases](#later-phases).
 - More than one core instance. The core stays single-instance.
@@ -250,8 +251,53 @@ accounts with a qualified handle (`reviewer@ci`). In addition:
   accepted within the cache time, so that failures from others on a shared
   address do not lock out valid agents. Behind a proxy, the client address is
   the last `X-Forwarded-For` entry.
-- `GET /healthz` for probes. No other routes.
+- `GET /healthz` for probes. With a public URL set, also the OAuth routes
+  (next section). No other routes.
 - Never log a token. Log the credential id.
+
+### OAuth (token paste)
+
+Added 2026-10-11. Some UI connectors accept only OAuth: they have no field for a static bearer token. When
+`SUBSPACE_GATEWAY_PUBLIC_URL` is set, the gateway is also a small OAuth
+authorization server, built on the MCP SDK's authorize and token handlers:
+
+- **Discovery.** A 401 on `/mcp` names
+  `/.well-known/oauth-protected-resource/mcp` (RFC 9728) in
+  `WWW-Authenticate`. That document names the gateway as its authorization
+  server, and `/.well-known/oauth-authorization-server` (RFC 8414) lists the
+  endpoints. The root path `/.well-known/oauth-protected-resource` serves the
+  same document for clients that try it.
+- **Login.** `/authorize` checks the request and sends the browser to
+  `/oauth/login`, a page where the user pastes an `ssp_` token. The gateway
+  asks the core about the token (the same check and failure limit as a bearer
+  token). If the core accepts it, the browser goes back to the client with a
+  code. The page can also refuse (`access_denied`). It has no scripts and
+  cannot be framed.
+- **Token.** `/token` checks PKCE (S256 only) and returns the pasted token as
+  the access token, with no expiry and no refresh token. A code works once,
+  for 5 minutes.
+- **Clients.** Any client id is a public client (token auth method `none`).
+  `/register` (RFC 7591) gives a new client id and stores nothing. A client id
+  grants nothing by itself, so there is nothing to register in advance.
+- **Redirect URIs.** The real control. The gateway sends a code only to a
+  redirect URI in `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS` (exact, or a prefix
+  that ends in `*` and includes a path), or to a loopback `http` URI (RFC
+  8252). Others get an error page, not a redirect, and are logged. Without this
+  list, anyone could send a user a link that ends with the user's credential
+  at another site.
+
+Why the access token is the credential itself:
+
+- A short-lived access token needs a refresh token, which is a long-lived
+  secret for the same account. So the client would hold an equivalent secret
+  anyway.
+- The gateway keeps no token state, so a restart signs no one out.
+- Revocation stays in one place: remove the credential from `accounts.toml`.
+
+The login and code stores are in memory and capped (1000 each); a login page
+lasts 10 minutes. `/authorize` needs no credential, so a flood can fill the
+login store for up to 10 minutes. That stops new logins, not existing
+sessions.
 
 ### Naming the session
 
@@ -376,9 +422,11 @@ Phases 1–4 are implemented (docs/plans/2026-10-10-remote-agents.md).
   or a CI workflow. This makes remote agents reachable between runs. Risks:
   SSRF (allowlist schemes and hosts, block private addresses), retries, and a
   cap on the rate.
-- **OAuth 2.1** for UI connectors (claude.ai, ChatGPT): the gateway acts as
-  an authorization server whose consent page takes an `ssp_` token and issues
-  a short-lived access token for the same account.
+- **Session in each tool call.** UI connectors run many conversations through one connector URL, so a handle in the URL
+  names one session for all of them. Instead, each tool gets an optional
+  `handle` or `session` argument, and a call that names no session, on a
+  request with no session state, fails with how to name one. This replaces
+  the URL parameters as the main path.
 - **Server-sent notifications** on the `GET /mcp` stream for clients that
   support them. This is cheap after the gateway exists, but few remote clients
   read the stream.

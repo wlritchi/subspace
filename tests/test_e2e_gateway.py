@@ -55,13 +55,15 @@ class Stack:
 
 
 @contextlib.contextmanager
-def _stack(data_dir: Path, **gateway_settings: str) -> Iterator[Stack]:
+def _stack(
+    data_dir: Path, gateway_port: int | None = None, **gateway_settings: str
+) -> Iterator[Stack]:
     tokens = _accounts_file(data_dir)
     core_port = free_port()
     env = server_env(core_port, data_dir)
     env["SUBSPACE_TOKEN"] = MASTER
     env["SUBSPACE_ACCOUNTS_CHECK_SECONDS"] = "0.2"
-    gateway_port = free_port()
+    gateway_port = gateway_port or free_port()
     with server_process(env):
         with gateway_process(core_port, gateway_port, **gateway_settings):
             yield Stack(core_port, gateway_port, data_dir, tokens)
@@ -93,6 +95,13 @@ def test_http_auth(stack: Stack) -> None:
                 reply = await http.post(stack.url(), json=body, headers=headers)
                 assert reply.status_code == 401, headers
                 assert reply.headers["www-authenticate"].startswith("Bearer")
+                # No public URL is set, so OAuth is off.
+                assert "resource_metadata" not in reply.headers["www-authenticate"]
+            metadata = await http.get(
+                f"http://127.0.0.1:{stack.gateway_port}"
+                "/.well-known/oauth-authorization-server"
+            )
+            assert metadata.status_code == 404
             reply = await http.post(
                 stack.url(),
                 json=body,

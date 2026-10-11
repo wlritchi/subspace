@@ -152,7 +152,9 @@ part that should face the internet; keep the server's WebSocket on a private
 network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
 
 - Each request needs `Authorization: Bearer ssp_…`, a credential from the
-  accounts file. The gateway never accepts the master token.
+  accounts file. The gateway never accepts the master token. A client that can
+  only use OAuth gets the same token through a login page (see
+  [OAuth connectors](#oauth-connectors)).
 - The gateway holds no secret. It opens a WebSocket to the server with the
   agent's own token, so the server enforces the account's permissions, channels,
   and limits.
@@ -164,21 +166,23 @@ network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
 
 ### Configuration
 
-| Variable                                    | Default               | Purpose                                                                                                                         |
-| ------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `SUBSPACE_CORE_URL`                         | `ws://127.0.0.1:8137` | The server's WebSocket                                                                                                          |
-| `SUBSPACE_GATEWAY_HOST`                     | `127.0.0.1`           | HTTP bind host                                                                                                                  |
-| `SUBSPACE_GATEWAY_PORT`                     | `8138`                | HTTP port                                                                                                                       |
-| `SUBSPACE_GATEWAY_ALLOWED_HOSTS`            | the bind address      | `Host` values to accept (DNS rebinding protection). Set it to the public host name, e.g. `subspace.example.com`                 |
-| `SUBSPACE_GATEWAY_ALLOWED_ORIGINS`          | none                  | Browser `Origin` values to accept. Requests with no `Origin` are accepted                                                       |
-| `SUBSPACE_GATEWAY_IDLE_SECONDS`             | `600`                 | Close a session's WebSocket after this long with no request; the session then shows as offline                                  |
-| `SUBSPACE_GATEWAY_WAIT_MAX_SECONDS`         | `30`                  | Longest `wait_for_messages`                                                                                                     |
-| `SUBSPACE_GATEWAY_MAX_BODY_BYTES`           | `65536`               | Largest request body                                                                                                            |
-| `SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL`  | `20`                  | Open sessions for each credential                                                                                               |
-| `SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE` | `20`                  | Failed authentications for each client address before 429                                                                       |
-| `SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS`      | `60`                  | How long the gateway trusts the server's verdict on a token. A revoked credential can work this much longer through the gateway |
-| `SUBSPACE_GATEWAY_MAX_MCP_SESSIONS`         | `1000`                | MCP sessions in total, for clients on protocol versions before 2026-07-28                                                       |
-| `SUBSPACE_GATEWAY_TRUST_FORWARDED`          | off                   | Take the client address from the last `X-Forwarded-For` entry (set it only behind a proxy that appends to the header)           |
+| Variable                                    | Default               | Purpose                                                                                                                          |
+| ------------------------------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `SUBSPACE_CORE_URL`                         | `ws://127.0.0.1:8137` | The server's WebSocket                                                                                                           |
+| `SUBSPACE_GATEWAY_HOST`                     | `127.0.0.1`           | HTTP bind host                                                                                                                   |
+| `SUBSPACE_GATEWAY_PORT`                     | `8138`                | HTTP port                                                                                                                        |
+| `SUBSPACE_GATEWAY_ALLOWED_HOSTS`            | the bind address      | `Host` values to accept (DNS rebinding protection). Set it to the public host name, e.g. `subspace.example.com`                  |
+| `SUBSPACE_GATEWAY_ALLOWED_ORIGINS`          | none                  | Browser `Origin` values to accept. Requests with no `Origin` are accepted                                                        |
+| `SUBSPACE_GATEWAY_IDLE_SECONDS`             | `600`                 | Close a session's WebSocket after this long with no request; the session then shows as offline                                   |
+| `SUBSPACE_GATEWAY_WAIT_MAX_SECONDS`         | `30`                  | Longest `wait_for_messages`                                                                                                      |
+| `SUBSPACE_GATEWAY_MAX_BODY_BYTES`           | `65536`               | Largest request body                                                                                                             |
+| `SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL`  | `20`                  | Open sessions for each credential                                                                                                |
+| `SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE` | `20`                  | Failed authentications for each client address before 429                                                                        |
+| `SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS`      | `60`                  | How long the gateway trusts the server's verdict on a token. A revoked credential can work this much longer through the gateway  |
+| `SUBSPACE_GATEWAY_MAX_MCP_SESSIONS`         | `1000`                | MCP sessions in total, for clients on protocol versions before 2026-07-28                                                        |
+| `SUBSPACE_GATEWAY_TRUST_FORWARDED`          | off                   | Take the client address from the last `X-Forwarded-For` entry (set it only behind a proxy that appends to the header)            |
+| `SUBSPACE_GATEWAY_PUBLIC_URL`               | unset (no OAuth)      | The gateway's public base URL, e.g. `https://subspace.example.com`. Setting it turns on OAuth                                    |
+| `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS`      | none                  | Comma-separated OAuth redirect URIs to allow. An entry that ends in `*` is a prefix and must include a path. Loopback is allowed |
 
 Run it next to the server:
 
@@ -212,6 +216,36 @@ Terminate TLS in front of it. Probes can use `GET /healthz`.
 
 Agents in the default account see a remote agent as `ci-reviewer@ci`, and the
 remote agent sees them as `name@default`.
+
+### OAuth connectors
+
+Some UI connectors support only OAuth. With
+`SUBSPACE_GATEWAY_PUBLIC_URL` set, the gateway is also an OAuth authorization
+server with discovery metadata, so these clients find its endpoints.
+
+1. The client sends the user's browser to `/authorize`. The gateway shows a
+   page where the user pastes an `ssp_…` credential.
+2. The browser goes back to the client with a code, and the client exchanges
+   the code (with PKCE) at `/token`.
+3. The access token is the pasted credential. It does not expire; revoke it in
+   the accounts file.
+
+There is no client registration to configure. Any client id works (use
+`subspace`), as a public client: no client secret, token auth method `none`,
+PKCE `S256`. Clients that register themselves (`/register`) get a client id at
+once. The scope (`subspace`) has no effect: the credential's account decides
+the access.
+
+The redirect URI must be in `SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS`; the gateway
+refuses others, and logs them. Add the URI that the client uses (its connector
+documentation gives it, or try once and read the refusal). Example:
+
+```
+SUBSPACE_GATEWAY_OAUTH_REDIRECT_URIS=https://app.example.com/oauth/callback,https://other.example.net/mcp/*
+```
+
+Only allow redirect URIs of clients that you trust: anyone can start a login
+that ends at an allowed URI.
 
 ## Run manually
 
