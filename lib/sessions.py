@@ -172,7 +172,7 @@ class SessionRegistry:
     def get(self, key: str) -> SessionRecord | None:
         return self._by_key.get(key)
 
-    def list(self) -> list[SessionRecord]:
+    def records(self) -> list[SessionRecord]:
         return list(self._by_key.values())
 
     def by_handle(self, account: str, handle: str) -> SessionRecord | None:

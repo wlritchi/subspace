@@ -457,7 +457,7 @@ def _ensure_session(conn: Connection, key: str) -> None:
     account = conn.account
     limit = account.limits.sessions if account is not None else 0
     if limit is not None:
-        used = sum(1 for r in SESSIONS.list() if r.account == conn.account_id)
+        used = sum(1 for r in SESSIONS.records() if r.account == conn.account_id)
         if used >= limit:
             raise RequestError(
                 f"limit reached: sessions is {limit} for this account; reuse a "
@@ -1320,7 +1320,7 @@ async def _handle_set_availability(websocket, conn: Connection, msg: dict) -> No
 async def _handle_list_agents(websocket, conn: Connection, msg: dict) -> None:
     agents = [
         {**_agent_view(record, conn.account_id), "connected": _live(record.key)}
-        for record in SESSIONS.list()
+        for record in SESSIONS.records()
         if record.handle
     ]
     await _send(websocket, proto.AGENT_LIST, msg, agents=agents)
