@@ -27,7 +27,7 @@ import storage
 
 
 # uuid4().hex, as schedule() makes it.
-_CALLBACK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CALLBACK_ID_RE = re.compile(r"^[0-9a-f]{32}\Z")
 
 
 def store_dir() -> Path:

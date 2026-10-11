@@ -92,6 +92,8 @@ HANDLE_IDLE_DEFAULT_SECONDS = 900.0
 SESSION_TTL_DEFAULT_DAYS = 30.0
 # The largest message body that post and dm accept, in UTF-8 bytes.
 MAX_BODY_BYTES = 16 * 1024
+# The longest channel topic, in characters.
+MAX_TOPIC_CHARS = 200
 # How often to check the accounts file for changes and credentials for expiry.
 ACCOUNTS_CHECK_SECONDS = 5.0
 # How long a memberless+silent message topic (channel or DM) is kept before the
@@ -274,11 +276,11 @@ def _pr_clients() -> dict:
 # The alias is the env segment between the FORGEJO_ prefix and the _API_URL suffix,
 # lowercased with '_' -> '-' to recover the ref/tool alias (e.g. FORGEJO_EXTERNAL_API_URL
 # -> "external", FORGEJO_SELF_HOSTED_API_URL -> "self-hosted").
-_FORGEJO_ALIAS_URL_RE = re.compile(r"^FORGEJO_(?P<alias>[A-Z0-9][A-Z0-9_]*)_API_URL$")
+_FORGEJO_ALIAS_URL_RE = re.compile(r"^FORGEJO_(?P<alias>[A-Z0-9][A-Z0-9_]*)_API_URL\Z")
 # The alias must round-trip to lowercase kebab-case (same rule as agent/channel names and
 # the relay's ref parser), so infrastructure names stay clean and a full host can never be
 # mistaken for an alias.
-_FORGEJO_ALIAS_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_FORGEJO_ALIAS_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\Z")
 
 
 def _forgejo_token_env(instance: str) -> str:
@@ -558,6 +560,35 @@ async def _detach(conn: Connection) -> None:
         await _announce_connections(key)
 
 
+def _scope(key: str) -> accounts.Account | None:
+    """The current account of a session, or None if the account is gone."""
+    return ACCOUNTS.get(sessions.split_key(key)[0])
+
+
+def _topic_in_scope(account: accounts.Account | None, topic) -> bool:
+    """True if the account may receive messages from ``topic`` now. Delivery
+    checks this, so that a narrower accounts file takes effect at once."""
+    if account is None or "messaging" not in account.permissions:
+        return False
+    return topic.kind != "channel" or account.allows_channel(_channel_name(topic))
+
+
+def _enforce_scopes() -> None:
+    """Remove state that the accounts file no longer allows: channel and DM
+    memberships, and PR subscriptions. Runs at startup and after each reload."""
+    for topic in list(TOPICS.values()):
+        for key in list(topic.members):
+            if not _topic_in_scope(_scope(key), topic):
+                topic.leave(key)
+                message_topic.delete_subscriber(settings.data_dir(), topic, key)
+                message_topic.save_state(settings.data_dir(), topic)
+    for tracker in list(TRACKERS.values()):
+        for key in list(tracker.subscribers):
+            account = _scope(key)
+            if account is None or "pr" not in account.permissions:
+                _unsubscribe(tracker, key)
+
+
 def _next_callback_timeout(key: str, now: float) -> float | None:
     """Seconds until this session's soonest not-yet-due scheduled callback, so the
     loop can sleep until it comes due; None if none are pending (wait for a wake)."""
@@ -576,9 +607,15 @@ async def _dispatch_loop(conn: Connection) -> None:
     while True:
         key = conn.session_key
         timeout: float | None = None
-        if key:
+        account = _scope(key) if key else None
+        if key and account is not None:
             now = time.time()
-            for entry in scheduler.due_callbacks(key, now):
+            due = (
+                scheduler.due_callbacks(key, now)
+                if "schedule" in account.permissions
+                else []
+            )
+            for entry in due:
                 callback_id = str(entry.get("id", ""))
                 if callback_id and callback_id not in conn.inflight:
                     content, meta = _build_callback_notification(entry, key, now)
@@ -594,7 +631,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                         return
                     conn.inflight.add(callback_id)
             for tracker in list(TRACKERS.values()):
-                if key not in tracker.subscribers:
+                if key not in tracker.subscribers or "pr" not in account.permissions:
                     continue
                 # If events were dropped from the cache while this subscriber was
                 # away, surface a one-time "history truncated" notice ahead of the
@@ -643,7 +680,8 @@ async def _dispatch_loop(conn: Connection) -> None:
                     conn.inflight.add(nid)
             if not await _deliver_messages(conn, key):
                 return
-            timeout = _next_callback_timeout(key, now)
+            if "schedule" in account.permissions:
+                timeout = _next_callback_timeout(key, now)
         try:
             await asyncio.wait_for(conn.wake.wait(), timeout)
         except asyncio.TimeoutError:
@@ -699,7 +737,8 @@ _FRAME_PERMISSIONS: dict[str, str] = {
 async def _handle(websocket) -> None:
     # Authenticate once, at connect. The account and the credential stay with the
     # connection. _credential_check_loop closes it if the credential goes away.
-    ACCOUNTS.reload_if_changed()
+    if ACCOUNTS.reload_if_changed():
+        _enforce_scopes()
     provided = websocket.request.headers.get(proto.AUTH_HEADER) or ""
     auth = ACCOUNTS.authenticate(provided, time.time())
     if auth is None:
@@ -865,8 +904,9 @@ async def _dispatch_frame(conn: Connection, msg: dict, kind: object) -> None:
 
 async def _handle_register(conn: Connection, msg: dict) -> None:
     """Attach the connection to a session. A session id ``@<handle>`` attaches to
-    the session that holds the handle in this account, or else to a new session
-    with that id, which then takes the handle."""
+    the session with that id if it exists. If not, it attaches to the session
+    that holds the handle in this account, or else to a new session with that
+    id, which then takes the handle."""
     session_id = msg.get("session_id") or None
     if session_id is None:
         await _detach(conn)
@@ -882,14 +922,17 @@ async def _handle_register(conn: Connection, msg: dict) -> None:
     except sessions.SessionError as exc:
         await _send(conn.ws, proto.ERROR, msg, error=str(exc))
         return
-    if handle:
+    key = sessions.session_key(conn.account_id, session_id)
+    if handle and SESSIONS.get(key) is None:
         holder = SESSIONS.by_handle(conn.account_id, handle)
         if holder is not None:
             await _attach(conn, holder.key)
             return
-    key = sessions.session_key(conn.account_id, session_id)
+    existed = SESSIONS.get(key) is not None
     await _attach(conn, key)
-    if handle and SESSIONS.by_handle(conn.account_id, handle) is None:
+    # Only a new session takes the handle. An existing one keeps whatever handle
+    # it has now, so a reconnect does not undo a rename or an unregister.
+    if handle and not existed and SESSIONS.by_handle(conn.account_id, handle) is None:
         SESSIONS.register_handle(
             key,
             handle,
@@ -1458,6 +1501,12 @@ def _render_reaction(
     )
 
 
+def _one_block(text: str) -> str:
+    """Indent every line after the first, so that text from a message cannot
+    make a line that looks like another message."""
+    return text.replace("\r", "").replace("\n", "\n    ")
+
+
 def _render_message(
     topic: message_topic.MessageTopic,
     message: message_topic.Message,
@@ -1476,7 +1525,7 @@ def _render_message(
     marker = " (→ you)" if addressed else ""
     return (
         f"{_handle_prefix(message)}{_topic_prefix(topic)} "
-        f"{_sender_display(message, reader_account)}: {message.body}{marker}"
+        f"{_sender_display(message, reader_account)}: {_one_block(message.body)}{marker}"
     )
 
 
@@ -1500,8 +1549,9 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
         record.default_threshold if record is not None else sessions.DEFAULT_THRESHOLD
     )
     reader_account = sessions.split_key(key)[0]
+    scope = _scope(key)
     for topic in list(TOPICS.values()):
-        if key not in topic.members:
+        if key not in topic.members or not _topic_in_scope(scope, topic):
             continue
         acked = topic.acked.get(key, set())
         threshold = messaging.effective_threshold(
@@ -1601,6 +1651,9 @@ async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
         threshold = msg.get("threshold")
         if threshold is not None:
             messaging.validate_threshold(threshold)
+        requested_topic = (
+            _clean_topic(msg["topic"]) if msg.get("topic") is not None else ""
+        )
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
@@ -1614,7 +1667,6 @@ async def _handle_join_channel(websocket, conn: Connection, msg: dict) -> None:
             return
     created = channel_key not in TOPICS
     topic = _get_or_create_topic(channel_key, "channel")
-    requested_topic = msg.get("topic")
     if requested_topic and (created or not topic.messages):
         topic.topic = requested_topic
     topic.join(key, now=time.time(), threshold=threshold)
@@ -1649,6 +1701,19 @@ async def _handle_leave_channel(websocket, conn: Connection, msg: dict) -> None:
         message_topic.delete_subscriber(settings.data_dir(), topic, key)
         message_topic.save_state(settings.data_dir(), topic)
     await _send(websocket, proto.AGENT_OK, msg)
+
+
+def _clean_topic(value: object) -> str:
+    """A channel topic as one line of at most MAX_TOPIC_CHARS characters.
+    Raises MessagingError."""
+    if not isinstance(value, str):
+        raise messaging.MessagingError("topic must be a string")
+    topic = " ".join(value.split())
+    if len(topic) > MAX_TOPIC_CHARS:
+        raise messaging.MessagingError(
+            f"topic too long: at most {MAX_TOPIC_CHARS} characters"
+        )
+    return topic
 
 
 def _validate_message_fields(
@@ -1836,6 +1901,7 @@ async def _handle_set_channel_topic(websocket, conn: Connection, msg: dict) -> N
         return
     try:
         channel_key = messaging.channel_key(msg.get("channel") or "")
+        new_topic = _clean_topic(msg.get("topic") or "")
     except messaging.MessagingError as exc:
         await _send(websocket, proto.ERROR, msg, error=str(exc))
         return
@@ -1843,15 +1909,18 @@ async def _handle_set_channel_topic(websocket, conn: Connection, msg: dict) -> N
         await _send(websocket, proto.ERROR, msg, error=err)
         return
     topic = TOPICS.get(channel_key)
-    if topic is None:
+    if topic is None or key not in topic.members:
         await _send(
             websocket,
             proto.ERROR,
             msg,
-            error=f"no such channel {msg.get('channel')!r}",
+            error=f"not a member of #{msg.get('channel')}",
         )
         return
-    topic.topic = msg.get("topic") or ""
+    if (err := _limit_error(conn, key, "posts_per_minute")) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
+    topic.topic = new_topic
     message_topic.save_state(settings.data_dir(), topic)
     await _send(websocket, proto.AGENT_OK, msg)
 
@@ -1954,7 +2023,11 @@ async def _handle_react(websocket, conn: Connection, msg: dict) -> None:
         return
     topic, target_message = resolved
     if key not in topic.members:  # reacting does not auto-join
-        await _send(websocket, proto.ERROR, msg, error=f"not a member of {topic.key!r}")
+        # The same error as for no message, so that ordinals do not show which
+        # threads exist.
+        await _send(
+            websocket, proto.ERROR, msg, error=f"unknown message {raw_target!r}"
+        )
         return
     try:
         messaging.validate_reaction(reaction)
@@ -1996,7 +2069,9 @@ async def _handle_message_status(websocket, conn: Connection, msg: dict) -> None
         return
     topic, target_msg = resolved
     if key not in topic.members:
-        await _send(websocket, proto.ERROR, msg, error=f"not a member of {topic.key!r}")
+        await _send(
+            websocket, proto.ERROR, msg, error=f"unknown message {raw_target!r}"
+        )
         return
     # delivery_status / reactions_for key on the resolved message's full id, regardless
     # of whether the agent referenced it by #N handle or full id. The message's own
@@ -2140,15 +2215,25 @@ async def _credential_check_loop() -> None:
     credential or account is no longer valid."""
     while True:
         await asyncio.sleep(_accounts_check_seconds())
-        ACCOUNTS.reload_if_changed()
-        now = time.time()
-        for conn in list(ALL_CONNECTIONS):
-            if ACCOUNTS.get(conn.account_id) is None or not ACCOUNTS.credential_valid(
-                conn.account_id, conn.credential_id, now
-            ):
-                await conn.ws.close(
-                    code=proto.UNAUTHORIZED_CLOSE_CODE, reason="credential revoked"
-                )
+        try:
+            await _check_credentials()
+        except Exception as exc:  # noqa: BLE001 - the check must keep running
+            print(f"subspace: credential check failed: {exc!r}", file=sys.stderr)
+
+
+async def _check_credentials() -> None:
+    if ACCOUNTS.reload_if_changed():
+        _enforce_scopes()
+        for topic in TOPICS.values():
+            _wake_topic_members(topic)
+    now = time.time()
+    for conn in list(ALL_CONNECTIONS):
+        if ACCOUNTS.get(conn.account_id) is None or not ACCOUNTS.credential_valid(
+            conn.account_id, conn.credential_id, now
+        ):
+            await conn.ws.close(
+                code=proto.UNAUTHORIZED_CLOSE_CODE, reason="credential revoked"
+            )
 
 
 def _emit(tracker: pr_monitor.PRTracker, event: dict) -> None:
@@ -2351,6 +2436,7 @@ async def main() -> None:
     for tracker in pr_monitor.load_trackers(_pr_clients()):
         TRACKERS[tracker.storage_key] = tracker
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
+    _enforce_scopes()
     asyncio.create_task(_reaper_loop())
     asyncio.create_task(_credential_check_loop())
 

@@ -165,6 +165,13 @@ A pattern is a literal channel name, or a literal prefix with a trailing `*`
 (`ci-*`). There are no other wildcards, so that a reviewer can see the scope
 at a glance. The core checks them on join, post, and set_channel_topic.
 
+A change of scope takes effect at once. Delivery checks the account's current
+permissions and channel patterns, and after each reload the core removes
+memberships and PR subscriptions that the account no longer allows.
+
+A channel topic is one line of at most 200 characters. Only a member can set
+it, and a change counts against `posts_per_minute`.
+
 ## Core changes
 
 The identity spec covers accounts, sessions, handles, and the wire changes.
@@ -236,8 +243,13 @@ accounts with a qualified handle (`reviewer@ci`). In addition:
   MCP transport spec requires. The allowed hosts are configured; a request
   with a browser `Origin` that is not in an allowlist is refused (the default
   allowlist is empty).
-- Limits: request body (for example 64 KiB), concurrent MCP sessions for each
-  credential, authentication failures for each IP address.
+- Limits: request body (64 KiB), open sessions for each credential, MCP
+  sessions in total (for clients on older protocol versions), and failed
+  authentications for each client address. A client address over its limit
+  gets 429 without a call to the core, except with a token that the core
+  accepted within the cache time, so that failures from others on a shared
+  address do not lock out valid agents. Behind a proxy, the client address is
+  the last `X-Forwarded-For` entry.
 - `GET /healthz` for probes. No other routes.
 - Never log a token. Log the credential id.
 
@@ -260,19 +272,25 @@ request, in this order:
 
 The gateway keeps one WebSocket to the core for each (credential, session),
 and sends `register` with the session id or `@<handle>` (see "attach by
-handle" in the identity spec). Requests for the same session share it, so the
-gateway itself never splits delivery.
+handle" in the identity spec), then `whoami`. A reconnect uses the session id
+from that `whoami`, so it reaches the same session. Requests for the same
+session share the WebSocket, so the gateway itself never splits delivery. When
+the core closes the WebSocket because the credential was revoked, the gateway
+drops the session's buffer and forgets the token.
 
 ### Delivery: pull, at least once
 
 The core sends `notify` frames eagerly. The gateway buffers them in memory and
 does not ack them.
 
-- `catch_up(max_items?)` returns buffered items in order, in bounded batches
-  (the same limits as the relay: 25 items, 50 000 characters). The gateway
-  acks a batch when the agent calls `catch_up` **again**, or when it calls
-  `ack()`. A batch whose response did not arrive comes back again. Delivery is
-  at least once; the `#N` handles let the agent see duplicates.
+- `catch_up(max_items?, redeliver?)` returns buffered items in order, in
+  bounded batches (the same limits as the relay: 25 items, 50 000
+  characters). The gateway acks a batch when the agent pulls **again**, or
+  when it calls `ack()`. The gateway cannot see whether a result reached the
+  agent, so an agent that did not see a result (the call failed) passes
+  `redeliver=true`, and gets that batch again before new items. The core
+  sends unacked items again after a reconnect. The `#N` handles let the agent
+  see duplicates.
 - `wait_for_messages(timeout_s)` blocks until at least one item is buffered,
   or until the timeout. The maximum is 30 s by default, because remote clients
   time out tool calls. An agent that waits for a reply calls it in a loop.

@@ -20,10 +20,10 @@ import storage
 
 DEFAULT_THRESHOLD = "direct"
 _THRESHOLDS = frozenset({"all", "direct", "urgent"})
-_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\Z")
 _NAME_MIN = 2
 _NAME_MAX = 64
-_SESSION_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
+_SESSION_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}\Z")
 
 # A session id with this prefix names a session that attached by handle.
 HANDLE_SESSION_PREFIX = "@"

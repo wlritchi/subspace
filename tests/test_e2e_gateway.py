@@ -293,3 +293,21 @@ def test_failed_auth_limit_uses_trusted_forwarded_entry(tmp_path: Path) -> None:
                 assert reply.status_code == 401
 
         asyncio.run(scenario())
+
+
+def test_redeliver_after_a_lost_result(stack: Stack) -> None:
+    async def scenario() -> None:
+        alice = await stack.local("rd-s1", "rd-alice")
+        async with stack.mcp("?handle=rd-bot") as bot:
+            await _text(bot, "whoami")
+            await alice.request({"type": proto.DM, "to": ["rd-bot@ci"], "body": "one"})
+            await asyncio.sleep(0.3)
+            assert "one" in await _text(bot, "catch_up")  # pretend this was lost
+            await alice.request({"type": proto.DM, "to": ["rd-bot@ci"], "body": "two"})
+            await asyncio.sleep(0.3)
+            again = await _text(bot, "catch_up", redeliver=True)
+            assert "one" in again and "two" in again
+            assert "No new notifications." in await _text(bot, "catch_up")
+        await alice.close()
+
+    asyncio.run(scenario())

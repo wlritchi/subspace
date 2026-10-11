@@ -26,14 +26,14 @@ _SEVERITY_ORDER = ("low", "normal", "high")
 DEFAULT_ACCOUNT_ID = "default"
 MASTER_CREDENTIAL_ID = "master"
 
-_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\Z")
 _ID_MAX = 64
-_CHANNEL_PATTERN_RE = re.compile(r"^(?:\*|[a-z0-9][a-z0-9-]*\*?)$")
-_CREDENTIAL_ID_RE = re.compile(r"^[a-z2-7]{12}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CHANNEL_PATTERN_RE = re.compile(r"^(?:\*|[a-z0-9][a-z0-9-]*\*?)\Z")
+_CREDENTIAL_ID_RE = re.compile(r"^[a-z2-7]{12}\Z")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
 # ssp_<12 base32 chars>_<base64url secret>. The secret can contain "_", so the
 # fixed-length id is what separates the parts.
-_TOKEN_RE = re.compile(r"^ssp_([a-z2-7]{12})_([A-Za-z0-9_-]{20,})$")
+_TOKEN_RE = re.compile(r"^ssp_([a-z2-7]{12})_([A-Za-z0-9_-]{20,})\Z")
 _BEARER = "Bearer "
 
 
@@ -230,12 +230,16 @@ def _parse_account(raw: object, index: int) -> Account:
             )
         channels = tuple(patterns)
     permissions = raw.get("permissions", sorted(DEFAULT_PERMISSIONS))
-    if not isinstance(permissions, list) or not set(permissions) <= PERMISSIONS:
+    if (
+        not isinstance(permissions, list)
+        or not all(isinstance(p, str) for p in permissions)
+        or not set(permissions) <= PERMISSIONS
+    ):
         raise AccountsError(
             f"{where}: permissions must be a list of {sorted(PERMISSIONS)}"
         )
     max_severity = raw.get("max_severity", "normal")
-    if max_severity not in _SEVERITY_ORDER:
+    if not isinstance(max_severity, str) or max_severity not in _SEVERITY_ORDER:
         raise AccountsError(
             f"{where}: max_severity must be one of {list(_SEVERITY_ORDER)}"
         )
@@ -306,6 +310,9 @@ class AccountStore:
             stat = self.path.stat()
         except FileNotFoundError:
             return None
+        except OSError:
+            # Not readable: _load fails on the read, and fails closed.
+            return (-1, -1)
         return (stat.st_mtime_ns, stat.st_size)
 
     def _load(self, *, strict: bool) -> None:
@@ -313,7 +320,7 @@ class AccountStore:
         try:
             text = self.path.read_text() if stamp is not None else ""
             accounts = parse(text, self.default_id)
-        except (OSError, AccountsError) as exc:
+        except Exception as exc:  # noqa: BLE001 - any failure must fail closed
             if strict:
                 raise
             # Fail closed: an edit that revokes a credential must not leave it

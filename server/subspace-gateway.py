@@ -26,6 +26,7 @@ Config (env):  SUBSPACE_GATEWAY_HOST (default 127.0.0.1)
                SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL (default 20)
                SUBSPACE_GATEWAY_AUTH_FAILURES_PER_MINUTE (default 20)
                SUBSPACE_GATEWAY_TOKEN_CACHE_SECONDS (default 60)
+               SUBSPACE_GATEWAY_MAX_MCP_SESSIONS (default 1000)
                SUBSPACE_GATEWAY_TRUST_FORWARDED (default 0)
 """
 
@@ -66,9 +67,12 @@ log = logging.getLogger("subspace-gateway")
 
 # The token format that the gateway forwards. The master token is never accepted
 # here: the gateway is internet-facing.
-_TOKEN_RE = re.compile(r"^ssp_[a-z2-7]{12}_[A-Za-z0-9_-]{20,}$")
+_TOKEN_RE = re.compile(r"^ssp_[a-z2-7]{12}_[A-Za-z0-9_-]{20,}\Z")
 # How long a verdict on a token stays cached, by default.
 TOKEN_CACHE_SECONDS = 60.0
+# How long an MCP session (protocol versions before 2026-07-28) lives without
+# requests; the SDK closes it then, and the gateway forgets its attach.
+MCP_SESSION_IDLE_SECONDS = 1800.0
 # How long to wait for the core to answer one request.
 CORE_TIMEOUT_SECONDS = 10.0
 # Limits for one catch_up batch, the same as the relay's.
@@ -77,7 +81,7 @@ CATCHUP_MAX_CHARS = 50_000
 
 _PR_REF_RE = re.compile(
     r"^(?:(?P<instance>[a-z0-9](?:[a-z0-9-]*[a-z0-9])?):)?"
-    r"(?P<owner>[^/\s#:]+)/(?P<repo>[^/\s#]+)#(?P<number>\d+)$"
+    r"(?P<owner>[^/\s#:]+)/(?P<repo>[^/\s#]+)#(?P<number>\d+)\Z"
 )
 
 
@@ -125,18 +129,29 @@ class CoreSession:
 
     Holds a WebSocket to the core with the agent's token, the notify frames that
     the core sent and the agent did not pull yet, and the batch that the last
-    catch_up returned. A batch is acked when the agent pulls again or calls ack,
-    so a batch whose response was lost comes back (at-least-once delivery).
+    pull returned. A batch is acked when the agent pulls again or calls ack. An
+    agent that did not get a pull's result asks for the batch again with
+    ``redeliver``. The core sends unacked items again after a reconnect.
     """
 
-    def __init__(self, core_url: str, token: str, spec: str) -> None:
+    def __init__(
+        self,
+        core_url: str,
+        token: str,
+        spec: str,
+        on_revoked: Callable[[str], None],
+    ) -> None:
         self.core_url: str = core_url
         self.token: str = token
         # The session id that the session attaches with, or "@<handle>".
         self.spec: str = spec
+        # The session id that the core attached to. A reconnect uses it, so a
+        # "@<handle>" session stays the same session.
+        self.session_id: str | None = None
+        self._on_revoked = on_revoked
         self.ws: ClientConnection | None = None
         self.buffer: list[dict] = []
-        self.batch: list[str] = []
+        self.batch: list[dict] = []
         self.connections: int = 1
         self.last_used: float = time.monotonic()
         self.arrived = asyncio.Event()
@@ -153,7 +168,16 @@ class CoreSession:
             ws = await _open_core(self.core_url, self.token)
             self.ws = ws
             self._recv_task = asyncio.create_task(self._recv(ws))
-            await ws.send(json.dumps({"type": proto.REGISTER, "session_id": self.spec}))
+            await ws.send(
+                json.dumps(
+                    {"type": proto.REGISTER, "session_id": self.session_id or self.spec}
+                )
+            )
+            reply = await self._round_trip(ws, {"type": proto.WHOAMI})
+            if reply.get("type") == proto.ERROR:
+                await ws.close()
+                raise GatewayError(f"Could not attach: {reply.get('error')}")
+            self.session_id = reply.get("session_id") or self.session_id
 
     async def _recv(self, ws: ClientConnection) -> None:
         try:
@@ -171,6 +195,11 @@ class CoreSession:
         finally:
             if self.ws is ws:
                 self.ws = None
+            if ws.close_code == proto.UNAUTHORIZED_CLOSE_CODE:
+                # Revoked: drop what is buffered, so that it cannot be pulled.
+                self.buffer.clear()
+                self.batch.clear()
+                self._on_revoked(self.token)
             for future in self._replies.values():
                 if not future.done():
                     future.set_exception(GatewayError("the subspace server closed"))
@@ -186,7 +215,7 @@ class CoreSession:
             self._ack_now(frame["id"])
             return
         notify_id = frame["id"]
-        if notify_id in self.batch or any(f["id"] == notify_id for f in self.buffer):
+        if any(f["id"] == notify_id for f in (*self.batch, *self.buffer)):
             return  # sent again after a reconnect
         self.buffer.append(frame)
         self.arrived.set()
@@ -203,6 +232,9 @@ class CoreSession:
         ws = self.ws
         if ws is None:
             raise GatewayError("the subspace server closed")
+        return await self._round_trip(ws, frame)
+
+    async def _round_trip(self, ws: ClientConnection, frame: dict[str, Any]) -> dict:
         self._next_req += 1
         req_id = self._next_req
         future: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
@@ -222,16 +254,20 @@ class CoreSession:
         batch, self.batch = self.batch, []
         ws = self.ws
         if ws is not None:
-            for notify_id in batch:
-                await _send_quietly(ws, {"type": proto.ACK, "id": notify_id})
+            for frame in batch:
+                await _send_quietly(ws, {"type": proto.ACK, "id": frame["id"]})
         return len(batch)
 
-    async def pull(self, max_items: int) -> list[dict]:
-        """Ack the previous batch and take the next one from the buffer."""
+    async def pull(self, max_items: int, redeliver: bool = False) -> list[dict]:
+        """Take the next batch from the buffer. Ack the previous batch first,
+        or, with ``redeliver``, start the new batch with it again."""
         await self.ensure_connected()
-        await self.ack_batch()
         taken: list[dict] = []
-        chars = 0
+        if redeliver:
+            taken, self.batch = self.batch, []
+        else:
+            await self.ack_batch()
+        chars = sum(len(f.get("content", "")) for f in taken)
         while self.buffer and len(taken) < max_items:
             size = len(self.buffer[0].get("content", ""))
             if taken and chars + size > CATCHUP_MAX_CHARS:
@@ -240,7 +276,7 @@ class CoreSession:
             chars += size
         if not self.buffer:
             self.arrived.clear()
-        self.batch = [f["id"] for f in taken]
+        self.batch = taken
         return taken
 
     async def close(self) -> None:
@@ -302,8 +338,9 @@ class Gateway:
         ) not in ("", "0")
         # (token hash, spec) -> session
         self.sessions: dict[tuple[str, str], CoreSession] = {}
-        # (token hash, MCP session id) -> spec, for clients that keep MCP sessions
-        self.attached: dict[tuple[str, str], str] = {}
+        # (token hash, MCP session id) -> (spec, last use), for clients that keep
+        # MCP sessions
+        self.attached: dict[tuple[str, str], tuple[str, float]] = {}
         self.verdicts: dict[str, TokenVerdict] = {}
         # client address -> (failures left, last refill)
         self.failures: dict[str, tuple[float, float]] = {}
@@ -333,6 +370,36 @@ class Gateway:
         self.verdicts[key] = TokenVerdict(whoami, now)
         return whoami
 
+    def known_valid(self, token: str) -> bool:
+        """True if the core accepted the token within the cache time."""
+        verdict = self.verdicts.get(_token_hash(token))
+        return (
+            verdict is not None
+            and verdict.whoami is not None
+            and time.monotonic() - verdict.checked_at < self.token_cache_seconds
+        )
+
+    def forget_token(self, token: str) -> None:
+        """The core revoked the token: drop its verdict and its sessions."""
+        key = _token_hash(token)
+        self.verdicts.pop(key, None)
+        for session_key in [k for k in self.sessions if k[0] == key]:
+            session = self.sessions.pop(session_key)
+            asyncio.ensure_future(session.close())
+        for attach_key in [k for k in self.attached if k[0] == key]:
+            del self.attached[attach_key]
+
+    def attach(self, token: str, mcp_session: str, spec: str) -> None:
+        self.attached[(_token_hash(token), mcp_session)] = (spec, time.monotonic())
+
+    def attached_spec(self, token: str, mcp_session: str) -> str | None:
+        key = (_token_hash(token), mcp_session)
+        entry = self.attached.get(key)
+        if entry is None:
+            return None
+        self.attached[key] = (entry[0], time.monotonic())
+        return entry[0]
+
     def _failures_left(self, client: str, now: float) -> float:
         rate = self.auth_failures_per_minute
         left, last = self.failures.get(client, (rate, now))
@@ -358,7 +425,7 @@ class Gateway:
                 f"too many sessions for this credential (at most "
                 f"{self.sessions_per_credential} at a time)"
             )
-        created = CoreSession(self.core_url, token, spec)
+        created = CoreSession(self.core_url, token, spec, self.forget_token)
         self.sessions[key] = created
         return created
 
@@ -376,6 +443,9 @@ class Gateway:
             for client, (_left, last) in list(self.failures.items()):
                 if now - last > 60.0:  # refilled by now
                     del self.failures[client]
+            for key, (_spec, last) in list(self.attached.items()):
+                if now - last > MCP_SESSION_IDLE_SECONDS:
+                    del self.attached[key]
 
 
 GATEWAY = Gateway()
@@ -413,14 +483,17 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         client = _client_address(scope)
-        if GATEWAY.blocked(client):
+        request = Request(scope)
+        header = request.headers.get("authorization", "")
+        token = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
+        # A blocked address still gets through with a token that the core
+        # accepted recently, so failures from others on a shared address do not
+        # lock out valid agents.
+        if GATEWAY.blocked(client) and not GATEWAY.known_valid(token):
             await PlainTextResponse("too many failed attempts", status_code=429)(
                 scope, receive, send
             )
             return
-        request = Request(scope)
-        header = request.headers.get("authorization", "")
-        token = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
         whoami = None
         if _TOKEN_RE.match(token):
             try:
@@ -543,7 +616,7 @@ def _spec(ctx: Context) -> str | None:
     mcp_session = _mcp_session_id(ctx)
     if mcp_session is None:
         return None
-    return GATEWAY.attached.get((_token_hash(_bearer(ctx.headers or {})), mcp_session))
+    return GATEWAY.attached_spec(_bearer(ctx.headers or {}), mcp_session)
 
 
 async def _session(ctx: Context) -> CoreSession:
@@ -673,9 +746,7 @@ async def attach(ctx: Context, session_id: str = "", handle: str = "") -> str:
             "This client does not keep an MCP session, so an attach cannot last "
             "beyond this call. " + _NOT_ATTACHED.split(". ", 1)[1]
         )
-    spec = session_id or f"@{handle}"
-    token = _bearer(ctx.headers or {})
-    GATEWAY.attached[(_token_hash(token), mcp_session)] = spec
+    GATEWAY.attach(_bearer(ctx.headers or {}), mcp_session, session_id or f"@{handle}")
     return await whoami(ctx)
 
 
@@ -714,8 +785,7 @@ async def register_agent(
         mcp_session = _mcp_session_id(ctx)
         if mcp_session is None:
             return _NOT_ATTACHED
-        token = _bearer(ctx.headers or {})
-        GATEWAY.attached[(_token_hash(token), mcp_session)] = f"@{name}"
+        GATEWAY.attach(_bearer(ctx.headers or {}), mcp_session, f"@{name}")
     frame: dict[str, Any] = {
         "type": proto.REGISTER_AGENT,
         "name": name,
@@ -811,7 +881,8 @@ def _history_lines(history: list[dict]) -> list[str]:
     lines = []
     for m in history:
         handle = f"#{m['ordinal']} " if m.get("ordinal") else ""
-        lines.append(f"  {handle}{m.get('sender')}: {m.get('body')}")
+        body = str(m.get("body", "")).replace("\r", "").replace("\n", "\n      ")
+        lines.append(f"  {handle}{m.get('sender')}: {body}")
     return lines
 
 
@@ -1047,33 +1118,44 @@ async def list_subscriptions(ctx: Context) -> str:
 
 
 @_tool
-async def catch_up(ctx: Context, max_items: int = CATCHUP_MAX_ITEMS) -> str:
+async def catch_up(
+    ctx: Context, max_items: int = CATCHUP_MAX_ITEMS, redeliver: bool = False
+) -> str:
     """Retrieve pending notifications: messages, PR updates, and callbacks.
 
     Nothing is pushed to you through this gateway, so call this periodically and
-    after long pauses. Each call acknowledges the batch that the previous call
-    returned; if a response is lost, its batch comes back. Items marked [direct] or
-    [urgent] are addressed to you.
+    after long pauses. Each call acknowledges the batch that the previous
+    catch_up or wait_for_messages returned. If that call failed or you did not
+    see its result, pass redeliver=true to get its batch again. Items marked
+    [direct] or [urgent] are addressed to you.
 
     Args:
-        max_items: at most this many items (1-25).
+        max_items: at most this many new items (1-25).
+        redeliver: return the previous batch again, before new items.
     """
     session = await _session(ctx)
-    items = await session.pull(max(1, min(CATCHUP_MAX_ITEMS, max_items)))
+    items = await session.pull(max(1, min(CATCHUP_MAX_ITEMS, max_items)), redeliver)
     return _render_batch(session, items)
 
 
 @_tool
-async def wait_for_messages(ctx: Context, timeout_s: float = 30.0) -> str:
+async def wait_for_messages(
+    ctx: Context, timeout_s: float = 30.0, redeliver: bool = False
+) -> str:
     """Wait until a notification arrives (or the timeout passes), then return like catch_up.
 
     Use this in a loop when you wait for a reply. The gateway caps the timeout
-    (30 s by default), because clients time out long tool calls.
+    (30 s by default), because clients time out long tool calls. Like catch_up,
+    it acknowledges the previous batch; pass redeliver=true if you did not see
+    the previous result, and the call returns that batch at once.
 
     Args:
         timeout_s: how long to wait, in seconds.
+        redeliver: return the previous batch again, without waiting.
     """
     session = await _session(ctx)
+    if redeliver and session.batch:
+        return _render_batch(session, await session.pull(CATCHUP_MAX_ITEMS, True))
     await session.ack_batch()
     timeout = max(0.0, min(GATEWAY.wait_max, timeout_s))
     if not session.buffer:
@@ -1251,6 +1333,8 @@ def build_app() -> ASGIApp:
         streamable_http_path="/mcp",
         transport_security=security,
         max_request_body_size=int(_env_float("SUBSPACE_GATEWAY_MAX_BODY_BYTES", 65536)),
+        session_idle_timeout=MCP_SESSION_IDLE_SECONDS,
+        max_sessions=int(_env_float("SUBSPACE_GATEWAY_MAX_MCP_SESSIONS", 1000)),
         host=host,
     )
     return AuthMiddleware(app, "/mcp")

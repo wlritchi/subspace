@@ -381,13 +381,13 @@ class TestServerHandlersInstance:
         async def scenario():
             ws = _FakeWS()
             conn = server.Connection(ws, "default", "master")
-            conn.session_key = "sidA"
-            server.CONNECTIONS["sidA"] = [conn]
+            conn.session_key = "default/sidA"
+            server.CONNECTIONS["default/sidA"] = [conn]
             await server._handle_subscribe(
                 ws,
                 conn,
                 {
-                    "session_id": "sidA",
+                    "session_id": "default/sidA",
                     "owner": "o",
                     "repo": "r",
                     "number": 1,
@@ -426,12 +426,12 @@ class TestServerHandlersInstance:
         async def scenario():
             ws = _FakeWS()
             conn = server.Connection(ws, "default", "master")
-            conn.session_key = "sidA"
+            conn.session_key = "default/sidA"
             await server._handle_subscribe(
                 ws,
                 conn,
                 {
-                    "session_id": "sidA",
+                    "session_id": "default/sidA",
                     "owner": "o",
                     "repo": "r",
                     "number": 1,
@@ -473,16 +473,19 @@ class TestServerHandlersInstance:
         )
         for t in (default, named):
             t.snapshot = {"timeline": {}, "state": "open"}
-            t.subscribers.add("sidA")
-            t.acked["sidA"] = set()
+            t.subscribers.add("default/sidA")
+            t.acked["default/sidA"] = set()
             server.TRACKERS[t.storage_key] = t
 
         async def scenario():
             ws = _FakeWS()
             conn = server.Connection(ws, "default", "master")
-            conn.session_key = "sidA"
+            conn.session_key = "default/sidA"
             await server._handle_list_pr_subscriptions(
-                ws, conn, {"session_id": "sidA", "req_id": 9}, provider="forgejo"
+                ws,
+                conn,
+                {"session_id": "default/sidA", "req_id": 9},
+                provider="forgejo",
             )
             return ws
 
@@ -534,15 +537,15 @@ class TestAuthErrorNaming:
             instance=instance,
         )
         t.snapshot = {"timeline": {}, "state": "open", "merged": False}
-        t.subscribers.add("sidA")
-        t.acked["sidA"] = set()
+        t.subscribers.add("default/sidA")
+        t.acked["default/sidA"] = set()
 
         async def scenario():
             import asyncio
 
             conn = server.Connection(_FakeWS(), "default", "master")
-            conn.session_key = "sidA"
-            server.CONNECTIONS["sidA"] = [conn]
+            conn.session_key = "default/sidA"
+            server.CONNECTIONS["default/sidA"] = [conn]
             loop_task = asyncio.ensure_future(server._tracker_loop(t))
             for _ in range(200):
                 if t.auth_notified:

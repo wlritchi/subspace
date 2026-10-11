@@ -1229,7 +1229,7 @@ def test_truncation_notice_delivered_once_then_ack_resets(
     server, tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
-    key, sid = "o/r#1", "sidA"
+    key, sid = "o/r#1", "default/sidA"
     trunc_id = f"trunc:{key}"
     tracker = pm.PRTracker("o", "r", 1, None)
     tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
@@ -1429,7 +1429,7 @@ class TestRefresh:
         time of each poll_once call, and `gate` is an asyncio.Event poll_once awaits
         before returning (cleared to hold a poll in flight)."""
         monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
-        sid = "sidA"
+        sid = "default/sidA"
         tracker = pm.PRTracker("o", "r", 1, _StubClient())
         tracker.snapshot = {"timeline": {}, "labels": [], "state": "open"}
         tracker.subscribers.add(sid)
@@ -1533,11 +1533,11 @@ class TestRefresh:
             assert ws.sent[-1]["reason"].startswith("rate limited until ")
             tracker.client.throttle_until = None
 
-            del server.CONNECTIONS["sidA"]
+            del server.CONNECTIONS["default/sidA"]
             await server._handle_refresh(ws, conn, _refresh_msg())
             assert ws.sent[-1]["polled"] is False
             assert ws.sent[-1]["reason"] == "no connected subscribers"
-            server.CONNECTIONS["sidA"] = [conn]
+            server.CONNECTIONS["default/sidA"] = [conn]
 
             tracker.terminal, tracker.merged = True, True
             await server._handle_refresh(ws, conn, _refresh_msg())

@@ -198,3 +198,15 @@ def test_default_account_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SUBSPACE_DEFAULT_ACCOUNT", "Not Valid")
     with pytest.raises(a.AccountsError):
         a.default_account_id()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[[account]]\nid = "ci"\npermissions = [["messaging"]]\n',
+        '[[account]]\nid = "ci"\nmax_severity = ["high"]\n',
+    ],
+)
+def test_wrong_types_are_accounts_errors(text: str) -> None:
+    with pytest.raises(a.AccountsError):
+        a.parse(text, "default")
