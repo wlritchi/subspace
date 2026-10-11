@@ -43,16 +43,23 @@ class AccountsError(ValueError):
 
 @dataclass(frozen=True)
 class Limits:
-    """Limits for each session of an account. None means no limit."""
+    """Limits for an account and its sessions. None means no limit."""
 
+    # For the whole account.
+    sessions: int | None = 20
     posts_per_minute: int | None = 30
+    # For each session.
     channels: int | None = 10
     pr_subscriptions: int | None = 0
     callbacks: int | None = 0
 
 
 UNLIMITED = Limits(
-    posts_per_minute=None, channels=None, pr_subscriptions=None, callbacks=None
+    sessions=None,
+    posts_per_minute=None,
+    channels=None,
+    pr_subscriptions=None,
+    callbacks=None,
 )
 _LIMIT_KEYS = frozenset(Limits.__dataclass_fields__)
 
@@ -309,12 +316,14 @@ class AccountStore:
         except (OSError, AccountsError) as exc:
             if strict:
                 raise
+            # Fail closed: an edit that revokes a credential must not leave it
+            # valid because the edit also broke the file.
             print(
-                f"subspace: {self.path}: {exc}; keeping the previous accounts",
+                f"subspace: {self.path}: {exc}; until the file is fixed, only the "
+                "master token is accepted",
                 file=sys.stderr,
             )
-            self._stamp = stamp
-            return
+            accounts = {self.default_id: builtin_default(self.default_id)}
         self.accounts = accounts
         self._credentials = {
             c.id: (a.id, c) for a in accounts.values() for c in a.credentials

@@ -95,7 +95,7 @@ def test_expired_credential(tmp_path: Path) -> None:
     assert not store.credential_valid("ci", parts[1], time.time())
 
 
-def test_reload_revokes_and_keeps_previous_on_error(tmp_path: Path) -> None:
+def test_reload_revokes(tmp_path: Path) -> None:
     parts = a.new_token()
     path = tmp_path / "accounts.toml"
     _write(path, '[[account]]\nid = "ci"\n' + _credential_block(parts))
@@ -103,14 +103,27 @@ def test_reload_revokes_and_keeps_previous_on_error(tmp_path: Path) -> None:
     assert store.credential_valid("ci", parts[1], 0.0)
     assert not store.reload_if_changed()
 
-    _write(path, "not = [valid")  # broken: keep the previous accounts
-    assert store.reload_if_changed()
-    assert store.credential_valid("ci", parts[1], 0.0)
-
     _write(path, '[[account]]\nid = "ci"\n')  # credential removed
     assert store.reload_if_changed()
     assert not store.credential_valid("ci", parts[1], 0.0)
     assert store.credential_valid("default", "master", 0.0)
+
+
+def test_broken_file_at_reload_fails_closed(tmp_path: Path) -> None:
+    parts = a.new_token()
+    path = tmp_path / "accounts.toml"
+    _write(path, '[[account]]\nid = "ci"\n' + _credential_block(parts))
+    store = a.AccountStore(path, MASTER, "default")
+    _write(path, "not = [valid")
+    assert store.reload_if_changed()
+    assert store.get("ci") is None
+    assert not store.credential_valid("ci", parts[1], 0.0)
+    assert store.authenticate(f"Bearer {parts[0]}", 0.0) is None
+    assert store.authenticate(f"Bearer {MASTER}", 0.0) == ("default", "master")
+    # Fixing the file brings the account back.
+    _write(path, '[[account]]\nid = "ci"\n' + _credential_block(parts))
+    assert store.reload_if_changed()
+    assert store.credential_valid("ci", parts[1], 0.0)
 
 
 def test_strict_load_at_startup(tmp_path: Path) -> None:
@@ -174,6 +187,7 @@ def test_limits_parse() -> None:
     limits = accounts["ci"].limits
     assert limits.posts_per_minute == 5 and limits.callbacks == 2
     assert limits.channels == 10 and limits.pr_subscriptions == 0
+    assert limits.sessions == 20
 
 
 def test_default_account_id_env(monkeypatch: pytest.MonkeyPatch) -> None:

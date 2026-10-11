@@ -175,7 +175,7 @@ SESSIONS: sessions.SessionRegistry
 # Message topics: topic key ("chan:<name>" / "dm:<...>") -> MessageTopic,
 # persisted under <data_dir>/msg/<safe_key>/.
 TOPICS: dict[str, message_topic.MessageTopic] = {}
-# Session key -> (tokens, last refill time) for the post rate limit.
+# Account id -> (tokens, last refill time) for the post rate limit.
 POST_BUCKETS: dict[str, tuple[float, float]] = {}
 
 
@@ -445,6 +445,27 @@ def _wake_subscribers(tracker: pr_monitor.PRTracker) -> None:
         _wake(key)
 
 
+class RequestError(Exception):
+    """A request fails; _handle_frame sends the message as an ERROR reply."""
+
+
+def _ensure_session(conn: Connection, key: str) -> None:
+    """Make sure the session has a record, so that expiry finds its state.
+    Raises RequestError if the account is at its sessions limit."""
+    if SESSIONS.get(key) is not None:
+        return
+    account = conn.account
+    limit = account.limits.sessions if account is not None else 0
+    if limit is not None:
+        used = sum(1 for r in SESSIONS.list() if r.account == conn.account_id)
+        if used >= limit:
+            raise RequestError(
+                f"limit reached: sessions is {limit} for this account; reuse a "
+                "session id, or wait until old sessions expire"
+            )
+    SESSIONS.ensure(key, time.time())
+
+
 def _session_key_for(conn: Connection, msg: dict) -> str | None:
     """The session a request acts for: the attached session, else the frame's
     ``session_id`` in the connection's account. None if there is neither."""
@@ -457,7 +478,9 @@ def _session_key_for(conn: Connection, msg: dict) -> str | None:
         sessions.validate_session_id(session_id)
     except sessions.SessionError:
         return None
-    return sessions.session_key(conn.account_id, session_id)
+    key = sessions.session_key(conn.account_id, session_id)
+    _ensure_session(conn, key)
+    return key
 
 
 _NOTICE_SEQ = itertools.count(1)
@@ -499,6 +522,7 @@ async def _attach(conn: Connection, key: str) -> None:
     """Attach a connection to a session, and detach it from its previous one."""
     if conn.session_key == key:
         return
+    _ensure_session(conn, key)
     await _detach(conn)
     now = time.time()
     conns = CONNECTIONS.setdefault(key, [])
@@ -716,7 +740,14 @@ async def _handle_frame(conn: Connection, msg: dict) -> None:
     if permission is not None and permission not in account.permissions:
         await _send(websocket, proto.ERROR, msg, error=f"forbidden: {permission}")
         return
+    try:
+        await _dispatch_frame(conn, msg, kind)
+    except RequestError as exc:
+        await _send(websocket, proto.ERROR, msg, error=str(exc))
 
+
+async def _dispatch_frame(conn: Connection, msg: dict, kind: object) -> None:
+    websocket = conn.ws
     if kind == proto.REGISTER:
         await _handle_register(conn, msg)
 
@@ -1519,22 +1550,24 @@ def _get_or_create_topic(key: str, kind: str) -> message_topic.MessageTopic:
 
 
 def _limit_error(conn: Connection, key: str, limit: str) -> str | None:
-    """An error string if the session is at its account's ``limit``, else None.
-    For posts_per_minute, a None result also spends one post."""
+    """An error string if the session (or, for posts_per_minute, the account) is
+    at the account's ``limit``, else None. For posts_per_minute, a None result
+    also spends one post."""
     account = conn.account
     if account is None:
         return "account removed"
     value: int | None = getattr(account.limits, limit)
     if value is None:
         return None
-    if limit == "posts_per_minute":
+    if limit == "posts_per_minute":  # for the whole account
         now = time.time()
-        tokens, last = POST_BUCKETS.get(key, (float(value), now))
+        bucket = conn.account_id
+        tokens, last = POST_BUCKETS.get(bucket, (float(value), now))
         tokens = min(float(value), tokens + (now - last) * value / 60.0)
         if tokens < 1.0:
-            POST_BUCKETS[key] = (tokens, now)
-            return f"rate limited: at most {value} posts and DMs a minute"
-        POST_BUCKETS[key] = (tokens - 1.0, now)
+            POST_BUCKETS[bucket] = (tokens, now)
+            return f"rate limited: at most {value} posts, DMs, and reactions a minute"
+        POST_BUCKETS[bucket] = (tokens - 1.0, now)
         return None
     if limit == "channels":
         used = sum(
@@ -2098,7 +2131,6 @@ def _reap_expired_sessions(now: float) -> list[str]:
         for tracker in list(TRACKERS.values()):
             _unsubscribe(tracker, key)
         scheduler.delete_session(key)
-        POST_BUCKETS.pop(key, None)
         SESSIONS.remove(key)
     return removed
 

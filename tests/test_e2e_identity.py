@@ -23,20 +23,29 @@ MASTER = "master-test-token"
 
 
 class Server:
-    def __init__(self, port: int, data_dir: Path, remote_token: str) -> None:
+    def __init__(self, port: int, data_dir: Path, tokens: dict[str, str]) -> None:
         self.port: int = port
         self.data_dir: Path = data_dir
-        self.remote_token: str = remote_token
+        self.tokens: dict[str, str] = tokens
 
     async def local(self) -> Client:
         return await Client.open(self.port, MASTER)
 
-    async def remote(self) -> Client:
-        return await Client.open(self.port, self.remote_token)
+    async def remote(self, account: str = "ci") -> Client:
+        return await Client.open(self.port, self.tokens[account])
 
 
-def _accounts_file(data_dir: Path) -> str:
-    token, credential_id, digest = accounts.new_token()
+def _accounts_file(data_dir: Path) -> dict[str, str]:
+    """Write an accounts file with two accounts. Returns account id -> token."""
+    tokens: dict[str, str] = {}
+    blocks: dict[str, str] = {}
+    for account in ("ci", "burst"):
+        token, credential_id, digest = accounts.new_token()
+        tokens[account] = token
+        blocks[account] = (
+            f'[[account.credential]]\nid = "{credential_id}"\n'
+            f'secret_sha256 = "{digest}"\n'
+        )
     (data_dir / "accounts.toml").write_text(
         f"""
 [[account]]
@@ -44,26 +53,30 @@ id = "ci"
 label = "CI reviewers"
 channels = ["ops", "ci-*"]
 
-[account.limits]
-posts_per_minute = 5
+{blocks["ci"]}
 
-[[account.credential]]
-id = "{credential_id}"
-secret_sha256 = "{digest}"
+[[account]]
+id = "burst"
+
+[account.limits]
+sessions = 2
+posts_per_minute = 3
+
+{blocks["burst"]}
 """
     )
-    return token
+    return tokens
 
 
 @contextlib.contextmanager
 def _server(data_dir: Path) -> Iterator[Server]:
-    token = _accounts_file(data_dir)
+    tokens = _accounts_file(data_dir)
     port = free_port()
     env = server_env(port, data_dir)
     env["SUBSPACE_TOKEN"] = MASTER
     env["SUBSPACE_ACCOUNTS_CHECK_SECONDS"] = "0.2"
     with server_process(env):
-        yield Server(port, data_dir, token)
+        yield Server(port, data_dir, tokens)
 
 
 @pytest.fixture(scope="module")
@@ -108,7 +121,8 @@ def test_whoami(srv: Server) -> None:
         assert reply["channels"] == ["ops", "ci-*"]
         assert reply["session_id"] == "@whoami-bot"
         assert reply["handle"] == "whoami-bot"
-        assert reply["limits"]["posts_per_minute"] == 5
+        assert reply["limits"]["posts_per_minute"] == 30
+        assert reply["limits"]["sessions"] == 20
         await local.close()
         await remote.close()
 
@@ -213,14 +227,38 @@ def test_remote_scope(srv: Server) -> None:
         assert all(
             c["name"] in {"ops"} or c["name"].startswith("ci-") for c in channels
         )
-        # posts_per_minute = 5: the sixth post in a burst is refused.
-        results = [
-            await bot.request({"type": proto.POST, "channel": "ci-builds", "body": "x"})
-            for _ in range(6)
-        ]
-        assert [r["type"] for r in results[:5]] == [proto.POSTED] * 5
-        assert "rate limited" in results[5]["error"]
         await bot.close()
+
+    asyncio.run(scenario())
+
+
+def test_account_limits(srv: Server) -> None:
+    async def scenario() -> None:
+        one = await srv.remote("burst")
+        await one.register("@burst-one")
+        two = await srv.remote("burst")
+        await two.register("@burst-two")
+        # sessions = 2: a third session is refused, by attach or by frame.
+        three = await srv.remote("burst")
+        reply = await three.request(
+            {"type": proto.REGISTER, "session_id": "burst-three"}
+        )
+        assert "limit reached: sessions" in reply["error"]
+        reply = await three.request(
+            {"type": proto.REGISTER_AGENT, "session_id": "s3", "name": "burst-three"}
+        )
+        assert "limit reached: sessions" in reply["error"]
+        # Reusing a session is fine.
+        await three.register("@burst-one")
+        # posts_per_minute = 3, for the whole account: two sessions share it.
+        results = [
+            await client.request({"type": proto.POST, "channel": "burst", "body": "x"})
+            for client in (one, two, one, two)
+        ]
+        assert [r["type"] for r in results[:3]] == [proto.POSTED] * 3
+        assert "rate limited" in results[3]["error"]
+        for client in (one, two, three):
+            await client.close()
 
     asyncio.run(scenario())
 

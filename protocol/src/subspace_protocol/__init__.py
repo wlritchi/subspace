@@ -749,8 +749,10 @@ Permission = Literal["messaging", "schedule", "pr"]
 
 
 class AccountLimits(TypedDict):
-    """Limits for each session. None means no limit."""
+    """Limits for the account (sessions, posts_per_minute) and for each of its
+    sessions (the others). None means no limit."""
 
+    sessions: int | None
     posts_per_minute: int | None
     channels: int | None
     pr_subscriptions: int | None

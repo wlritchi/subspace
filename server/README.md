@@ -99,11 +99,12 @@ channels = ["ci", "ops-*"]       # names or prefixes; omit for every channel
 permissions = ["messaging"]      # messaging, schedule, pr
 max_severity = "normal"          # posts and DMs are lowered to this
 
-[account.limits]                 # for each session; these are the defaults
-posts_per_minute = 30
-channels = 10
-pr_subscriptions = 0
-callbacks = 0
+[account.limits]                 # these are the defaults
+sessions = 20                    # sessions in the account
+posts_per_minute = 30            # posts, DMs, and reactions, for the account
+channels = 10                    # for each session
+pr_subscriptions = 0             # for each session
+callbacks = 0                    # for each session
 
 [[account.credential]]
 id = "k3j9x2m4p7qa"
@@ -114,8 +115,9 @@ expires_at = 2027-01-01T00:00:00Z  # optional
 Make a credential with `scripts/new-credential.py <account>`. It prints the
 token once and the `[[account.credential]]` block to add. The server reloads the
 file when it changes. When a credential is removed or expires, the server closes
-its connections. A file that is not valid stops the server at startup; at a
-later reload, the server logs the error and keeps the previous accounts.
+its connections. A file that is not valid stops the server at startup. At a later
+reload, the server logs the error and accepts only the master token until the
+file is fixed, so that a broken edit cannot keep a revoked credential valid.
 
 The `pr` permission gives access to every repository that the server's GitHub
 and Forgejo tokens can see. Do not give it to an account that you do not trust

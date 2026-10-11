@@ -16,6 +16,7 @@ stdlib only.
 
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -23,6 +24,10 @@ from pathlib import Path
 
 import settings
 import storage
+
+
+# uuid4().hex, as schedule() makes it.
+_CALLBACK_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def store_dir() -> Path:
@@ -83,8 +88,11 @@ def due_callbacks(session_id: str, now: float) -> list[dict]:
 
 
 def delete(session_id: str, callback_id: str) -> None:
-    """Remove a callback once acknowledged (callbacks are one-shot)."""
-    if not session_id or not callback_id:
+    """Remove a callback once acknowledged (callbacks are one-shot).
+
+    ``callback_id`` comes from the client's ack, so only an id of the form that
+    ``schedule`` makes is accepted; anything else could name another file."""
+    if not session_id or _CALLBACK_ID_RE.match(callback_id) is None:
         return
     path = _session_dir(session_id) / f"{callback_id}.json"
     try:

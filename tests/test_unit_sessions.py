@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import scheduler
 import sessions as s
 import storage
 
@@ -218,3 +219,17 @@ def test_expired_and_remove(tmp_path: Path) -> None:
     assert reg.get("default/old") is None
     assert reg.by_handle("default", "old") is None
     assert s.SessionRegistry(tmp_path).get("default/old") is None
+
+
+def test_scheduler_delete_ignores_ids_it_did_not_make(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    victim = tmp_path / "sessions" / "victim.json"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("{}")
+    callback_id = scheduler.schedule("ci/x", 0.0)
+    scheduler.delete("ci/x", "../../sessions/victim")
+    assert victim.exists()
+    scheduler.delete("ci/x", callback_id)
+    assert scheduler.pending("ci/x") == []
