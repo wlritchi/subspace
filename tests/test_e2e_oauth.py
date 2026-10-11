@@ -74,8 +74,14 @@ async def _login(
     login_url = authorize.headers["location"]
     page = await http.get(login_url)
     assert page.status_code == 200
+    # With "no-referrer", a browser sends "Origin: null" on the form POST.
+    assert page.headers["referrer-policy"] == "same-origin"
     rid = urllib.parse.parse_qs(urllib.parse.urlsplit(login_url).query)["request"][0]
-    return await http.post(f"{_base(stack)}/oauth/login", data={"request": rid, **form})
+    return await http.post(
+        f"{_base(stack)}/oauth/login",
+        data={"request": rid, **form},
+        headers={"Origin": _base(stack)},
+    )
 
 
 def _query(response: httpx2.Response) -> dict[str, str]:
@@ -382,6 +388,10 @@ def test_login_is_bound_to_its_browser(stack: Stack) -> None:
                 headers={"Origin": "https://evil.example"},
             )
             assert cross.status_code == 403
+            opaque = await victim.post(
+                f"{_base(stack)}/oauth/login", data=form, headers={"Origin": "null"}
+            )
+            assert opaque.status_code == 403
             done = await victim.post(f"{_base(stack)}/oauth/login", data=form)
             assert "code" in _query(done)
 

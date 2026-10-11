@@ -879,11 +879,13 @@ class OAuthServer:
 OAUTH = OAuthServer()
 
 # The page has no scripts. It must not be framed (clickjacking).
+# Use "same-origin", not "no-referrer": with "no-referrer" the browser sends
+# "Origin: null" on the form POST, and the login refuses it.
 _PAGE_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
     "frame-ancestors 'none'",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "X-Frame-Options": "DENY",
 }
 
