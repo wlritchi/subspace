@@ -16,6 +16,7 @@ import re
 import secrets
 import sys
 import tomllib
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,10 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
 # fixed-length id is what separates the parts.
 _TOKEN_RE = re.compile(r"^ssp_([a-z2-7]{12})_([A-Za-z0-9_-]{20,})\Z")
 _BEARER = "Bearer "
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_WEBHOOK_KEY_RE = re.compile(r"^[\x21-\x7e]*\Z")
+DEFAULT_WAKE_GRACE_SECONDS = 60.0
+DEFAULT_WAKE_COOLDOWN_SECONDS = 300.0
 
 
 class AccountsError(ValueError):
@@ -75,6 +80,19 @@ class Credential:
 
 
 @dataclass(frozen=True)
+class Webhook:
+    """Wake-up for the session that holds ``handle``. See "Webhook wake-up" in
+    docs/specs/2026-10-10-remote-agent-mcp.md."""
+
+    handle: str
+    url: str
+    # Sent as "Authorization: Bearer <key>". Empty means no Authorization header.
+    key: str = field(default="", repr=False)
+    grace_seconds: float = DEFAULT_WAKE_GRACE_SECONDS
+    cooldown_seconds: float = DEFAULT_WAKE_COOLDOWN_SECONDS
+
+
+@dataclass(frozen=True)
 class Account:
     id: str
     label: str = ""
@@ -84,6 +102,13 @@ class Account:
     max_severity: str = "normal"
     limits: Limits = field(default_factory=Limits)
     credentials: tuple[Credential, ...] = ()
+    webhooks: tuple[Webhook, ...] = ()
+
+    def webhook(self, handle: str) -> Webhook | None:
+        for webhook in self.webhooks:
+            if webhook.handle == handle:
+                return webhook
+        return None
 
     def allows_channel(self, name: str) -> bool:
         if self.channels is None:
@@ -193,6 +218,52 @@ def _parse_credential(raw: object, where: str) -> Credential:
     )
 
 
+def _seconds(raw: dict, key: str, default: float, where: str) -> float:
+    value = raw.get(key, default)
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise AccountsError(f"{where}: {key} must be a number >= 0")
+    return float(value)
+
+
+def _parse_webhook(raw: object, where: str) -> Webhook:
+    if not isinstance(raw, dict):
+        raise AccountsError(f"{where} must be a table")
+    _check_keys(
+        raw, {"handle", "url", "key", "grace_seconds", "cooldown_seconds"}, where
+    )
+    handle = raw.get("handle")
+    if (
+        not isinstance(handle, str)
+        or not (2 <= len(handle) <= _ID_MAX)
+        or not _ID_RE.match(handle)
+    ):
+        raise AccountsError(f"{where}: handle must be a kebab-case agent name")
+    url = raw.get("url")
+    parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+    if parsed is None or not parsed.hostname:
+        raise AccountsError(f"{where}: url must be an absolute URL")
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and parsed.hostname in _LOOPBACK_HOSTS
+    ):
+        raise AccountsError(f"{where}: url must be https (http only on loopback)")
+    key = raw.get("key", "")
+    if not isinstance(key, str) or not _WEBHOOK_KEY_RE.match(key):
+        # An HTTP header must be ASCII. A key that is not would fail in the
+        # client, whose error repeats the header value, key included.
+        raise AccountsError(
+            f"{where}: key must be a string of printable ASCII with no spaces"
+        )
+    return Webhook(
+        handle=handle,
+        url=url,
+        key=key,
+        grace_seconds=_seconds(raw, "grace_seconds", DEFAULT_WAKE_GRACE_SECONDS, where),
+        cooldown_seconds=_seconds(
+            raw, "cooldown_seconds", DEFAULT_WAKE_COOLDOWN_SECONDS, where
+        ),
+    )
+
+
 def _parse_account(raw: object, index: int) -> Account:
     where = f"account[{index}]"
     if not isinstance(raw, dict):
@@ -207,6 +278,7 @@ def _parse_account(raw: object, index: int) -> Account:
             "max_severity",
             "limits",
             "credential",
+            "webhook",
         },
         where,
     )
@@ -246,6 +318,15 @@ def _parse_account(raw: object, index: int) -> Account:
     credentials = raw.get("credential", [])
     if not isinstance(credentials, list):
         raise AccountsError(f"{where}: credential must be an array of tables")
+    raw_webhooks = raw.get("webhook", [])
+    if not isinstance(raw_webhooks, list):
+        raise AccountsError(f"{where}: webhook must be an array of tables")
+    webhooks = tuple(
+        _parse_webhook(w, f"{where} webhook[{i}]") for i, w in enumerate(raw_webhooks)
+    )
+    handles = [w.handle for w in webhooks]
+    if len(set(handles)) != len(handles):
+        raise AccountsError(f"{where}: more than one webhook for a handle")
     return Account(
         id=account_id,
         label=label,
@@ -257,6 +338,7 @@ def _parse_account(raw: object, index: int) -> Account:
             _parse_credential(c, f"{where} credential[{i}]")
             for i, c in enumerate(credentials)
         ),
+        webhooks=webhooks,
     )
 
 

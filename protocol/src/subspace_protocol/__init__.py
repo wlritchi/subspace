@@ -141,6 +141,9 @@ class AgentRecord(TypedDict):
 
 class AgentListEntry(AgentRecord):
     connected: bool
+    # The session's handle has a webhook: a message can start the agent while
+    # it is offline.
+    wakeable: NotRequired[bool]
 
 
 class Message(TypedDict):

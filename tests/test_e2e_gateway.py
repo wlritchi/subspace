@@ -204,16 +204,12 @@ def test_messaging_round_trip(stack: Stack) -> None:
             first = await _text(bot, "catch_up")
             assert "gw-alice@default: on it?" in first
             assert "[direct]" in first
-            # Not acked until the next pull.
-            status = await alice.request(
-                {"type": proto.MESSAGE_STATUS, "target": f"#{sent['ordinal']}"}
-            )
-            assert status["pending"] == ["gw-bot@ci"]
-            assert "No new notifications." in await _text(bot, "catch_up")
+            # Acked when the pull returns it.
             status = await alice.request(
                 {"type": proto.MESSAGE_STATUS, "target": f"#{sent['ordinal']}"}
             )
             assert status["delivered"] == ["gw-bot@ci"]
+            assert "No new notifications." in await _text(bot, "catch_up")
 
             reply = await _text(bot, "join_channel", channel="secret")
             assert "forbidden: channel" in reply
@@ -277,7 +273,7 @@ def test_attach_needs_a_session(stack: Stack) -> None:
     asyncio.run(scenario())
 
 
-def test_lost_batch_comes_back_after_gateway_restart(tmp_path: Path) -> None:
+def test_unpulled_items_come_back_after_gateway_restart(tmp_path: Path) -> None:
     with _stack(tmp_path) as s:
 
         async def first() -> None:
@@ -285,10 +281,14 @@ def test_lost_batch_comes_back_after_gateway_restart(tmp_path: Path) -> None:
             async with s.mcp("?handle=lb-bot") as bot:
                 await _text(bot, "whoami")
                 await alice.request(
-                    {"type": proto.DM, "to": ["lb-bot@ci"], "body": "keep me"}
+                    {"type": proto.DM, "to": ["lb-bot@ci"], "body": "pulled"}
                 )
                 await asyncio.sleep(0.3)
-                assert "keep me" in await _text(bot, "catch_up")
+                assert "pulled" in await _text(bot, "catch_up")
+                await alice.request(
+                    {"type": proto.DM, "to": ["lb-bot@ci"], "body": "not pulled"}
+                )
+                await asyncio.sleep(0.3)
             await alice.close()
 
         asyncio.run(first())
@@ -301,12 +301,14 @@ def test_lost_batch_comes_back_after_gateway_restart(tmp_path: Path) -> None:
                 async with s.mcp("?handle=lb-bot") as bot:
                     await _text(bot, "whoami")
                     await asyncio.sleep(0.3)
-                    assert "keep me" in await _text(bot, "catch_up")
+                    batch = await _text(bot, "catch_up")
+                    assert "not pulled" in batch
+                    assert "lb-alice@default: pulled" not in batch
 
             asyncio.run(second())
 
 
-def test_idle_reap_acks_the_pulled_batch(tmp_path: Path) -> None:
+def test_pulled_batch_does_not_come_back_after_idle_reap(tmp_path: Path) -> None:
     with _stack(tmp_path, idle_seconds="1") as s:
 
         async def scenario() -> None:
@@ -318,8 +320,8 @@ def test_idle_reap_acks_the_pulled_batch(tmp_path: Path) -> None:
                 )
                 await asyncio.sleep(0.3)
                 assert "seen once" in await _text(bot, "catch_up")
-                # The gateway reaps the idle session. The client saw the batch,
-                # so it must not come back.
+                # The gateway forgets the idle session. The pull acked the
+                # batch, so the core does not send it again.
                 await asyncio.sleep(3.0)
                 assert "No new notifications." in await _text(bot, "catch_up")
             await alice.close()
@@ -375,6 +377,30 @@ def test_failed_auth_limit_uses_trusted_forwarded_entry(tmp_path: Path) -> None:
                     s.url(), json=body, headers={**bad, "X-Forwarded-For": "10.0.0.2"}
                 )
                 assert reply.status_code == 401
+
+        asyncio.run(scenario())
+
+
+def test_offline_between_calls(tmp_path: Path) -> None:
+    with _stack(tmp_path, linger_seconds="0.2") as s:
+
+        async def scenario() -> None:
+            alice = await s.local("oc-s1", "oc-alice")
+            async with s.mcp("?handle=oc-bot") as bot:
+                await _text(bot, "whoami")
+                await asyncio.sleep(0.6)
+                agents = await alice.request({"type": proto.LIST_AGENTS})
+                [entry] = [a for a in agents["agents"] if a["name"] == "oc-bot@ci"]
+                assert entry["connected"] is False
+                await alice.request(
+                    {"type": proto.DM, "to": ["oc-bot@ci"], "body": "while away"}
+                )
+                # The pull right after the reconnect sees what was pending.
+                assert "while away" in await _text(bot, "catch_up")
+                # The copy for redeliver outlives the connection.
+                await asyncio.sleep(0.6)
+                assert "while away" in await _text(bot, "catch_up", redeliver=True)
+            await alice.close()
 
         asyncio.run(scenario())
 

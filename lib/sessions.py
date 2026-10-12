@@ -66,6 +66,10 @@ class SessionRecord:
     # Last time the session acked a delivery. 0.0 if it has not acked since the
     # server started.
     last_acked: float = 0.0
+    # Webhook wake-up: when the last wake was sent, and the highest message
+    # ordinal that a wake covered.
+    wake_sent_at: float = 0.0
+    wake_covered: int = 0
 
     @property
     def account(self) -> str:
@@ -89,6 +93,8 @@ class SessionRecord:
             registered_at=float(data.get("registered_at", 0.0)),
             last_seen=float(data.get("last_seen", 0.0)),
             last_acked=float(data.get("last_acked", 0.0)),
+            wake_sent_at=float(data.get("wake_sent_at", 0.0)),
+            wake_covered=int(data.get("wake_covered", 0)),
         )
 
 

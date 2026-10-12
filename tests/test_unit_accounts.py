@@ -210,3 +210,51 @@ def test_default_account_id_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_wrong_types_are_accounts_errors(text: str) -> None:
     with pytest.raises(a.AccountsError):
         a.parse(text, "default")
+
+
+def test_webhook_parse() -> None:
+    accounts = a.parse(
+        '[[account]]\nid = "bots"\n'
+        '[[account.webhook]]\nhandle = "runner"\n'
+        'url = "https://hooks.example.com/run/1"\nkey = "s3cret"\n'
+        "grace_seconds = 5\n"
+        '[[account.webhook]]\nhandle = "local"\nurl = "http://127.0.0.1:9/hook"\n',
+        "default",
+    )
+    account = accounts["bots"]
+    runner = account.webhook("runner")
+    assert runner is not None
+    assert runner.url == "https://hooks.example.com/run/1"
+    assert runner.key == "s3cret" and "s3cret" not in repr(runner)
+    assert runner.grace_seconds == 5.0
+    assert runner.cooldown_seconds == a.DEFAULT_WAKE_COOLDOWN_SECONDS
+    local = account.webhook("local")
+    assert local is not None and local.key == ""
+    assert account.webhook("other") is None
+
+
+@pytest.mark.parametrize(
+    "webhook",
+    [
+        'handle = "runner"\nurl = "http://hooks.example.com/run"\n',
+        'handle = "runner"\nurl = "ftp://hooks.example.com/run"\n',
+        'handle = "runner"\nurl = "not a url"\n',
+        'handle = "Runner"\nurl = "https://hooks.example.com/run"\n',
+        'url = "https://hooks.example.com/run"\n',
+        'handle = "runner"\nurl = "https://hooks.example.com/run"\nkey = 1\n',
+        'handle = "runner"\nurl = "https://hooks.example.com/run"\nkey = "k\u00e9y"\n',
+        'handle = "runner"\nurl = "https://hooks.example.com/run"\nkey = "a b"\n',
+        'handle = "runner"\nurl = "https://hooks.example.com/run"\n'
+        "cooldown_seconds = -1\n",
+        'handle = "runner"\nurl = "https://hooks.example.com/run"\nretries = 3\n',
+    ],
+)
+def test_invalid_webhooks(webhook: str) -> None:
+    with pytest.raises(a.AccountsError):
+        a.parse(f'[[account]]\nid = "bots"\n[[account.webhook]]\n{webhook}', "default")
+
+
+def test_one_webhook_per_handle() -> None:
+    block = '[[account.webhook]]\nhandle = "runner"\nurl = "https://h.example.com/"\n'
+    with pytest.raises(a.AccountsError):
+        a.parse('[[account]]\nid = "bots"\n' + block + block, "default")

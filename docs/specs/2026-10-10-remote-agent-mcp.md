@@ -39,8 +39,6 @@ hostile network and, sometimes, a compromised or prompt-injected remote agent.
 - A full OAuth 2.1 authorization server with its own users and token store.
   UI connectors get a token-paste flow instead; see
   [OAuth (token paste)](#oauth-token-paste).
-- Push wake-up of an offline remote agent (webhooks). See
-  [Later phases](#later-phases).
 - More than one core instance. The core stays single-instance.
 - Agent spawning. That stays in the plugin.
 
@@ -125,6 +123,13 @@ callbacks = 0
 id = "k3j9x2m4p7qa"
 secret_sha256 = "…"
 expires_at = 2027-01-01T00:00:00Z  # optional
+
+[[account.webhook]]              # optional; see "Webhook wake-up"
+handle = "reviewer"
+url = "https://hooks.example.com/run/abc"
+key = "…"                        # optional; sent as a Bearer token
+grace_seconds = 60               # optional
+cooldown_seconds = 300           # optional
 ```
 
 The default account always exists, and the master token is always one of its
@@ -344,19 +349,21 @@ reached (for example, during a restart), the gateway tries again for
 Only the core's unauthorized close code refuses a token; any other close is not
 cached as a verdict.
 
-### Delivery: pull, at least once
+### Delivery: pull
 
 The core sends `notify` frames eagerly. The gateway buffers them in memory and
-does not ack them.
+acks an item to the core only when a pull returns it.
 
 - `catch_up(max_items?, redeliver?)` returns buffered items in order, in
   bounded batches (the same limits as the relay: 25 items, 50 000
-  characters). The gateway acks a batch when the agent pulls **again**, or
-  when it calls `ack()`. The gateway cannot see whether a result reached the
-  agent, so an agent that did not see a result (the call failed) passes
-  `redeliver=true`, and gets that batch again before new items. The core
-  sends unacked items again after a reconnect. The `#N` handles let the agent
-  see duplicates.
+  characters). The gateway acks the batch to the core when it returns it, so
+  that "acked" in the core means "the agent got it". `message_status` and
+  webhook wake-up depend on that. The gateway keeps a copy of the last batch.
+  The gateway cannot see whether a result reached the agent, so an agent that
+  did not see a result (the call failed) passes `redeliver=true`, and gets
+  that batch again before new items. `ack()` drops the copy. The core sends
+  items that no pull returned again after a reconnect. The `#N` handles let
+  the agent see duplicates.
 - `wait_for_messages(timeout_s)` blocks until at least one item is buffered,
   or until the timeout. The maximum is 30 s by default, because remote clients
   time out tool calls. An agent that waits for a reply calls it in a loop.
@@ -368,17 +375,90 @@ does not ack them.
 
 ### Presence and idle sessions
 
-The gateway keeps the WebSocket open for an idle lease (for example 10
-minutes) after the last MCP request, then closes it. After that, the session
-is offline. Before it closes, the gateway acks the batch that the last pull
-returned: the agent got that batch, and a request for it again (`redeliver`)
-comes at once, not after the lease. Messages that the agent did not pull stay
-unacked in the core, and the core sends them again when the session next
-attaches. A gateway restart therefore loses nothing, but can send the last
-batch again.
+The gateway holds a session's WebSocket to the core only while a tool call
+for the session is in progress, including a `wait_for_messages`, and for a
+short linger after the last call ends (`SUBSPACE_GATEWAY_LINGER_SECONDS`,
+5 s). Then it closes the WebSocket, and the session is offline. So "connected"
+in the core means "in a call", which webhook wake-up needs. The next call connects again. Inside the cluster, a connection takes little time. The core answers `whoami`
+after its first delivery pass for the session, on the same WebSocket, so a
+pull right after the gateway connects sees everything that was pending.
 
-`message_status` already reports `last_acked`. For a remote agent, that value
-shows when it last pulled.
+The gateway keeps the session's buffer and the copy of the last batch for an
+idle lease (`SUBSPACE_GATEWAY_IDLE_SECONDS`, 10 minutes) after the last call,
+then forgets them. Messages that no pull returned stay unacked in the core,
+and the core sends them again when the session next attaches. A gateway
+restart therefore loses no message that the agent did not get; it loses only
+the copy for `redeliver`.
+
+`message_status` reports `last_acked`. For a remote agent, that value shows
+when it last pulled.
+
+### Webhook wake-up
+
+A session that is offline does not see new messages until it connects again.
+A webhook lets the core start the agent instead: for example a bot run, a
+scheduled cloud agent, or a CI workflow. The core sends it, not the gateway,
+so it works for every kind of session, and its state survives restarts.
+
+**Configuration.** An `[[account.webhook]]` entry in `accounts.toml` names a
+handle in the account, a URL, and an optional key. The URL must be `https`,
+except on a loopback host. The key goes in `Authorization: Bearer <key>`. The
+file is the operator's, so the core does not limit the hosts. A webhook
+belongs to the session that holds the handle.
+
+**When the core sends it.** All of these must be true:
+
+- The session holds a handle that has a webhook.
+- The session has no connection.
+- The session has an unacked message at or above its threshold for that
+  context (the same `level` and `threshold` as delivery), that no earlier
+  wake covered.
+- The grace time (`grace_seconds`, 60) passed since the session was last
+  connected, and since the core started (clients need time to connect again
+  after a restart). An agent that makes a new connection for each tool call is
+  offline between two calls of the same turn; the grace time keeps the core
+  from starting a second run then.
+- The session connected after the last wake, or the cooldown
+  (`cooldown_seconds`, 300) passed since it. A burst of messages gives one
+  wake.
+
+A wake covers every message that it lists. A message that a wake covered does
+not cause another wake, even if the agent does not get it.
+
+**Request.** `POST <url>` with a JSON body that points to the messages and
+does not contain them:
+
+```json
+{
+  "event": "wake",
+  "account": "ci",
+  "handle": "reviewer",
+  "pending": 3,
+  "items": [
+    {
+      "id": "msg:dm:…:7",
+      "short_id": "#812",
+      "context": "dm:…",
+      "from": "alice@default",
+      "level": "direct",
+      "severity": "normal",
+      "intent": "request"
+    }
+  ]
+}
+```
+
+`items` has at most 10 entries; `pending` counts all of them. The agent then
+pulls as usual, which fetches and acks.
+
+**Failures.** A network error, a 5xx, or a 429 is tried again after 5 s,
+30 s, and 2 minutes. Then, or after any other status that is not 2xx, the
+core logs the failure and treats the messages as covered. A 2xx means that
+the receiver accepted the wake, not that the agent ran. The core stops trying
+again when the session connects.
+
+**Presence.** `list_agents` shows `wakeable` for a session whose handle has a
+webhook, so other agents know that a message can start it.
 
 ### Tool surface
 
@@ -413,7 +493,8 @@ step can move them into a shared module that both import.
 - The ingress terminates TLS and exposes only the gateway. The core WebSocket
   stays on the private network.
 - Gateway settings: `SUBSPACE_GATEWAY_HOST`, `SUBSPACE_GATEWAY_PORT`,
-  `SUBSPACE_CORE_URL`, and the limits above.
+  `SUBSPACE_CORE_URL`, `SUBSPACE_GATEWAY_LINGER_SECONDS`, and the limits
+  above.
 
 ## Phases
 
@@ -436,15 +517,13 @@ Phases 1–4 are implemented (docs/plans/2026-10-10-remote-agents.md).
    remote client (URL, header, first tool calls).
 5. **Relay follow-up (wlr-cc-plugins).** The identity-spec follow-ups, and a
    separate threshold for messages from other accounts.
+6. **Webhook wake-up.** `[[account.webhook]]`, the wake rules in the core, the
+   gateway's connection only during calls, and acks at pull. Tests: a fake
+   receiver: threshold, grace, cooldown, retries, no wake during a wait, and no
+   second wake after a core restart.
 
 ## Later phases
 
-- **Webhook wake-up.** An optional `webhook_url` on an account. When a message
-  at or above a session's threshold arrives while the session is offline, the
-  core sends an HMAC-signed POST, for example to start a scheduled cloud agent
-  or a CI workflow. This makes remote agents reachable between runs. Risks:
-  SSRF (allowlist schemes and hosts, block private addresses), retries, and a
-  cap on the rate.
 - **Session in each tool call.** UI connectors run many conversations through
   one connector URL, so a handle in the URL names one session for all of them.
   Instead, each tool gets an optional `handle` or `session` argument, and a

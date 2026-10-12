@@ -58,6 +58,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import subspace_protocol as proto
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
@@ -77,6 +78,7 @@ import scheduler  # noqa: E402
 import sessions  # noqa: E402
 import settings  # noqa: E402
 import storage  # noqa: E402
+import wake  # noqa: E402
 
 # A scheduled callback this far past due was held while nothing was connected.
 RECOVERED_THRESHOLD_SECONDS = 30
@@ -123,6 +125,17 @@ def _handle_idle_seconds() -> float:
         except ValueError:
             pass
     return HANDLE_IDLE_DEFAULT_SECONDS
+
+
+def _wake_retry_delays() -> tuple[float, ...]:
+    """Delays before each retry of a webhook wake (comma-separated seconds)."""
+    raw = os.environ.get("SUBSPACE_WAKE_RETRY_SECONDS")
+    if raw:
+        try:
+            return tuple(float(part) for part in raw.split(","))
+        except ValueError:
+            pass
+    return wake.RETRY_DELAYS
 
 
 def _session_ttl_seconds() -> float:
@@ -179,6 +192,16 @@ SESSIONS: sessions.SessionRegistry
 TOPICS: dict[str, message_topic.MessageTopic] = {}
 # Account id -> (tokens, last refill time) for the post rate limit.
 POST_BUCKETS: dict[str, tuple[float, float]] = {}
+# session key -> the task that sends that session's webhook wake-ups, and the
+# event that makes the task check again.
+WAKE_TASKS: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
+# How long to wait for a webhook to answer.
+WAKE_TIMEOUT_SECONDS = 10.0
+# How long whoami waits for the first delivery pass of a session.
+WHOAMI_DELIVERY_SECONDS = 5.0
+# When this process started. The webhook grace time counts from here at the
+# earliest, so that clients can connect again after a restart.
+STARTED_AT = time.time()
 
 
 def _next_ordinal_path() -> Path:
@@ -407,6 +430,8 @@ class Connection:
         self.session_key: str | None = None
         self.inflight: set[str] = set()  # notification ids sent, awaiting ack
         self.wake = asyncio.Event()  # set to nudge the dispatch loop to deliver now
+        # Set when the dispatch loop finished a pass for the current session.
+        self.delivered = asyncio.Event()
         self.dispatch_task: asyncio.Task | None = None
 
     @property
@@ -437,8 +462,11 @@ def _wake(key: str | None) -> None:
     available notifications. Setting an asyncio.Event is sync and safe anywhere."""
     if not key:
         return
-    for conn in CONNECTIONS.get(key, ()):
+    conns = CONNECTIONS.get(key, ())
+    for conn in conns:
         conn.wake.set()
+    if not conns:
+        _poke_webhook(key)
 
 
 def _wake_subscribers(tracker: pr_monitor.PRTracker) -> None:
@@ -531,6 +559,7 @@ async def _attach(conn: Connection, key: str) -> None:
     conns.append(conn)
     conn.session_key = key
     conn.inflight.clear()
+    conn.delivered.clear()
     SESSIONS.ensure(key, now)
     SESSIONS.touch(key, now, persist=True)
     for tracker in TRACKERS.values():
@@ -554,10 +583,13 @@ async def _detach(conn: Connection) -> None:
         conns.remove(conn)
     if not conns:
         CONNECTIONS.pop(key, None)
-    # The handle idle rule and session expiry count from here.
+    # The handle idle rule, session expiry, and the webhook grace time count
+    # from here.
     SESSIONS.touch(key, time.time(), persist=True)
     if len(conns) == 1:
         await _announce_connections(key)
+    if not conns:
+        _poke_webhook(key)
 
 
 def _scope(key: str) -> accounts.Account | None:
@@ -682,6 +714,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                 return
             if "schedule" in account.permissions:
                 timeout = _next_callback_timeout(key, now)
+        conn.delivered.set()
         try:
             await asyncio.wait_for(conn.wake.wait(), timeout)
         except asyncio.TimeoutError:
@@ -947,6 +980,14 @@ async def _handle_whoami(conn: Connection, msg: dict) -> None:
     account = conn.account
     assert account is not None  # _handle_frame checked it
     key = conn.session_key
+    if key:
+        # Reply after the pending items, on the same WebSocket. A client that
+        # connects for each request (the gateway) sends whoami after register,
+        # and then knows that a pull sees everything that was pending.
+        try:
+            await asyncio.wait_for(conn.delivered.wait(), WHOAMI_DELIVERY_SECONDS)
+        except TimeoutError:
+            pass
     record = SESSIONS.get(key) if key else None
     limits = {
         name: getattr(account.limits, name)
@@ -1362,11 +1403,187 @@ async def _handle_set_availability(websocket, conn: Connection, msg: dict) -> No
 
 async def _handle_list_agents(websocket, conn: Connection, msg: dict) -> None:
     agents = [
-        {**_agent_view(record, conn.account_id), "connected": _live(record.key)}
+        {
+            **_agent_view(record, conn.account_id),
+            "connected": _live(record.key),
+            "wakeable": _webhook_for(record.key) is not None,
+        }
         for record in SESSIONS.records()
         if record.handle
     ]
     await _send(websocket, proto.AGENT_LIST, msg, agents=agents)
+
+
+# --------------------------------------------------------------------------- #
+# webhook wake-up (see "Webhook wake-up" in docs/specs/2026-10-10-remote-agent-mcp.md)
+# --------------------------------------------------------------------------- #
+
+
+def _webhook_for(key: str) -> tuple[accounts.Account, accounts.Webhook] | None:
+    """The account and webhook of the session's handle, or None."""
+    record = SESSIONS.get(key)
+    account = _scope(key)
+    if record is None or not record.handle or account is None:
+        return None
+    webhook = account.webhook(record.handle)
+    return (account, webhook) if webhook is not None else None
+
+
+def _wake_items(key: str, after: int) -> list[tuple[int, dict]]:
+    """Unacked messages for the session at or above its threshold, with an
+    ordinal above ``after``: (ordinal, description) pairs, oldest first."""
+    record = SESSIONS.get(key)
+    if record is None:
+        return []
+    reader_account = sessions.split_key(key)[0]
+    scope = _scope(key)
+    found: list[tuple[int, dict]] = []
+    for topic in TOPICS.values():
+        if key not in topic.members or not _topic_in_scope(scope, topic):
+            continue
+        acked = topic.acked.get(key, set())
+        threshold = messaging.effective_threshold(
+            topic.thresholds.get(key), record.default_threshold
+        )
+        for message in topic.messages:
+            if message.ordinal <= after or message.id in acked:
+                continue
+            level = messaging.compute_level(
+                severity=message.severity,
+                addressed=topic.kind == "dm" or key in message.mentions,
+                intent=message.intent,
+            )
+            if not messaging.should_surface(level, threshold):
+                continue
+            found.append(
+                (
+                    message.ordinal,
+                    {
+                        "id": message.id,
+                        "short_id": f"#{message.ordinal}",
+                        "context": topic.key,
+                        "from": _sender_display(message, reader_account),
+                        "level": level,
+                        "severity": message.severity,
+                        "intent": message.intent,
+                    },
+                )
+            )
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _poke_webhook(key: str) -> None:
+    """Make the session's wake task check whether a wake is due. Start the task
+    if the session has a webhook and no task runs."""
+    running = WAKE_TASKS.get(key)
+    if running is not None:
+        running[1].set()
+        return
+    if _webhook_for(key) is None:
+        return
+    event = asyncio.Event()
+    WAKE_TASKS[key] = (asyncio.create_task(_webhook_loop(key, event)), event)
+
+
+async def _webhook_loop(key: str, event: asyncio.Event) -> None:
+    """Send the session's wakes as the rules allow. Ends when no wake is due."""
+    try:
+        while True:
+            event.clear()
+            target = _webhook_for(key)
+            record = SESSIONS.get(key)
+            if target is None or record is None:
+                return
+            account, webhook = target
+            items = _wake_items(key, record.wake_covered)
+            due = wake.due_at(
+                live=_live(key),
+                has_new=bool(items),
+                last_seen=record.last_seen,
+                sent_at=record.wake_sent_at,
+                grace=webhook.grace_seconds,
+                cooldown=webhook.cooldown_seconds,
+                started_at=STARTED_AT,
+            )
+            if due is None:
+                return
+            delay = due - time.time()
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(event.wait(), delay)
+                except TimeoutError:
+                    pass
+                continue
+            await _send_wake(key, account, webhook, items)
+    except Exception as exc:  # noqa: BLE001 - log; the next poke starts a new task
+        # Only the type: the message of an HTTP client error can hold the key.
+        print(
+            f"subspace: wake task for {key} failed: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+    finally:
+        if WAKE_TASKS.get(key, (None,))[0] is asyncio.current_task():
+            del WAKE_TASKS[key]
+
+
+async def _send_wake(
+    key: str,
+    account: accounts.Account,
+    webhook: accounts.Webhook,
+    items: list[tuple[int, dict]],
+) -> None:
+    """POST one wake, and try again as the rules allow. Then record what the
+    wake covered. Stop if the session connects in the meantime: it then gets
+    its messages, and the next disconnect starts the rules again."""
+    started = time.time()
+    # The URL can hold a secret: log only its host.
+    where = f"{webhook.handle}@{account.id} ({httpx.URL(webhook.url).host})"
+    for delay in (0.0, *_wake_retry_delays()):
+        if delay:
+            await asyncio.sleep(delay)
+        record = SESSIONS.get(key)
+        if record is None or _live(key) or record.last_seen > started:
+            return
+        if delay:
+            # Messages can have been acked or added during the delay.
+            items = _wake_items(key, record.wake_covered)
+            if not items:
+                return
+        body = wake.body(account.id, webhook.handle, [item for _, item in items])
+        status = await _post_webhook(webhook, body)
+        if status is not None and 200 <= status < 300:
+            print(
+                f"subspace: woke {where} for {body['pending']} message(s)",
+                file=sys.stderr,
+            )
+            break
+        print(
+            f"subspace: wake of {where} failed: {status or 'no response'}",
+            file=sys.stderr,
+        )
+        if not wake.retryable(status):
+            break
+    record = SESSIONS.get(key)
+    if record is not None:
+        # The time before the first attempt: a connect during the POST then
+        # counts as a connect after the wake.
+        record.wake_sent_at = started
+        record.wake_covered = max(record.wake_covered, max(o for o, _ in items))
+        SESSIONS.persist(record)
+
+
+async def _post_webhook(webhook: accounts.Webhook, body: dict) -> int | None:
+    """Return the HTTP status, or None on a network error or timeout."""
+    headers = {"User-Agent": "subspace"}
+    if webhook.key:
+        headers["Authorization"] = f"Bearer {webhook.key}"
+    try:
+        async with httpx.AsyncClient(timeout=WAKE_TIMEOUT_SECONDS) as client:
+            response = await client.post(webhook.url, json=body, headers=headers)
+    except httpx.HTTPError:
+        return None
+    return response.status_code
 
 
 # --------------------------------------------------------------------------- #
@@ -2438,6 +2655,8 @@ async def main() -> None:
         TRACKERS[tracker.storage_key] = tracker
         tracker.task = asyncio.create_task(_tracker_loop(tracker))
     _enforce_scopes()
+    for record in SESSIONS.records():
+        _poke_webhook(record.key)
     asyncio.create_task(_reaper_loop())
     asyncio.create_task(_credential_check_loop())
 

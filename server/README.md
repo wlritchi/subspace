@@ -51,6 +51,7 @@ It provides two capabilities:
 | `SUBSPACE_ACCOUNTS_CHECK_SECONDS`     | `5`                        | How often to reload the accounts file and check credentials                                                    |
 | `SUBSPACE_HANDLE_IDLE_SECONDS`        | `900`                      | A handle whose session has had no connection this long can be registered by another session without `takeover` |
 | `SUBSPACE_SESSION_TTL_DAYS`           | `30`                       | Remove a session (handle, memberships, PR subscriptions, callbacks) after this long with no connection         |
+| `SUBSPACE_WAKE_RETRY_SECONDS`         | `5,30,120`                 | Delays before each retry of a webhook wake that failed (network error, 5xx, 429)                               |
 | `GITHUB_TOKEN`                        | —                          | Token for PR polling (`gh auth token`)                                                                         |
 | `GITHUB_API_URL`                      | `https://api.github.com`   | API base (set for GitHub Enterprise / tests)                                                                   |
 | `GITHUB_GRAPHQL_URL`                  | `{GITHUB_API_URL}/graphql` | GraphQL endpoint (override for Enterprise)                                                                     |
@@ -110,6 +111,13 @@ callbacks = 0                    # for each session
 id = "k3j9x2m4p7qa"
 secret_sha256 = "…"
 expires_at = 2027-01-01T00:00:00Z  # optional
+
+[[account.webhook]]              # optional: wake the agent with this handle
+handle = "reviewer"
+url = "https://hooks.example.com/run/abc"  # https, or http on loopback
+key = "…"                        # optional; sent as "Authorization: Bearer <key>"
+grace_seconds = 60               # wait this long after its last connection
+cooldown_seconds = 300           # at most one wake in this time, until it connects
 ```
 
 Make a credential with `scripts/new-credential.py <account>`. It prints the
@@ -122,6 +130,14 @@ file is fixed, so that a broken edit cannot keep a revoked credential valid.
 The `pr` permission gives access to every repository that the server's GitHub
 and Forgejo tokens can see. Do not give it to an account that you do not trust
 with those repositories.
+
+A webhook wakes an agent that is offline. When a message at or above the
+session's threshold arrives for the handle, and the session has had no
+connection for the grace time, the server POSTs a JSON body that lists the
+messages (ids, sender, context, level; not the text) to the URL. The agent then
+pulls as usual. A burst gives one wake. Network errors, 5xx, and 429 are tried
+again three times. `list_agents` shows the session as wakeable. The file holds the key in plain text. Restrict access to the file. See "Webhook wake-up" in
+`docs/specs/2026-10-10-remote-agent-mcp.md`.
 
 ### Migration to session keys
 
@@ -159,9 +175,11 @@ network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
   agent's own token, so the server enforces the account's permissions, channels,
   and limits.
 - Nothing is pushed. Agents call `catch_up`, or `wait_for_messages` to wait for
-  a reply. A batch is acknowledged when the agent pulls again (or calls `ack`).
-  An agent that did not see a result passes `redeliver=true` to get that batch
-  again.
+  a reply. A batch is acknowledged when a call returns it. An agent that did not
+  see a result passes `redeliver=true` to get that batch again.
+- The gateway holds the WebSocket for a session only during tool calls and a
+  short linger after, so a session is offline between calls. A webhook in the
+  accounts file can wake it.
 - Only the tools that the account can use are listed.
 
 ### Configuration
@@ -173,7 +191,8 @@ network. See `docs/specs/2026-10-10-remote-agent-mcp.md` for the design.
 | `SUBSPACE_GATEWAY_PORT`                     | `8138`                | HTTP port                                                                                                                        |
 | `SUBSPACE_GATEWAY_ALLOWED_HOSTS`            | the bind address      | `Host` values to accept (DNS rebinding protection). Set it to the public host name, e.g. `subspace.example.com`                  |
 | `SUBSPACE_GATEWAY_ALLOWED_ORIGINS`          | none                  | Browser `Origin` values to accept. Requests with no `Origin` are accepted                                                        |
-| `SUBSPACE_GATEWAY_IDLE_SECONDS`             | `600`                 | Close a session's WebSocket after this long with no request; the session then shows as offline                                   |
+| `SUBSPACE_GATEWAY_IDLE_SECONDS`             | `600`                 | Forget a session's buffer and its copy for `redeliver` after this long with no call                                              |
+| `SUBSPACE_GATEWAY_LINGER_SECONDS`           | `5`                   | Close a session's WebSocket this long after its last call ends; the session is then offline                                      |
 | `SUBSPACE_GATEWAY_WAIT_MAX_SECONDS`         | `30`                  | Longest `wait_for_messages`                                                                                                      |
 | `SUBSPACE_GATEWAY_CORE_RETRY_SECONDS`       | `10`                  | While the server cannot be reached, try again for this long before a request fails (503)                                         |
 | `SUBSPACE_GATEWAY_MAX_BODY_BYTES`           | `65536`               | Largest request body                                                                                                             |

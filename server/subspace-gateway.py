@@ -25,6 +25,7 @@ Config (env):  SUBSPACE_GATEWAY_HOST (default 127.0.0.1)
                SUBSPACE_GATEWAY_ALLOWED_HOSTS (comma-separated Host values)
                SUBSPACE_GATEWAY_ALLOWED_ORIGINS (comma-separated; default none)
                SUBSPACE_GATEWAY_IDLE_SECONDS (default 600)
+               SUBSPACE_GATEWAY_LINGER_SECONDS (default 5)
                SUBSPACE_GATEWAY_WAIT_MAX_SECONDS (default 30)
                SUBSPACE_GATEWAY_CORE_RETRY_SECONDS (default 10)
                SUBSPACE_GATEWAY_MAX_BODY_BYTES (default 65536)
@@ -124,6 +125,9 @@ TOKEN_CACHE_SECONDS = 60.0
 MCP_SESSION_IDLE_SECONDS = 1800.0
 # How long to wait for the core to answer one request.
 CORE_TIMEOUT_SECONDS = 10.0
+# Default time to keep a session's WebSocket open after its last tool call ends.
+# While the WebSocket is closed, the core counts the session as offline.
+LINGER_SECONDS = 5.0
 # Default time to try again while the core cannot be reached. A core restart
 # that is shorter than this does not make a request fail.
 CORE_RETRY_SECONDS = 10.0
@@ -180,10 +184,12 @@ class CoreSession:
     """A subspace session that remote agents use through this gateway.
 
     Holds a WebSocket to the core with the agent's token, the notify frames that
-    the core sent and the agent did not pull yet, and the batch that the last
-    pull returned. A batch is acked when the agent pulls again or calls ack. An
-    agent that did not get a pull's result asks for the batch again with
-    ``redeliver``. The core sends unacked items again after a reconnect.
+    the core sent and the agent did not pull yet, and a copy of the batch that
+    the last pull returned. A pull acks its batch at once, so that the core
+    knows what the agent got. An agent that did not get a pull's result asks
+    for the batch again with ``redeliver``. The WebSocket is open only while a
+    tool call uses the session, and for ``linger_seconds`` after; the core
+    sends unacked items again after a reconnect.
     """
 
     def __init__(
@@ -193,10 +199,15 @@ class CoreSession:
         spec: str,
         on_revoked: Callable[[str], None],
         retry_seconds: float = 0.0,
+        linger_seconds: float = 0.0,
     ) -> None:
         self.core_url: str = core_url
         self.token: str = token
         self.retry_seconds: float = retry_seconds
+        self.linger_seconds: float = linger_seconds
+        # Tool calls in progress that use this session.
+        self.calls: int = 0
+        self._linger: asyncio.TimerHandle | None = None
         # The session id that the session attaches with, or "@<handle>".
         self.spec: str = spec
         # The session id that the core attached to. A reconnect uses it, so a
@@ -205,6 +216,7 @@ class CoreSession:
         self._on_revoked = on_revoked
         self.ws: ClientConnection | None = None
         self.buffer: list[dict] = []
+        # The last pull's result, already acked; kept for ``redeliver``.
         self.batch: list[dict] = []
         self.connections: int = 1
         self.last_used: float = time.monotonic()
@@ -269,7 +281,11 @@ class CoreSession:
             self._ack_now(frame["id"])
             return
         notify_id = frame["id"]
-        if any(f["id"] == notify_id for f in (*self.batch, *self.buffer)):
+        if any(f["id"] == notify_id for f in self.batch):
+            # Sent again after a reconnect: the ack did not reach the core.
+            self._ack_now(notify_id)
+            return
+        if any(f["id"] == notify_id for f in self.buffer):
             return  # sent again after a reconnect
         self.buffer.append(frame)
         self.arrived.set()
@@ -303,37 +319,67 @@ class CoreSession:
         finally:
             self._replies.pop(req_id, None)
 
-    async def ack_batch(self) -> int:
-        """Ack the batch that the last pull returned. Returns how many."""
-        batch, self.batch = self.batch, []
-        ws = self.ws
-        if ws is not None:
-            for frame in batch:
-                await _send_quietly(ws, {"type": proto.ACK, "id": frame["id"]})
-        return len(batch)
+    def forget_batch(self) -> int:
+        """Drop the copy of the last batch. Returns how many items it had."""
+        count = len(self.batch)
+        self.batch = []
+        return count
 
     async def pull(self, max_items: int, redeliver: bool = False) -> list[dict]:
-        """Take the next batch from the buffer. Ack the previous batch first,
-        or, with ``redeliver``, start the new batch with it again."""
+        """Take the next batch from the buffer and ack it. With ``redeliver``,
+        start the batch with the last one again."""
         await self.ensure_connected()
-        taken: list[dict] = []
-        if redeliver:
-            taken, self.batch = self.batch, []
-        else:
-            await self.ack_batch()
+        taken: list[dict] = list(self.batch) if redeliver else []
         chars = sum(len(f.get("content", "")) for f in taken)
-        while self.buffer and len(taken) < max_items:
+        new: list[dict] = []
+        while self.buffer and len(taken) + len(new) < max_items:
             size = len(self.buffer[0].get("content", ""))
-            if taken and chars + size > CATCHUP_MAX_CHARS:
+            if (taken or new) and chars + size > CATCHUP_MAX_CHARS:
                 break
-            taken.append(self.buffer.pop(0))
+            new.append(self.buffer.pop(0))
             chars += size
         if not self.buffer:
             self.arrived.clear()
-        self.batch = taken
-        return taken
+        # Keep the batch before the first await, so that a cancelled call does
+        # not lose the items.
+        self.batch = taken + new
+        batch = self.batch
+        ws = self.ws
+        if ws is not None:
+            for frame in new:
+                await _send_quietly(ws, {"type": proto.ACK, "id": frame["id"]})
+        return batch
+
+    def begin_call(self) -> None:
+        self.calls += 1
+        if self._linger is not None:
+            self._linger.cancel()
+            self._linger = None
+
+    def end_call(self) -> None:
+        self.calls -= 1
+        if self.calls == 0 and self.ws is not None:
+            self._linger = asyncio.get_running_loop().call_later(
+                self.linger_seconds,
+                lambda: asyncio.ensure_future(self._disconnect_if_idle()),
+            )
+
+    async def _disconnect_if_idle(self) -> None:
+        """Close the WebSocket if no call uses the session. The session state
+        stays, and the next call connects again."""
+        self._linger = None
+        async with self._lock:
+            ws = self.ws
+            if self.calls == 0 and ws is not None:
+                # Clear it first, so that the next call connects again and does
+                # not use a WebSocket that is closing.
+                self.ws = None
+                await ws.close()
 
     async def close(self) -> None:
+        if self._linger is not None:
+            self._linger.cancel()
+            self._linger = None
         ws = self.ws
         self.ws = None
         if ws is not None:
@@ -390,6 +436,9 @@ class Gateway:
         self.wait_max: float = _env_float("SUBSPACE_GATEWAY_WAIT_MAX_SECONDS", 30.0)
         self.core_retry_seconds: float = _env_float(
             "SUBSPACE_GATEWAY_CORE_RETRY_SECONDS", CORE_RETRY_SECONDS
+        )
+        self.linger_seconds: float = _env_float(
+            "SUBSPACE_GATEWAY_LINGER_SECONDS", LINGER_SECONDS
         )
         self.sessions_per_credential: int = int(
             _env_float("SUBSPACE_GATEWAY_SESSIONS_PER_CREDENTIAL", 20)
@@ -507,7 +556,12 @@ class Gateway:
                 f"{self.sessions_per_credential} at a time)"
             )
         created = CoreSession(
-            self.core_url, token, spec, self.forget_token, self.core_retry_seconds
+            self.core_url,
+            token,
+            spec,
+            self.forget_token,
+            self.core_retry_seconds,
+            self.linger_seconds,
         )
         self.sessions[key] = created
         return created
@@ -517,12 +571,8 @@ class Gateway:
             await asyncio.sleep(min(30.0, max(1.0, self.idle_seconds / 4)))
             now = time.monotonic()
             for key, session in list(self.sessions.items()):
-                if now - session.last_used > self.idle_seconds:
+                if session.calls == 0 and now - session.last_used > self.idle_seconds:
                     del self.sessions[key]
-                    # The client got this batch and did not ask for it again
-                    # while the session was idle. Ack it, so that the core does
-                    # not send it again on the next connect.
-                    await session.ack_batch()
                     await session.close()
             for key, verdict in list(self.verdicts.items()):
                 if now - verdict.checked_at > self.token_cache_seconds:
@@ -1303,12 +1353,23 @@ def _spec(ctx: Context) -> str | None:
     return GATEWAY.attached_spec(_bearer(ctx.headers or {}), mcp_session)
 
 
+# The sessions that the current tool call uses. The tool wrapper ends the call
+# on each of them.
+_CALL_SESSIONS: ContextVar[list[CoreSession] | None] = ContextVar(
+    "_CALL_SESSIONS", default=None
+)
+
+
 async def _session(ctx: Context) -> CoreSession:
     """The attached session for this request, connected."""
     spec = _spec(ctx)
     if spec is None:
         raise GatewayError(_NOT_ATTACHED)
     session = GATEWAY.session(_bearer(ctx.headers or {}), spec)
+    used = _CALL_SESSIONS.get()
+    if used is not None and session not in used:
+        session.begin_call()
+        used.append(session)
     await session.ensure_connected()
     return session
 
@@ -1330,10 +1391,16 @@ def _tool(
 
     @functools.wraps(fn)
     async def wrapper(*args: Any, **kwargs: Any) -> str:
+        used: list[CoreSession] = []
+        reset = _CALL_SESSIONS.set(used)
         try:
             return await fn(*args, **kwargs)
         except GatewayError as exc:
             return str(exc)
+        finally:
+            _CALL_SESSIONS.reset(reset)
+            for session in used:
+                session.end_call()
 
     mcp.tool()(wrapper)
     return fn
@@ -1521,6 +1588,8 @@ async def list_agents(ctx: Context) -> str:
             if a.get("connected")
             else f"last seen {_fmt_time(a.get('last_seen'))}"
         )
+        if not a.get("connected") and a.get("wakeable"):
+            presence += "; a message wakes it"
         detail = "; ".join(
             x
             for x in (
@@ -1808,10 +1877,10 @@ async def catch_up(
     """Retrieve pending notifications: messages, PR updates, and callbacks.
 
     Nothing is pushed to you through this gateway, so call this periodically and
-    after long pauses. Each call acknowledges the batch that the previous
-    catch_up or wait_for_messages returned. If that call failed or you did not
-    see its result, pass redeliver=true to get its batch again. Items marked
-    [direct] or [urgent] are addressed to you.
+    after long pauses. Items count as delivered when a call returns them. If the
+    previous catch_up or wait_for_messages failed or you did not see its result,
+    pass redeliver=true to get its batch again. Items marked [direct] or
+    [urgent] are addressed to you.
 
     Args:
         max_items: at most this many new items (1-25).
@@ -1829,9 +1898,9 @@ async def wait_for_messages(
     """Wait until a notification arrives (or the timeout passes), then return like catch_up.
 
     Use this in a loop when you wait for a reply. The gateway caps the timeout
-    (30 s by default), because clients time out long tool calls. Like catch_up,
-    it acknowledges the previous batch; pass redeliver=true if you did not see
-    the previous result, and the call returns that batch at once.
+    (30 s by default), because clients time out long tool calls. Pass
+    redeliver=true if you did not see the previous result, and the call returns
+    that batch at once.
 
     Args:
         timeout_s: how long to wait, in seconds.
@@ -1840,7 +1909,6 @@ async def wait_for_messages(
     session = await _session(ctx)
     if redeliver and session.batch:
         return _render_batch(session, await session.pull(CATCHUP_MAX_ITEMS, True))
-    await session.ack_batch()
     timeout = max(0.0, min(GATEWAY.wait_max, timeout_s))
     if not session.buffer:
         try:
@@ -1853,12 +1921,13 @@ async def wait_for_messages(
 
 @_tool
 async def ack(ctx: Context) -> str:
-    """Acknowledge the batch that the last catch_up or wait_for_messages returned.
+    """Confirm that you saw the batch that the last catch_up or wait_for_messages
+    returned, so that redeliver can no longer return it.
 
-    catch_up does this for you on its next call; use ack when you stop pulling.
+    You do not need this: a batch counts as delivered when a call returns it.
     """
     session = await _session(ctx)
-    count = await session.ack_batch()
+    count = session.forget_batch()
     return f"Acknowledged {count} notification(s)."
 
 
