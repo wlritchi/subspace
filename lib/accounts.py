@@ -88,8 +88,28 @@ class Webhook:
     url: str
     # Sent as "Authorization: Bearer <key>". Empty means no Authorization header.
     key: str = field(default="", repr=False)
+    # A file that holds the key, read for each wake, so that the key can change
+    # without a restart (for example, a mounted Kubernetes Secret).
+    key_file: str = ""
     grace_seconds: float = DEFAULT_WAKE_GRACE_SECONDS
     cooldown_seconds: float = DEFAULT_WAKE_COOLDOWN_SECONDS
+
+    def bearer_key(self) -> str:
+        """The key to send now. Raises AccountsError if the key file cannot be
+        read or does not hold a valid key. The error does not contain the key."""
+        if not self.key_file:
+            return self.key
+        try:
+            key = Path(self.key_file).read_text().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise AccountsError(
+                f"cannot read the key file {self.key_file}: {type(exc).__name__}"
+            ) from None
+        if not key or not _WEBHOOK_KEY_RE.match(key):
+            raise AccountsError(
+                f"the key file {self.key_file} must hold printable ASCII with no spaces"
+            )
+        return key
 
 
 @dataclass(frozen=True)
@@ -229,7 +249,9 @@ def _parse_webhook(raw: object, where: str) -> Webhook:
     if not isinstance(raw, dict):
         raise AccountsError(f"{where} must be a table")
     _check_keys(
-        raw, {"handle", "url", "key", "grace_seconds", "cooldown_seconds"}, where
+        raw,
+        {"handle", "url", "key", "key_file", "grace_seconds", "cooldown_seconds"},
+        where,
     )
     handle = raw.get("handle")
     if (
@@ -253,10 +275,16 @@ def _parse_webhook(raw: object, where: str) -> Webhook:
         raise AccountsError(
             f"{where}: key must be a string of printable ASCII with no spaces"
         )
+    key_file = raw.get("key_file", "")
+    if not isinstance(key_file, str) or (key_file and not Path(key_file).is_absolute()):
+        raise AccountsError(f"{where}: key_file must be an absolute path")
+    if key and key_file:
+        raise AccountsError(f"{where}: set key or key_file, not both")
     return Webhook(
         handle=handle,
         url=url,
         key=key,
+        key_file=key_file,
         grace_seconds=_seconds(raw, "grace_seconds", DEFAULT_WAKE_GRACE_SECONDS, where),
         cooldown_seconds=_seconds(
             raw, "cooldown_seconds", DEFAULT_WAKE_COOLDOWN_SECONDS, where

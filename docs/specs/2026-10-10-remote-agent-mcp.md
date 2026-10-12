@@ -127,7 +127,7 @@ expires_at = 2027-01-01T00:00:00Z  # optional
 [[account.webhook]]              # optional; see "Webhook wake-up"
 handle = "reviewer"
 url = "https://hooks.example.com/run/abc"
-key = "…"                        # optional; sent as a Bearer token
+key_file = "/etc/subspace-keys/reviewer"  # optional; or key = "…"
 grace_seconds = 60               # optional
 cooldown_seconds = 300           # optional
 ```
@@ -402,7 +402,11 @@ so it works for every kind of session, and its state survives restarts.
 
 **Configuration.** An `[[account.webhook]]` entry in `accounts.toml` names a
 handle in the account, a URL, and an optional key. The URL must be `https`,
-except on a loopback host. The key goes in `Authorization: Bearer <key>`. The
+except on a loopback host. The key goes in `Authorization: Bearer <key>`. It
+is either in the entry (`key`) or in a file (`key_file`, an absolute path)
+that the core reads for each wake. With a file, the key can come from a
+Kubernetes Secret while the accounts file, which holds only hashes otherwise,
+stays a ConfigMap, and a new key takes effect without a restart. The
 file is the operator's, so the core does not limit the hosts. A webhook
 belongs to the session that holds the handle.
 

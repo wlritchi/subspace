@@ -258,3 +258,43 @@ def test_one_webhook_per_handle() -> None:
     block = '[[account.webhook]]\nhandle = "runner"\nurl = "https://h.example.com/"\n'
     with pytest.raises(a.AccountsError):
         a.parse('[[account]]\nid = "bots"\n' + block + block, "default")
+
+
+def test_webhook_key_file(tmp_path: Path) -> None:
+    key_file = tmp_path / "runner.key"
+    accounts = a.parse(
+        '[[account]]\nid = "bots"\n[[account.webhook]]\nhandle = "runner"\n'
+        f'url = "https://h.example.com/"\nkey_file = "{key_file}"\n',
+        "default",
+    )
+    webhook = accounts["bots"].webhook("runner")
+    assert webhook is not None
+    with pytest.raises(a.AccountsError) as missing:
+        webhook.bearer_key()
+    assert str(key_file) in str(missing.value)
+    key_file.write_text("first-key\n")
+    assert webhook.bearer_key() == "first-key"
+    # Read for each wake: a new key takes effect without a reload.
+    key_file.write_text("second-key")
+    assert webhook.bearer_key() == "second-key"
+    key_file.write_text("has a space")
+    with pytest.raises(a.AccountsError) as invalid:
+        webhook.bearer_key()
+    assert "space" not in str(invalid.value).replace("no spaces", "")
+
+
+@pytest.mark.parametrize(
+    "webhook",
+    [
+        'key_file = "relative/path"\n',
+        'key = "k"\nkey_file = "/etc/subspace/k"\n',
+        "key_file = 1\n",
+    ],
+)
+def test_invalid_webhook_key_files(webhook: str) -> None:
+    with pytest.raises(a.AccountsError):
+        a.parse(
+            '[[account]]\nid = "bots"\n[[account.webhook]]\nhandle = "runner"\n'
+            f'url = "https://h.example.com/"\n{webhook}',
+            "default",
+        )

@@ -1551,7 +1551,12 @@ async def _send_wake(
             if not items:
                 return
         body = wake.body(account.id, webhook.handle, [item for _, item in items])
-        status = await _post_webhook(webhook, body)
+        try:
+            bearer = webhook.bearer_key()
+        except accounts.AccountsError as exc:
+            print(f"subspace: wake of {where} failed: {exc}", file=sys.stderr)
+            break
+        status = await _post_webhook(webhook.url, bearer, body)
         if status is not None and 200 <= status < 300:
             print(
                 f"subspace: woke {where} for {body['pending']} message(s)",
@@ -1573,14 +1578,14 @@ async def _send_wake(
         SESSIONS.persist(record)
 
 
-async def _post_webhook(webhook: accounts.Webhook, body: dict) -> int | None:
+async def _post_webhook(url: str, bearer: str, body: dict) -> int | None:
     """Return the HTTP status, or None on a network error or timeout."""
     headers = {"User-Agent": "subspace"}
-    if webhook.key:
-        headers["Authorization"] = f"Bearer {webhook.key}"
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
     try:
         async with httpx.AsyncClient(timeout=WAKE_TIMEOUT_SECONDS) as client:
-            response = await client.post(webhook.url, json=body, headers=headers)
+            response = await client.post(url, json=body, headers=headers)
     except httpx.HTTPError:
         return None
     return response.status_code

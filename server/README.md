@@ -115,7 +115,7 @@ expires_at = 2027-01-01T00:00:00Z  # optional
 [[account.webhook]]              # optional: wake the agent with this handle
 handle = "reviewer"
 url = "https://hooks.example.com/run/abc"  # https, or http on loopback
-key = "…"                        # optional; sent as "Authorization: Bearer <key>"
+key_file = "/etc/subspace-keys/reviewer"  # optional; or key = "…"
 grace_seconds = 60               # wait this long after its last connection
 cooldown_seconds = 300           # at most one wake in this time, until it connects
 ```
@@ -136,7 +136,10 @@ session's threshold arrives for the handle, and the session has had no
 connection for the grace time, the server POSTs a JSON body that lists the
 messages (ids, sender, context, level; not the text) to the URL. The agent then
 pulls as usual. A burst gives one wake. Network errors, 5xx, and 429 are tried
-again three times. `list_agents` shows the session as wakeable. The file holds the key in plain text. Restrict access to the file. See "Webhook wake-up" in
+again three times. `list_agents` shows the session as wakeable. The key goes in `Authorization: Bearer <key>`. Prefer `key_file`: the server
+reads the file for each wake, so the key can live in a Kubernetes Secret
+mounted as a volume (not with `subPath`), and a new key takes effect without a
+restart. `key` puts the key in the accounts file itself. See "Webhook wake-up" in
 `docs/specs/2026-10-10-remote-agent-mcp.md`.
 
 ### Migration to session keys

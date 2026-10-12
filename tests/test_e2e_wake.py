@@ -94,6 +94,12 @@ def _accounts_file(data_dir: Path, hooks_port: int) -> dict[str, str]:
             ("wk-pulled", "/pulled"),
         )
     )
+    key_file = data_dir / "wk-file.key"
+    key_file.write_text("file-key-1\n")
+    webhooks += (
+        f'[[account.webhook]]\nhandle = "wk-file"\nurl = "{base}/file"\n'
+        f'key_file = "{key_file}"\ngrace_seconds = {GRACE}\ncooldown_seconds = 0\n'
+    )
     (data_dir / "accounts.toml").write_text(
         f'[[account]]\nid = "ci"\nchannels = ["ops"]\n'
         f'[[account.credential]]\nid = "{credential_id}"\n'
@@ -177,7 +183,9 @@ def test_offline_handle_is_woken(stack: Stack, hooks: Hooks) -> None:
         await asyncio.sleep(1.0)
         assert len(hooks.calls("/bot")) == 1
         calls = await hooks.wait_for("/bot", 2, COOLDOWN + 2.0)
-        assert calls[1]["at"] - calls[0]["at"] >= COOLDOWN - 0.1
+        # The cooldown counts from just before the first POST, which reaches the
+        # receiver a little later.
+        assert calls[1]["at"] - calls[0]["at"] >= COOLDOWN - 0.5
         assert [i["short_id"] for i in calls[1]["body"]["items"]] == [f"#{second}"]
 
         # The agent pulls. After that, the grace time applies, not the cooldown.
@@ -281,3 +289,22 @@ def test_no_retry_after_the_agent_pulled(tmp_path: Path, hooks: Hooks) -> None:
         gateway_process(core_port, gateway_port, linger_seconds="0.2"),
     ):
         asyncio.run(scenario())
+
+
+def test_key_file_is_read_for_each_wake(stack: Stack, hooks: Hooks) -> None:
+    async def scenario() -> None:
+        alice = await stack.local("wk-s6", "wk-alice6")
+        async with stack.mcp("?handle=wk-file") as bot:
+            await _text(bot, "whoami")
+        await asyncio.sleep(0.5)
+        await _dm(alice, "wk-file@ci", "one")
+        [first] = await hooks.wait_for("/file", 1, 5.0)
+        assert first["headers"]["authorization"] == "Bearer file-key-1"
+        # Rotate the key. The cooldown is 0, so the next message wakes again.
+        (stack.data_dir / "wk-file.key").write_text("file-key-2\n")
+        await _dm(alice, "wk-file@ci", "two")
+        calls = await hooks.wait_for("/file", 2, 5.0)
+        assert calls[1]["headers"]["authorization"] == "Bearer file-key-2"
+        await alice.close()
+
+    asyncio.run(scenario())
