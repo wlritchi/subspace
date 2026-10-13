@@ -12,6 +12,8 @@ name: Build and push image
 # Repository variable REGISTRY (e.g. registry.example.com) sets where the image
 # goes: <REGISTRY>/<owner>/<repo>. Secrets REGISTRY_USERNAME and
 # REGISTRY_PASSWORD authenticate to it.
+# Repository variable RELEASE_EMAIL (optional) sets the tagger email of
+# release tags.
 on:
   push:
     tags:
@@ -29,7 +31,7 @@ jobs:
       DOCKER_CONFIG: /tmp/docker
       REGISTRY: ${{ vars.REGISTRY }}
       IMAGE: ${{ vars.REGISTRY }}/${{ github.repository }}
-      RELEASE_EMAIL: auto-release@noreply.wlritchi.com
+      RELEASE_EMAIL: ${{ vars.RELEASE_EMAIL || 'auto-release@users.noreply.invalid' }}
 
     steps:
       - name: Checkout

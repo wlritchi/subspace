@@ -7,6 +7,9 @@ name: Tag protocol release
 # touches protocol/ and is marked breaking (`!` or BREAKING CHANGE) also forces
 # a major bump, for changes in meaning that the types do not show.
 # [skip release] in the merge commit opts out. The first tag is pushed by hand.
+#
+# Repository variable RELEASE_EMAIL (optional) sets the tagger email of
+# release tags.
 on:
   push:
     branches:
@@ -20,7 +23,7 @@ jobs:
     runs-on: docker
     timeout-minutes: 30
     env:
-      RELEASE_EMAIL: auto-release@noreply.wlritchi.com
+      RELEASE_EMAIL: ${{ vars.RELEASE_EMAIL || 'auto-release@users.noreply.invalid' }}
 
     steps:
       - name: Checkout
