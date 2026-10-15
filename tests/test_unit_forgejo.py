@@ -24,6 +24,38 @@ import pr_monitor as pm
 # --------------------------------------------------------------------------- #
 
 
+def test_combined_status_follows_pages_and_keeps_failure():
+    pages = []
+
+    def handler(request):
+        if request.url.path.endswith("/pulls/1"):
+            return httpx.Response(200, json={"state": "open", "head": {"sha": "abc"}})
+        if request.url.path.endswith("/status"):
+            page = int(request.url.params["page"])
+            pages.append(page)
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    json={"statuses": [{"context": "one", "status": "success"}]},
+                    headers={
+                        "Link": '<http://fj/api/v1/repos/o/r/commits/abc/status?page=2>; rel="next"'
+                    },
+                )
+            return httpx.Response(
+                200, json={"statuses": [{"context": "two", "status": "failure"}]}
+            )
+        return httpx.Response(200, json=[])
+
+    client = fc.ForgejoClient(
+        base_url="http://fj", transport=httpx.MockTransport(handler)
+    )
+    result = anyio.run(client.fetch_pr, "o", "r", 1)
+    snapshot = pm.snapshot_from_forgejo(result)
+    assert pages == [1, 2]
+    assert set(snapshot["statuses"]) == {"one", "two"}
+    assert not pm._checks_all_green(snapshot)
+
+
 def raw(**override) -> dict:
     """A raw forgejo_client.fetch_pr() dict (pr + sub-resource lists), with defaults."""
     data = {

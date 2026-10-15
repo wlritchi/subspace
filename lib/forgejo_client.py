@@ -203,17 +203,13 @@ class ForgejoClient:
     async def _get_obj(self, client: httpx.AsyncClient, path: str) -> dict:
         return self._json(await self._get(client, path)) or {}
 
-    async def _get_obj_optional(self, client: httpx.AsyncClient, path: str) -> dict:
-        """Like _get_obj but a 404 on a sub-resource yields {} instead of terminating
-        the PR — only the top-level pulls fetch treats 404 as 'PR gone'."""
-        try:
-            return await self._get_obj(client, path)
-        except ForgejoNotFound:
-            return {}
-
-    async def _get_list(self, client: httpx.AsyncClient, path: str) -> list[dict]:
-        """Follow ?page=&limit= pagination, returning every page's items merged. Stops
-        when a short page is returned or _MAX_PAGES is hit (loud on the cap, never a
+    async def _get_list(
+        self, client: httpx.AsyncClient, path: str, field: str | None = None
+    ) -> list[dict]:
+        """Follow ?page=&limit= pagination, returning every page's items merged. With
+        ``field``, each page is an object and its items are in that field. Stops
+        when a short page with no ``next`` link is returned (an instance can cap the
+        page size below _PAGE_LIMIT) or _MAX_PAGES is hit (loud on the cap, never a
         silent truncation)."""
         items: list[dict] = []
         page = 1
@@ -225,24 +221,27 @@ class ForgejoClient:
                     file=sys.stderr,
                 )
                 break
-            batch = self._json(
-                await self._get(client, path, {"page": page, "limit": _PAGE_LIMIT})
+            response = await self._get(
+                client, path, {"page": page, "limit": _PAGE_LIMIT}
             )
+            batch = self._json(response)
+            if field is not None:
+                batch = batch.get(field) if isinstance(batch, dict) else None
             if not isinstance(batch, list) or not batch:
                 break
             items.extend(batch)
-            if len(batch) < _PAGE_LIMIT:
+            if len(batch) < _PAGE_LIMIT and "next" not in response.links:
                 break
             page += 1
         return items
 
     async def _get_list_optional(
-        self, client: httpx.AsyncClient, path: str
+        self, client: httpx.AsyncClient, path: str, field: str | None = None
     ) -> list[dict]:
         """Like _get_list but a 404 on a sub-resource yields [] instead of terminating
         the PR — only the top-level pulls fetch treats 404 as 'PR gone'."""
         try:
-            return await self._get_list(client, path)
+            return await self._get_list(client, path, field)
         except ForgejoNotFound:
             return []
 
@@ -288,10 +287,11 @@ class ForgejoClient:
                 # Swallow a 404 here (like the other sub-resources): a missing/absent
                 # status for the head commit means "no statuses", NOT that the PR is
                 # gone. Only the pulls fetch above decides existence.
-                combined = await self._get_obj_optional(
-                    client, f"{base}/commits/{head_sha}/status"
+                # The combined status is paginated: its "statuses" field holds
+                # one page.
+                statuses = await self._get_list_optional(
+                    client, f"{base}/commits/{head_sha}/status", "statuses"
                 )
-                statuses = combined.get("statuses") or []
             return {
                 "pr": pr,
                 "reviews": reviews,
