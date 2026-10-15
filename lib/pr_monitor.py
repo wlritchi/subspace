@@ -64,7 +64,7 @@ def storage_key(
     other providers get a "<provider>:" prefix so a Forgejo owner/repo#n cannot collide
     with a GitHub one. Only the storage key carries the prefix — the human-facing
     ``PRTracker.key`` (used in event text and tool replies) stays "owner/repo#number".
-    ``_safe`` maps the ':' and '/' to '_', so the dir names stay distinct on disk.
+    ``_tracker_dir`` encodes the whole key, so the dir names stay distinct on disk.
 
     ``instance`` is the Forgejo multi-instance alias dimension: the DEFAULT instance
     (alias "" / None) stays ``forgejo:owner/repo#n`` — byte-identical to v1, so existing
@@ -1052,12 +1052,10 @@ def pr_store_dir() -> Path:
     return settings.data_dir() / "pr"
 
 
-def _safe(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.#-]", "_", name)
-
-
 def _tracker_dir(key: str) -> Path:
-    return pr_store_dir() / _safe(key)
+    # Encode the complete key. Replacing separators with "_" is not injective
+    # across owners, providers and instance aliases, which can contain "_".
+    return pr_store_dir() / storage.key_filename(key)
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -1222,6 +1220,19 @@ def load_trackers(clients) -> list[PRTracker]:
             base_url=state.get("base_url"),
             instance=instance,
         )
+        target = _tracker_dir(t.storage_key)
+        if directory != target:
+            if target.exists():
+                # Never merge potentially unrelated histories from a collided legacy
+                # directory. The canonical record wins; preserve the old directory.
+                print(
+                    f"subspace: skipping legacy PR directory {directory}: "
+                    f"canonical directory {target} already exists",
+                    file=sys.stderr,
+                )
+                continue
+            directory.rename(target)
+            directory = target
         snapshot = state.get("snapshot")
         # A snapshot from before the timeline-identity switch has a different
         # shape/ID space; drop it so the next poll re-baselines silently instead of

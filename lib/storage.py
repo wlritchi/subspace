@@ -2,8 +2,7 @@
 """Filesystem persistence helpers shared by the server's storage layers.
 
 Factored out of ``pr_monitor`` so newer persistence (the agent registry) does not
-have to depend on PR-monitoring code. The atomic-write strategy and the
-filesystem-safe slugging mirror ``pr_monitor`` exactly.
+have to depend on PR-monitoring code.
 """
 
 import json
@@ -15,8 +14,8 @@ from pathlib import Path
 def safe_name(name: str) -> str:
     """Slug ``name`` into a filesystem-safe filename component.
 
-    Mirrors ``pr_monitor._safe``: replace anything outside ``[A-Za-z0-9_.#-]``
-    with ``_`` so arbitrary keys can be used as filenames.
+    Replaces anything outside ``[A-Za-z0-9_.#-]`` with ``_``. Two keys can give
+    the same name; ``key_filename`` does not have this problem.
     """
     return re.sub(r"[^A-Za-z0-9_.#-]", "_", name)
 

@@ -18,6 +18,7 @@ import _harness as h
 import github_client as gc
 import pr_monitor as pm
 import pr_schedule as ps
+import storage
 
 UTC = timezone.utc
 
@@ -125,6 +126,27 @@ class TestSchedule:
 # --------------------------------------------------------------------------- #
 # github client error classification
 # --------------------------------------------------------------------------- #
+
+
+def test_tracker_collision_safe_paths_and_legacy_migration(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    a = pm.PRTracker("team_tools", "repo", 1, None, provider="forgejo")
+    b = pm.PRTracker("tools", "repo", 1, None, provider="forgejo", instance="team")
+    pm.save_state(a)
+    pm.save_subscriber(a, "session-a")
+    canonical = pm._tracker_dir(a.storage_key)
+    legacy = pm.pr_store_dir() / storage.safe_name(a.storage_key)
+    canonical.rename(legacy)
+    loaded = pm.load_trackers({"forgejo": None})
+    assert len(loaded) == 1
+    assert loaded[0].subscribers == {"session-a"}
+    assert canonical.exists() and not legacy.exists()
+    pm.save_state(b)
+    assert pm._tracker_dir(a.storage_key) != pm._tracker_dir(b.storage_key)
+    loaded = pm.load_trackers({"forgejo": None, ("forgejo", "team"): None})
+    assert {t.storage_key for t in loaded} == {a.storage_key, b.storage_key}
+    pm.delete_tracker(a.storage_key)
+    assert pm._tracker_dir(b.storage_key).exists()
 
 
 class TestErrorClassification:
