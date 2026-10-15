@@ -228,6 +228,79 @@ def test_topic_truncation_delivered_once_until_ack_and_persisted(
     assert len(sent) == count
 
 
+@pytest.mark.parametrize("same_pr", [True, False])
+def test_concurrent_subscriptions_keep_one_tracker_and_enforce_quota(
+    server, tmp_path, monkeypatch, same_pr
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(server, "TRACKERS", {})
+    monkeypatch.setattr(server, "_pr_client", lambda *_: None)
+    monkeypatch.setattr(server, "_wake", lambda *_: None)
+    monkeypatch.setattr(server, "_session_key_for", lambda conn, msg: "bots/one")
+    monkeypatch.setattr(pr_monitor, "save_state", lambda *_: None)
+    monkeypatch.setattr(pr_monitor, "save_subscriber", lambda *_: None)
+    monkeypatch.setattr(pr_monitor, "summarize", lambda *_: "summary")
+    account = accounts.Account(id="bots", limits=accounts.Limits(pr_subscriptions=1))
+    conn = SimpleNamespace(account=account)
+    sent = []
+    polls = []
+    tasks = []
+
+    async def send(ws, kind, msg, **fields):
+        sent.append(kind)
+
+    async def tracker_loop(tracker):
+        tasks.append(tracker)
+
+    async def run():
+        monkeypatch.setattr(server, "_SUBSCRIBE_LOCKS", {})
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def initial_poll(tracker):
+            polls.append(tracker)
+            if tracker.number == 1:
+                entered.set()
+                await release.wait()
+            return "summary"
+
+        monkeypatch.setattr(pr_monitor.PRTracker, "initial_poll", initial_poll)
+        msg = {"owner": "org", "repo": "repo", "number": 1}
+        first = asyncio.create_task(server._handle_subscribe(None, conn, msg))
+        await entered.wait()
+        second = asyncio.create_task(
+            server._handle_subscribe(None, conn, {**msg, "number": 1 if same_pr else 2})
+        )
+        await asyncio.sleep(0)
+        if same_pr:
+            assert not second.done()
+            assert len(polls) == 1
+        else:
+            # Independent PR finishes while the first fetch remains blocked,
+            # consuming the last slot before the first's post-fetch check.
+            await asyncio.wait_for(second, timeout=1)
+            assert not first.done()
+            assert len(server.TRACKERS) == 1
+            assert next(iter(server.TRACKERS.values())).number == 2
+        release.set()
+        await asyncio.gather(first, second)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(server, "_send", send)
+    monkeypatch.setattr(server, "_tracker_loop", tracker_loop)
+    asyncio.run(run())
+    assert len(polls) == (1 if same_pr else 2)
+    assert len(tasks) == len(server.TRACKERS) == 1
+    tracker = next(iter(server.TRACKERS.values()))
+    assert tracker is polls[0 if same_pr else 1] is tasks[0]
+    assert tracker.subscribers == {"bots/one"}
+    assert sent == [
+        server.proto.SUBSCRIBED,
+        server.proto.SUBSCRIBED if same_pr else server.proto.ERROR,
+    ]
+
+
 def _make_tracker(
     server, key="o/r#1", *, subscribers=(), terminal=False, idle_since=None
 ):

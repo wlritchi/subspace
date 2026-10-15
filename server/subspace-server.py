@@ -56,6 +56,7 @@ import signal
 import sys
 import time
 import uuid
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1117,8 +1118,25 @@ def _msg_storage_key(msg: dict, provider: str) -> str:
     )
 
 
+# Active holders/waiters retain their lock; unused keys need no permanent entry.
+_SUBSCRIBE_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
 async def _handle_subscribe(
     websocket, conn: Connection, msg: dict, provider: str = "github"
+) -> None:
+    # Serialize only competing creation of the same PR. An unrelated PR's fetch
+    # must not block admission; the post-fetch quota check handles shared limits.
+    skey = _msg_storage_key(msg, provider)
+    lock = _SUBSCRIBE_LOCKS.setdefault(skey, asyncio.Lock())
+    async with lock:
+        await _subscribe_locked(websocket, conn, msg, provider)
+
+
+async def _subscribe_locked(
+    websocket, conn: Connection, msg: dict, provider: str
 ) -> None:
     key = _session_key_for(conn, msg)
     owner, repo, number = msg.get("owner"), msg.get("repo"), msg.get("number")
@@ -1157,6 +1175,11 @@ async def _handle_subscribe(
             await _send(
                 websocket, proto.ERROR, msg, error=f"could not fetch {pr_ref}: {exc}"
             )
+            return
+        # Another PR can consume quota while this fetch is in flight. There must
+        # be no await between this check and installation/membership admission.
+        if (err := _limit_error(conn, key, "pr_subscriptions")) is not None:
+            await _send(websocket, proto.ERROR, msg, error=err)
             return
         TRACKERS[skey] = tracker
         tracker.next_poll_at = time.time() + _poll_delay(
