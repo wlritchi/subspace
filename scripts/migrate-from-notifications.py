@@ -34,6 +34,10 @@ LEGACY_DIR = Path.home() / ".claude" / "notifications"
 def migrate(src: Path, dst: Path, *, dry_run: bool) -> None:
     if not src.is_dir() or src.is_symlink():
         sys.exit(f"nothing to migrate: {src} is not a directory")
+    # Resolve after rejecting symlink sources, so a relative destination makes
+    # an absolute token link rather than one relative to the legacy directory.
+    src = src.resolve()
+    dst = dst.resolve()
     if dst.exists() and any(dst.iterdir()):
         sys.exit(f"refusing to migrate: {dst} already exists and is not empty")
 

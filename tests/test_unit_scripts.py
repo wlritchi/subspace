@@ -1,5 +1,6 @@
 """Regression tests for administrative scripts."""
 
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -58,3 +59,26 @@ def test_credential_rejects_invalid_expiry(expiry):
     assert result.returncode == 2
     assert not result.stdout
     assert "not an RFC 3339 date-time" in result.stderr
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_legacy_migration_relative_destination(tmp_path, monkeypatch, dry_run):
+    spec = importlib.util.spec_from_file_location(
+        "migrate_legacy", ROOT / "scripts/migrate-from-notifications.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", "data")
+    source = Path("legacy")
+    source.mkdir()
+    (source / "token").write_text("secret")
+    module.migrate(source, module.settings.data_dir(), dry_run=dry_run)
+    assert (source / "token").read_text() == "secret"
+    if dry_run:
+        assert not Path("data").exists()
+        assert not (source / "token").is_symlink()
+    else:
+        assert (source / "token").is_symlink()
+        assert (source / "token").resolve() == tmp_path / "data/token"
+        assert Path("data/token").read_text() == "secret"
