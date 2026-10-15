@@ -292,7 +292,12 @@ def test_attach_needs_a_session(stack: Stack) -> None:
 
 
 def test_unpulled_items_come_back_after_gateway_restart(tmp_path: Path) -> None:
-    with _stack(tmp_path) as s:
+    tokens = _accounts_file(tmp_path)
+    core_port = free_port()
+    env = server_env(core_port, tmp_path)
+    env["SUBSPACE_TOKEN"] = MASTER
+    s = Stack(core_port, free_port(), tmp_path, tokens)
+    with server_process(env):
 
         async def first() -> None:
             alice = await s.local("lb-s1", "lb-alice")
@@ -309,7 +314,9 @@ def test_unpulled_items_come_back_after_gateway_restart(tmp_path: Path) -> None:
                 await asyncio.sleep(0.3)
             await alice.close()
 
-        asyncio.run(first())
+        with gateway_process(core_port, s.gateway_port) as old_gateway:
+            asyncio.run(first())
+        assert old_gateway.poll() is not None
 
         port = free_port()
         with gateway_process(s.core_port, port):
