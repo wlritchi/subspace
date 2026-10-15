@@ -1537,14 +1537,19 @@ async def _send_wake(
     wake covered. Stop if the session connects in the meantime: it then gets
     its messages, and the next disconnect starts the rules again."""
     started = time.time()
-    # The URL can hold a secret: log only its host.
-    where = f"{webhook.handle}@{account.id} ({httpx.URL(webhook.url).host})"
     for delay in (0.0, *_wake_retry_delays()):
         if delay:
             await asyncio.sleep(delay)
         record = SESSIONS.get(key)
         if record is None or _live(key) or record.last_seen > started:
             return
+        # Configuration and handle ownership may change during the retry sleep.
+        target = _webhook_for(key)
+        if target is None:
+            return
+        account, webhook = target
+        # The URL can hold a secret: log only its host.
+        where = f"{webhook.handle}@{account.id} ({httpx.URL(webhook.url).host})"
         if delay:
             # Messages can have been acked or added during the delay.
             items = _wake_items(key, record.wake_covered)

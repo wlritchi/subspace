@@ -2,7 +2,11 @@
 """Unit tests for the scheduled-callback store, the server settings, and the
 server's warm-retention reaper."""
 
+import asyncio
 import importlib.util
+
+import accounts
+import sessions
 import time
 from pathlib import Path
 
@@ -79,6 +83,50 @@ def server():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("change", ["remove", "replace", "transfer"])
+def test_wake_retry_resolves_current_target(server, tmp_path, monkeypatch, change):
+    registry = sessions.SessionRegistry(tmp_path)
+    record, _ = registry.register_handle(
+        "bots/one", "runner", now=1, is_live=lambda _: False, idle=60
+    )
+    old = accounts.Webhook("runner", "https://old.invalid/wake", key="old")
+    new = accounts.Webhook("runner", "https://new.invalid/wake", key="new")
+    account = accounts.Account(id="bots", webhooks=(old,))
+    monkeypatch.setattr(server, "SESSIONS", registry, raising=False)
+    monkeypatch.setattr(server, "_scope", lambda _: account)
+    monkeypatch.setattr(server, "_live", lambda _: False)
+    monkeypatch.setattr(server, "_wake_retry_delays", lambda: [0.001])
+    items = [(1, {"id": "message"})]
+    monkeypatch.setattr(server, "_wake_items", lambda *_: items)
+    posts = []
+
+    async def post(url, bearer, body):
+        nonlocal account
+        posts.append((url, bearer))
+        if len(posts) == 1:
+            if change == "transfer":
+                registry.register_handle(
+                    "bots/two",
+                    "runner",
+                    now=2,
+                    is_live=lambda _: False,
+                    idle=60,
+                    takeover=True,
+                )
+            else:
+                account = accounts.Account(
+                    id="bots", webhooks=(new,) if change == "replace" else ()
+                )
+            return 503
+        return 200
+
+    monkeypatch.setattr(server, "_post_webhook", post)
+    asyncio.run(server._send_wake(record.key, account, old, items))
+    assert posts == [(old.url, old.key)] + (
+        [(new.url, new.key)] if change == "replace" else []
+    )
 
 
 def _make_tracker(
