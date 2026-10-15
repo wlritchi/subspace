@@ -192,6 +192,31 @@ def test_review_dismissal_survives_record_and_restart(tmp_path, monkeypatch):
     assert pm.diff(dismissed, dismissed.copy(), t.key) == []
 
 
+def test_check_repeat_failure_survives_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    t = pm.PRTracker("owner", "repo", 1, None)
+    t.snapshot = pm.snapshot_from_graphql({"state": "OPEN"})
+    failure_ids = []
+    for conclusion in ("failure", "success", "failure"):
+        new = pm.snapshot_from_graphql({"state": "OPEN"})
+        new["check_runs"] = {
+            "check": {"name": "ci", "status": "completed", "conclusion": conclusion}
+        }
+        events = pm.diff(t.snapshot, new, t.key)
+        assert [e["id"] for e in events] == [
+            e["id"] for e in pm.diff(t.snapshot, new, t.key)
+        ]
+        added = t.record(events)
+        assert any(e["type"] == "pr_check" for e in added)
+        if conclusion == "failure":
+            failure_ids.extend(e["id"] for e in added if e["type"] == "pr_check")
+        pm.append_events(t, added)
+        t.snapshot = new
+        pm.save_state(t)
+        t = pm.load_trackers(None)[0]
+    assert len(set(failure_ids)) == 2
+
+
 class TestErrorClassification:
     def _resp(self, code, headers=None):
         return httpx.Response(code, headers=headers or {}, json={})

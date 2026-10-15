@@ -631,6 +631,11 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             and prev.get("conclusion") != ch.get("conclusion")
         )
         if became_complete or conclusion_changed:
+            # A run can complete with a conclusion that it had before. The
+            # monotonic "check" counter keeps each completion distinct, in the
+            # single and in the summary identities.
+            epochs["check"] = epochs.get("check", 0) + 1
+            chid = f"{chid}:{epochs['check']}"
             if ch.get("conclusion") in _FAILED_CONCLUSIONS:
                 events.append(_check_event(ch, key, chid))  # failures never collapse
             elif ch.get("conclusion") in _GREEN_CONCLUSIONS:
