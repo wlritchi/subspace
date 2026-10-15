@@ -340,6 +340,13 @@ def load_topic(directory: Path) -> MessageTopic | None:
             seen.add(mid)
             topic.messages.append(Message.from_dict(data))
         topic.messages.sort(key=lambda m: m.seq)
+        # The append-only log can survive a crash before state.json is replaced.
+        # Never reuse an id or reap a topic based on that stale snapshot.
+        if topic.messages:
+            topic.next_seq = max(topic.next_seq, topic.messages[-1].seq + 1)
+            topic.last_activity = max(
+                topic.last_activity, max(m.created_at for m in topic.messages)
+            )
         if len(topic.messages) > MAX_CACHED_MESSAGES:
             topic.messages = topic.messages[-MAX_CACHED_MESSAGES:]
 

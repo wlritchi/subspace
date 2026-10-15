@@ -15,6 +15,23 @@ import messaging as m
 from message_topic import Message, MessageTopic
 
 
+def test_load_recovers_sequence_and_activity_after_log_only_append(
+    tmp_path: Path,
+) -> None:
+    topic = MessageTopic("chan:room", "channel")
+    mt.save_state(tmp_path, topic)
+    first = topic.post("alice", now=42, body="durable log")
+    mt.append_messages(tmp_path, topic, [first])
+    loaded = mt.load_all_topics(tmp_path)[0]
+    assert loaded.next_seq == first.seq + 1
+    assert loaded.last_activity == 42
+    assert not loaded.reapable(now=43, ttl=10)
+    second = loaded.post("alice", now=44, body="next")
+    assert second.id != first.id
+    mt.append_messages(tmp_path, loaded, [second])
+    assert len(mt.load_all_topics(tmp_path)[0].messages) == 2
+
+
 def test_rejoin_preserves_pending_and_missed_and_updates_threshold(
     tmp_path: Path,
 ) -> None:
