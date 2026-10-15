@@ -14,6 +14,26 @@ import message_topic as mt
 import messaging as m
 from message_topic import Message, MessageTopic
 
+
+def test_rejoin_preserves_pending_and_missed_and_updates_threshold(
+    tmp_path: Path,
+) -> None:
+    topic = MessageTopic("chan:room", "channel")
+    topic.join("alice", now=1, threshold="direct")
+    pending = topic.post("bob", now=2, body="pending")
+    topic.missed["alice"] = 3
+    topic.join("alice", now=3, threshold="all")
+    assert pending.id not in topic.acked["alice"]
+    assert topic.missed["alice"] == 3
+    assert topic.thresholds["alice"] == "all"
+    mt.save_state(tmp_path, topic)
+    mt.save_subscriber(tmp_path, topic, "alice")
+    loaded = mt.load_all_topics(tmp_path)[0]
+    assert loaded.acked["alice"] == set()
+    assert loaded.missed["alice"] == 3
+    assert loaded.thresholds["alice"] == "all"
+
+
 # --------------------------------------------------------------------------- #
 # messaging: levels / thresholds / surfacing
 # --------------------------------------------------------------------------- #

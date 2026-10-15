@@ -103,9 +103,10 @@ class MessageTopic:
         id so a joiner gets no replay and no wake. Records a per-topic threshold
         override when given. Joining is not activity — ``last_activity`` is left to
         ``post`` (``now`` is accepted for signature symmetry with the other ops)."""
+        if sid not in self.members:
+            self.acked[sid] = {m.id for m in self.messages}
+            self.missed[sid] = 0
         self.members.add(sid)
-        self.acked[sid] = {m.id for m in self.messages}
-        self.missed.setdefault(sid, 0)
         if threshold is not None:
             self.thresholds[sid] = threshold
 
