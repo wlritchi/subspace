@@ -15,6 +15,7 @@ token now. Add the block under the account's [[account]] table.
 # ///
 
 import argparse
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -38,13 +39,20 @@ def main() -> None:
         accounts.validate_account_id(args.account)
     except accounts.AccountsError as exc:
         parser.error(str(exc))
+    expires = ""
     if args.expires:
         try:
-            datetime.fromisoformat(args.expires)
+            if not re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+                r"(?:\.[0-9]+)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})",
+                args.expires,
+            ):
+                raise ValueError("expected an offset date-time")
+            expiry = datetime.fromisoformat(args.expires.upper())
+            expires = f"\nexpires_at = {expiry.isoformat()}"
         except ValueError:
             parser.error(f"--expires: not an RFC 3339 date-time: {args.expires}")
     token, credential_id, digest = accounts.new_token()
-    expires = f"\nexpires_at = {args.expires}" if args.expires else ""
     print(
         f"# Add under the [[account]] table with id = {args.account!r}:\n"
         f"[[account.credential]]\n"
