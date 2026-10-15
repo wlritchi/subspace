@@ -172,8 +172,8 @@ class SessionRegistry:
         return self._dir / f"{storage.key_filename(key)}.json"
 
     def persist(self, record: SessionRecord) -> None:
-        self._by_key[record.key] = record
         storage.atomic_write(self._path(record.key), json.dumps(record.to_dict()))
+        self._by_key[record.key] = record
 
     def get(self, key: str) -> SessionRecord | None:
         return self._by_key.get(key)
@@ -285,10 +285,11 @@ class SessionRegistry:
             record.last_acked = now
 
     def remove(self, key: str) -> None:
+        # Keep failed removals registered so the next reaper pass can retry.
+        self._path(key).unlink(missing_ok=True)
         record = self._by_key.pop(key, None)
         if record is not None and record.handle:
             self._by_handle.pop((record.account, record.handle), None)
-        self._path(key).unlink(missing_ok=True)
 
     def expired(
         self, now: float, ttl: float, is_live: Callable[[str], bool]

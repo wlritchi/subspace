@@ -2490,9 +2490,11 @@ async def _reaper_loop() -> None:
         ]
         interval = max(1.0, min([*halves, 300.0]))
         await asyncio.sleep(interval)
-        _reap_expired_sessions(time.time())
-        _reap_idle_trackers(time.time())
-        _reap_idle_topics(time.time())
+        for reap in (_reap_expired_sessions, _reap_idle_trackers, _reap_idle_topics):
+            try:
+                reap(time.time())
+            except Exception as exc:  # noqa: BLE001 - retry cleanup next pass
+                print(f"subspace: {reap.__name__} failed: {exc!r}", file=sys.stderr)
 
 
 def _reap_expired_sessions(now: float) -> list[str]:

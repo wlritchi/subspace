@@ -301,6 +301,48 @@ def test_concurrent_subscriptions_keep_one_tracker_and_enforce_quota(
     ]
 
 
+def test_reaper_continues_after_cleanup_failure(server, monkeypatch):
+    calls = []
+    sleeps = 0
+
+    async def sleep(_):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 3:
+            raise asyncio.CancelledError
+
+    def sessions_reap(_):
+        calls.append("sessions")
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(server.asyncio, "sleep", sleep)
+    monkeypatch.setattr(server, "_reap_expired_sessions", sessions_reap)
+    monkeypatch.setattr(
+        server, "_reap_idle_trackers", lambda _: calls.append("trackers")
+    )
+    monkeypatch.setattr(server, "_reap_idle_topics", lambda _: calls.append("topics"))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(server._reaper_loop())
+    assert calls == ["sessions", "trackers", "topics"] * 2
+
+
+def test_session_failed_remove_stays_retryable(tmp_path, monkeypatch):
+    registry = sessions.SessionRegistry(tmp_path)
+    record = registry.ensure("bots/one", now=1)
+    original = Path.unlink
+
+    def fail(path, *args, **kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(Path, "unlink", fail)
+    with pytest.raises(OSError):
+        registry.remove(record.key)
+    assert registry.get(record.key) is record
+    monkeypatch.setattr(Path, "unlink", original)
+    registry.remove(record.key)
+    assert registry.get(record.key) is None
+
+
 def _make_tracker(
     server, key="o/r#1", *, subscribers=(), terminal=False, idle_since=None
 ):

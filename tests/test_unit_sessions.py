@@ -221,6 +221,18 @@ def test_expired_and_remove(tmp_path: Path) -> None:
     assert s.SessionRegistry(tmp_path).get("default/old") is None
 
 
+def test_failed_creation_does_not_publish_record(tmp_path, monkeypatch) -> None:
+    reg = s.SessionRegistry(tmp_path)
+
+    def fail(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(storage, "atomic_write", fail)
+    with pytest.raises(OSError):
+        reg.ensure("default/new", 1.0)
+    assert reg.get("default/new") is None
+
+
 def test_scheduler_delete_ignores_ids_it_did_not_make(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
