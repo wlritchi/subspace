@@ -574,8 +574,13 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
         if event is not None:
             events.append(event)
     for rid, r in new["reviews"].items():
-        if rid not in old["reviews"]:
+        previous = old["reviews"].get(rid)
+        if previous is None:
             events.append(_review_event(r, key, rid))
+        elif previous.get("state") != r.get("state"):
+            facet = f"review:{rid}"
+            epochs[facet] = epochs.get(facet, 0) + 1
+            events.append(_review_event(r, key, f"{rid}:transition:{epochs[facet]}"))
     for cid, c in new["review_comments"].items():
         if cid not in old["review_comments"]:
             events.append(_inline_comment_event(c, key, cid))

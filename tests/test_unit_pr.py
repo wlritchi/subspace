@@ -149,6 +149,49 @@ def test_tracker_collision_safe_paths_and_legacy_migration(tmp_path, monkeypatch
     assert pm._tracker_dir(b.storage_key).exists()
 
 
+def test_review_dismissal_survives_record_and_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    t = pm.PRTracker("owner", "repo", 1, None)
+    old = pm.snapshot_from_graphql({"state": "OPEN"})
+    approved = pm.snapshot_from_graphql(
+        {
+            "state": "OPEN",
+            "reviews": {
+                "nodes": [
+                    {
+                        "id": "review",
+                        "state": "APPROVED",
+                        "author": {"login": "reviewer"},
+                    }
+                ]
+            },
+        }
+    )
+    added = t.record(pm.diff(old, approved, t.key))
+    pm.append_events(t, added)
+    t.snapshot = approved
+    pm.save_state(t)
+    t = pm.load_trackers(None)[0]
+    dismissed = pm.snapshot_from_graphql(
+        {
+            "state": "OPEN",
+            "reviews": {
+                "nodes": [
+                    {
+                        "id": "review",
+                        "state": "DISMISSED",
+                        "author": {"login": "reviewer"},
+                    }
+                ]
+            },
+        }
+    )
+    events = pm.diff(t.snapshot, dismissed, t.key)
+    assert len(t.record(events)) == 1
+    assert "dismissed" in events[0]["content"]
+    assert pm.diff(dismissed, dismissed.copy(), t.key) == []
+
+
 class TestErrorClassification:
     def _resp(self, code, headers=None):
         return httpx.Response(code, headers=headers or {}, json={})
