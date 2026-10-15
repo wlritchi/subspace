@@ -631,9 +631,9 @@ def diff(old: dict | None, new: dict, key: str) -> list[dict]:
             and prev.get("conclusion") != ch.get("conclusion")
         )
         if became_complete or conclusion_changed:
-            # A run can complete with a conclusion that it had before. The
-            # monotonic "check" counter keeps each completion distinct, in the
-            # single and in the summary identities.
+            # A run can complete again with the same conclusion. The per-PR
+            # "check" counter makes each completion a new event id, for single
+            # events and for the summary.
             epochs["check"] = epochs.get("check", 0) + 1
             chid = f"{chid}:{epochs['check']}"
             if ch.get("conclusion") in _FAILED_CONCLUSIONS:
@@ -1063,8 +1063,8 @@ def pr_store_dir() -> Path:
 
 
 def _tracker_dir(key: str) -> Path:
-    # Encode the complete key. Replacing separators with "_" is not injective
-    # across owners, providers and instance aliases, which can contain "_".
+    # Use the injective key_filename: two different keys must never share a
+    # directory.
     return pr_store_dir() / storage.key_filename(key)
 
 

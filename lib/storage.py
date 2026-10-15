@@ -54,13 +54,9 @@ def key_filename(key: str) -> str:
 def key_path(
     directory: Path, key: str, *, prefix: str = "", suffix: str = ".json"
 ) -> Path:
-    """The path of the file for ``key`` in ``directory``, for ``atomic_write``.
-
-    The name is ``prefix``, the encoded key (see ``key_filename``), and
-    ``suffix``. If ``atomic_write`` could not write that name, because the
-    temporary name would be longer than ``NAME_MAX``, the digest name replaces
-    the encoded key. Such a file could not exist before, so no existing file
-    changes its name.
+    """Path of the file for ``key`` in ``directory``: ``prefix`` + encoded key +
+    ``suffix``. If the name plus atomic_write's ".tmp" would exceed NAME_MAX, the
+    key part becomes the digest name. No existing file has such a name.
     """
     name = f"{prefix}{_encode_key(key)}{suffix}"
     if len(name) + len(_TMP_SUFFIX) > NAME_MAX:

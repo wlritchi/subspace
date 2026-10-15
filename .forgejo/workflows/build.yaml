@@ -47,8 +47,9 @@ jobs:
           # Full history and tags: the version bump reads commits since the
           # last release tag.
           git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
-          # A queued run must build its event commit, not the moving branch tip.
-          # The fetch above usually has it already; fetch it by id only if not.
+          # Build the commit that triggered this run, not the current branch tip
+          # (the branch can advance while the run is queued). Fetch it by id if
+          # the fetch above did not bring it.
           git cat-file -e "${GITHUB_SHA}^{commit}" 2>/dev/null \
             || git fetch origin "${GITHUB_SHA}"
           git checkout --detach "${GITHUB_SHA}"

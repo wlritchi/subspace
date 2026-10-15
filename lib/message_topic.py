@@ -230,9 +230,9 @@ def _msg_root(data_dir: Path) -> Path:
 
 def _topic_dir(data_dir: Path, key: str) -> Path:
     name = storage.safe_name(key)
-    # A name longer than NAME_MAX could not exist before, so only a new
-    # directory, such as one for a DM between long session keys, gets the
-    # bounded name.
+    # Existing directories use the safe_name form, so keep it. Use the bounded
+    # key_filename form only when safe_name is too long for a file name. Such a
+    # directory cannot already exist.
     if len(name) > storage.NAME_MAX:
         name = storage.key_filename(key)
     return _msg_root(data_dir) / name
