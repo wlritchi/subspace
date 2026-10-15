@@ -37,7 +37,11 @@ jobs:
           AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
           git config --local http.extraheader "Authorization: Basic ${AUTH}"
           git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
-          git checkout "${GITHUB_REF}"
+          # A queued run must tag its event commit, not the moving branch tip.
+          # The fetch above usually has it already; fetch it by id only if not.
+          git cat-file -e "${GITHUB_SHA}^{commit}" 2>/dev/null \
+            || git fetch origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
 
       - name: Tag
         run: |
