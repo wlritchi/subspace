@@ -129,6 +129,34 @@ def test_wake_retry_resolves_current_target(server, tmp_path, monkeypatch, chang
     )
 
 
+def test_reactions_do_not_wake_at_all_threshold(server, tmp_path, monkeypatch):
+    from message_topic import MessageTopic
+
+    registry = sessions.SessionRegistry(tmp_path)
+    record = registry.ensure("bots/one", now=1)
+    record.default_threshold = "all"
+    topic = MessageTopic("chan:room", "channel")
+    topic.join(record.key, now=1)
+    normal = topic.post("bots/two", now=2, body="hello", ordinal=1)
+    reaction = topic.post(
+        "bots/two",
+        now=3,
+        body="yes",
+        ordinal=2,
+        intent="reaction",
+        target=normal.id,
+    )
+    monkeypatch.setattr(server, "SESSIONS", registry, raising=False)
+    monkeypatch.setattr(server, "TOPICS", {topic.key: topic})
+    monkeypatch.setattr(
+        server, "_scope", lambda _: accounts.Account(id="bots", channels=None)
+    )
+    assert [ordinal for ordinal, _ in server._wake_items(record.key, 0)] == [1]
+    # Wake filtering does not acknowledge or remove ordinary reaction delivery.
+    assert reaction in topic.messages
+    assert reaction.id not in topic.acked[record.key]
+
+
 def _make_tracker(
     server, key="o/r#1", *, subscribers=(), terminal=False, idle_since=None
 ):

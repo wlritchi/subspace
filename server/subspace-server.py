@@ -1446,7 +1446,11 @@ def _wake_items(key: str, after: int) -> list[tuple[int, dict]]:
             topic.thresholds.get(key), record.default_threshold
         )
         for message in topic.messages:
-            if message.ordinal <= after or message.id in acked:
+            if (
+                message.intent == "reaction"
+                or message.ordinal <= after
+                or message.id in acked
+            ):
                 continue
             level = messaging.compute_level(
                 severity=message.severity,
