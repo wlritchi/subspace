@@ -146,6 +146,10 @@ class TestErrorClassification:
             )
         with pytest.raises(gc.GitHubRateLimited):
             client._classify_http(self._resp(429, {"Retry-After": "30"}))
+        before = time.time()
+        with pytest.raises(gc.GitHubRateLimited) as caught:
+            client._classify_http(self._resp(429))
+        assert before + 60 <= caught.value.reset_at <= time.time() + 60
         with pytest.raises(gc.GitHubNotFound):
             client._classify_http(self._resp(404))
         with pytest.raises(gc.GitHubTransient):

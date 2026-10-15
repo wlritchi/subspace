@@ -287,7 +287,9 @@ class GitHubClient:
             return
         code = resp.status_code
         remaining = resp.headers.get("X-RateLimit-Remaining")
-        if code in (403, 429) and (remaining == "0" or resp.headers.get("Retry-After")):
+        if code == 429 or (
+            code == 403 and (remaining == "0" or resp.headers.get("Retry-After"))
+        ):
             raise GitHubRateLimited(
                 self._reset_at(resp.headers), f"rate limited (HTTP {code})"
             )
