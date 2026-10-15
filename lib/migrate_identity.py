@@ -114,15 +114,21 @@ def _migrate_topics(data_dir: Path, prefix: str, name_to_key: dict[str, str]) ->
             message.mentions = tuple(
                 name_to_key.get(m, m) if "/" not in m else m for m in message.mentions
             )
-        for sub_path in directory.glob("sub-*.json"):
-            sub_path.unlink()
-        for member in topic.members:
+        # Keep originals until both their replacements and membership are durable.
+        # A retry can load both names: rekey_member keeps the migrated state.
+        retained = {
+            f"sub-{storage.key_filename(member)}.json" for member in topic.members
+        }
+        for member in sorted(topic.members):
             message_topic.save_subscriber(data_dir, topic, member)
         storage.atomic_write(
             directory / "messages.jsonl",
             "".join(json.dumps(m.to_dict()) + "\n" for m in topic.messages),
         )
         message_topic.save_state(data_dir, topic)
+        for sub_path in directory.glob("sub-*.json"):
+            if sub_path.name not in retained:
+                sub_path.unlink()
 
 
 def _migrate_pr_subscribers(data_dir: Path, prefix: str) -> set[str]:

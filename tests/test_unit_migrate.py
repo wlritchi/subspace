@@ -5,6 +5,8 @@ that the name-keyed server wrote."""
 import json
 from pathlib import Path
 
+import pytest
+
 import message_topic as mt
 import migrate_identity
 import sessions
@@ -161,6 +163,41 @@ def test_rerun_after_partial_run_keeps_migrated_values(tmp_path: Path) -> None:
     assert chan is not None
     assert chan.members == {"default/sid-1", "default/sid-2"}
     assert chan.messages[0].sender == "default/sid-1"
+
+
+@pytest.mark.parametrize("fail_at", range(1, 8))
+def test_topic_migration_retries_each_persistence_step(tmp_path, monkeypatch, fail_at):
+    _old_data_dir(tmp_path)
+    sub = tmp_path / "msg/chan_ops/sub-frontend.json"
+    data = json.loads(sub.read_text())
+    data["missed"] = 7
+    sub.write_text(json.dumps(data))
+    write = storage.atomic_write
+    unlink = Path.unlink
+    calls = 0
+
+    def interrupt(path, operation, *args, **kwargs):
+        nonlocal calls
+        if path.parent == tmp_path / "msg/chan_ops":
+            calls += 1
+            if calls == fail_at:
+                raise OSError("interrupted persistence")
+        return operation(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            storage, "atomic_write", lambda p, *a, **k: interrupt(p, write, *a, **k)
+        )
+        patch.setattr(Path, "unlink", lambda p, *a, **k: interrupt(p, unlink, *a, **k))
+        with pytest.raises(OSError, match="interrupted persistence"):
+            migrate_identity.migrate(tmp_path, "default")
+    assert migrate_identity.migrate(tmp_path, "default")
+    topic = mt.load_topic(tmp_path / "msg/chan_ops")
+    assert topic.members == {"default/sid-1", "default/sid-2"}
+    assert topic.acked["default/sid-1"] == {"msg:chan:ops:0"}
+    assert topic.missed["default/sid-1"] == 7
+    assert topic.thresholds == {"default/sid-1": "urgent"}
+    assert topic.messages[0].sender == "default/sid-1"
 
 
 def test_empty_data_dir(tmp_path: Path) -> None:
