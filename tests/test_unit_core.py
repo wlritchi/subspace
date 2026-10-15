@@ -157,6 +157,77 @@ def test_reactions_do_not_wake_at_all_threshold(server, tmp_path, monkeypatch):
     assert reaction.id not in topic.acked[record.key]
 
 
+def test_topic_truncation_delivered_once_until_ack_and_persisted(
+    server, tmp_path, monkeypatch
+):
+    import message_topic
+
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(message_topic, "MAX_CACHED_MESSAGES", 1)
+    registry = sessions.SessionRegistry(tmp_path)
+    key = registry.ensure("bots/one", now=1).key
+    topic = message_topic.MessageTopic("chan:room", "channel")
+    topic.join(key, now=1)
+    for i in range(3):
+        message = topic.post("bots/two", now=i + 2, body=str(i))
+        message_topic.append_messages(tmp_path, topic, [message])
+    message_topic.save_state(tmp_path, topic)
+    topic = message_topic.load_all_topics(tmp_path)[0]
+    assert topic.missed[key] == 2
+    monkeypatch.setattr(server, "SESSIONS", registry, raising=False)
+    monkeypatch.setattr(server, "TOPICS", {topic.key: topic})
+    monkeypatch.setattr(
+        server, "_scope", lambda _: accounts.Account(id="bots", channels=None)
+    )
+    conn = server.Connection(None, "bots", "credential")
+    conn.session_key = key
+    sent = []
+
+    async def send(conn, payload):
+        sent.append(payload)
+        return True
+
+    monkeypatch.setattr(server, "_send_notify", send)
+    asyncio.run(server._deliver_messages(conn, key))
+    assert sent[0]["id"].startswith("trunc:msg:chan:room:")
+    assert sent[1]["id"] == topic.messages[0].id
+    assert sent[0]["meta"]["kind"] == "message_truncated"
+    asyncio.run(server._deliver_messages(conn, key))
+    assert len(sent) == 2
+    # Reconnect without acknowledging: the persisted loss is replayed.
+    conn = server.Connection(None, "bots", "credential")
+    conn.session_key = key
+    server._handle_ack(conn, {"id": sent[0]["id"]})
+    server._handle_ack(conn, {"id": "trunc:msg:chan:room"})
+    assert topic.missed[key] == 2
+    asyncio.run(server._deliver_messages(conn, key))
+    notice = sent[2]
+    assert notice["id"] != sent[0]["id"]
+    assert "2 earlier message(s)" in notice["content"]
+
+    # More history is compacted while the delivered notice awaits its ACK.
+    message = topic.post("bots/two", now=5, body="more")
+    message_topic.append_messages(tmp_path, topic, [message])
+    assert topic.missed[key] == 3
+    server._handle_ack(conn, {"id": notice["id"]})
+    assert notice["id"] not in conn.inflight
+    assert message_topic.load_all_topics(tmp_path)[0].missed[key] == 1
+    server._handle_ack(conn, {"id": notice["id"]})
+    assert topic.missed[key] == 1
+    asyncio.run(server._deliver_messages(conn, key))
+    next_notice = sent[4]
+    assert "1 earlier message(s)" in next_notice["content"]
+    assert next_notice["id"] != notice["id"]
+    # Even after another notice is sent, an old duplicate cannot clear it.
+    server._handle_ack(conn, {"id": notice["id"]})
+    assert topic.missed[key] == 1
+    server._handle_ack(conn, {"id": next_notice["id"]})
+    assert message_topic.load_all_topics(tmp_path)[0].missed[key] == 0
+    count = len(sent)
+    asyncio.run(server._deliver_messages(conn, key))
+    assert len(sent) == count
+
+
 def _make_tracker(
     server, key="o/r#1", *, subscribers=(), terminal=False, idle_since=None
 ):

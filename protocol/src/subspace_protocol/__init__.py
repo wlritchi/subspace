@@ -224,6 +224,17 @@ class PrTruncatedMeta(TypedDict):
     pr: str
 
 
+class MessageTruncatedMeta(TypedDict):
+    """Some messages in a channel or DM were dropped from the cache before this
+    session acknowledged them. ``context`` is the topic."""
+
+    kind: Literal["message_truncated"]
+    context: str
+    severity: Literal["high"]
+    level: Literal["urgent"]
+    threshold: Threshold
+
+
 PrEventKind = Literal[
     "pr_closed",
     "pr_conflict",
@@ -302,6 +313,7 @@ class HandleLostMeta(TypedDict):
 NotifyMeta = (
     CallbackMeta
     | PrTruncatedMeta
+    | MessageTruncatedMeta
     | PrEventMeta
     | MessageMeta
     | SuccessionMeta

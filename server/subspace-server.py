@@ -55,6 +55,7 @@ import re
 import signal
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -429,6 +430,7 @@ class Connection:
         # The session key this connection is attached to, or None.
         self.session_key: str | None = None
         self.inflight: set[str] = set()  # notification ids sent, awaiting ack
+        self.topic_truncations: dict[str, tuple[str, int]] = {}  # id -> (topic, count)
         self.wake = asyncio.Event()  # set to nudge the dispatch loop to deliver now
         # Set when the dispatch loop finished a pass for the current session.
         self.delivered = asyncio.Event()
@@ -559,6 +561,7 @@ async def _attach(conn: Connection, key: str) -> None:
     conns.append(conn)
     conn.session_key = key
     conn.inflight.clear()
+    conn.topic_truncations.clear()
     conn.delivered.clear()
     SESSIONS.ensure(key, now)
     SESSIONS.touch(key, now, persist=True)
@@ -1019,7 +1022,18 @@ def _handle_ack(conn: Connection, msg: dict) -> None:
     # context — stamp last_acked for the context-wedge liveness signal (a connected
     # session that stops acking while messages pend is the wedge fingerprint).
     SESSIONS.mark_acked(key, time.time())
-    if nid.startswith("trunc:"):
+    if nid.startswith("trunc:msg:"):
+        delivered = conn.topic_truncations.pop(nid, None)
+        if delivered is None:
+            return  # unsolicited or duplicate ACK (including an older notice)
+        topic_key, count = delivered
+        topic = TOPICS.get(topic_key)
+        if topic is not None and key in topic.members:
+            topic.missed[key] = max(0, topic.missed.get(key, 0) - count)
+            message_topic.save_subscriber(settings.data_dir(), topic, key)
+        conn.inflight.discard(nid)
+        conn.wake.set()  # report any additional loss accumulated during delivery
+    elif nid.startswith("trunc:"):
         # trunc:{storage_key}. Acking the notice clears the missed counter until
         # the next truncation.
         tracker = TRACKERS.get(nid[len("trunc:") :])
@@ -1789,6 +1803,36 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
         threshold = messaging.effective_threshold(
             topic.thresholds.get(key), default_threshold
         )
+        missed = topic.missed.get(key, 0)
+        if missed > 0 and not any(
+            topic_key == topic.key for topic_key, _ in conn.topic_truncations.values()
+        ):
+            # A fresh id prevents a delayed duplicate ACK from consuming a newer
+            # notice. Register before sending, since sending can yield to an ACK.
+            trunc_id = f"trunc:msg:{topic.key}:{uuid.uuid4().hex}"
+            conn.topic_truncations[trunc_id] = (topic.key, missed)
+            conn.inflight.add(trunc_id)
+            if not await _send_notify(
+                conn,
+                {
+                    "type": proto.NOTIFY,
+                    "id": trunc_id,
+                    "content": (
+                        f"{topic.key}: {missed} earlier message(s) were dropped "
+                        "from the cache before they reached you."
+                    ),
+                    "meta": {
+                        "kind": "message_truncated",
+                        "context": topic.key,
+                        "severity": "high",
+                        "level": "urgent",
+                        "threshold": threshold,
+                    },
+                },
+            ):
+                conn.topic_truncations.pop(trunc_id, None)
+                conn.inflight.discard(trunc_id)
+                return False
         is_dm = topic.kind == "dm"
         for message in topic.messages:
             if message.id in acked or message.id in conn.inflight:
