@@ -217,6 +217,17 @@ def test_check_repeat_failure_survives_restart(tmp_path, monkeypatch):
     assert len(set(failure_ids)) == 2
 
 
+def test_long_session_subscriber_persists_and_deletes(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    t = pm.PRTracker("owner", "repo", 1, None)
+    key = "bots/" + ":" * 128
+    pm.save_state(t)
+    pm.save_subscriber(t, key)
+    assert pm.load_trackers(None)[0].subscribers == {key}
+    pm.delete_subscriber(t, key)
+    assert pm.load_trackers(None)[0].subscribers == set()
+
+
 class TestErrorClassification:
     def _resp(self, code, headers=None):
         return httpx.Response(code, headers=headers or {}, json={})

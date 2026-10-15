@@ -4,6 +4,7 @@ that the name-keyed server wrote."""
 
 import json
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -198,6 +199,37 @@ def test_topic_migration_retries_each_persistence_step(tmp_path, monkeypatch, fa
     assert topic.missed["default/sid-1"] == 7
     assert topic.thresholds == {"default/sid-1": "urgent"}
     assert topic.messages[0].sender == "default/sid-1"
+
+
+def test_topic_migration_keeps_long_subscriber_filename(tmp_path: Path) -> None:
+    key = "default/" + "!" * 70
+    directory = tmp_path / "msg" / "chan_ops"
+    _write_json(
+        directory / "state.json",
+        {"key": "chan:ops", "kind": "channel", "members": [key]},
+    )
+    existing = directory / f"sub-{quote(key, safe='')}.json"
+    _write_json(
+        existing,
+        {
+            "member": key,
+            "acked": ["msg:chan:ops:0"],
+            "missed": 7,
+            "threshold": "urgent",
+        },
+    )
+    # Already-migrated members can be encountered after an interrupted run.
+    assert migrate_identity.migrate(tmp_path, "default")
+    assert list(directory.glob("sub-*.json")) == [existing]
+    topic = mt.load_topic(directory)
+    assert topic.members == {key}
+    assert topic.acked[key] == {"msg:chan:ops:0"}
+    assert topic.missed[key] == 7
+    assert topic.thresholds[key] == "urgent"
+    (tmp_path / "identity-version").unlink()
+    assert migrate_identity.migrate(tmp_path, "default")
+    assert mt.load_topic(directory).missed[key] == 7
+    assert existing.exists()
 
 
 def test_empty_data_dir(tmp_path: Path) -> None:

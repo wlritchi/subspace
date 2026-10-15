@@ -229,7 +229,13 @@ def _msg_root(data_dir: Path) -> Path:
 
 
 def _topic_dir(data_dir: Path, key: str) -> Path:
-    return _msg_root(data_dir) / storage.safe_name(key)
+    name = storage.safe_name(key)
+    # A name longer than NAME_MAX could not exist before, so only a new
+    # directory, such as one for a DM between long session keys, gets the
+    # bounded name.
+    if len(name) > storage.NAME_MAX:
+        name = storage.key_filename(key)
+    return _msg_root(data_dir) / name
 
 
 def save_state(data_dir: Path, topic: MessageTopic) -> None:
@@ -291,13 +297,13 @@ def save_subscriber(data_dir: Path, topic: MessageTopic, member: str) -> None:
     if override is not None:
         record["threshold"] = override
     storage.atomic_write(
-        _topic_dir(data_dir, topic.key) / f"sub-{storage.key_filename(member)}.json",
+        storage.key_path(_topic_dir(data_dir, topic.key), member, prefix="sub-"),
         json.dumps(record),
     )
 
 
 def delete_subscriber(data_dir: Path, topic: MessageTopic, member: str) -> None:
-    path = _topic_dir(data_dir, topic.key) / f"sub-{storage.key_filename(member)}.json"
+    path = storage.key_path(_topic_dir(data_dir, topic.key), member, prefix="sub-")
     path.unlink(missing_ok=True)
 
 

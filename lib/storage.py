@@ -5,6 +5,7 @@ Factored out of ``pr_monitor`` so newer persistence (the agent registry) does no
 have to depend on PR-monitoring code.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -21,18 +22,50 @@ def safe_name(name: str) -> str:
 
 
 _KEY_SAFE = re.compile(r"[^A-Za-z0-9_.-]")
+# The longest file name on common filesystems, in bytes.
+NAME_MAX = 255
+_TMP_SUFFIX = ".tmp"
 
 
-def key_filename(key: str) -> str:
-    """An injective filesystem-safe filename component for a session key.
-
-    Unlike ``safe_name``, two different keys never give the same name: each
-    character outside ``[A-Za-z0-9_.-]`` becomes ``%XX`` (its UTF-8 bytes in
-    hex), and ``%`` itself is encoded.
-    """
+def _encode_key(key: str) -> str:
     return _KEY_SAFE.sub(
         lambda m: "".join(f"%{b:02X}" for b in m.group().encode("utf-8")), key
     )
+
+
+def _digest_name(key: str) -> str:
+    # The encoded form never has ":", so a digest name cannot equal one.
+    return "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def key_filename(key: str) -> str:
+    """An injective filesystem-safe name for a key, for a directory.
+
+    Unlike ``safe_name``, two different keys never give the same name: each
+    character outside ``[A-Za-z0-9_.-]`` becomes ``%XX`` (its UTF-8 bytes in
+    hex), and ``%`` itself is encoded. A name longer than ``NAME_MAX`` becomes
+    ``sha256:<hex digest of the key>``. Such a name could not exist before, so
+    no existing directory changes its name.
+    """
+    encoded = _encode_key(key)
+    return encoded if len(encoded) <= NAME_MAX else _digest_name(key)
+
+
+def key_path(
+    directory: Path, key: str, *, prefix: str = "", suffix: str = ".json"
+) -> Path:
+    """The path of the file for ``key`` in ``directory``, for ``atomic_write``.
+
+    The name is ``prefix``, the encoded key (see ``key_filename``), and
+    ``suffix``. If ``atomic_write`` could not write that name, because the
+    temporary name would be longer than ``NAME_MAX``, the digest name replaces
+    the encoded key. Such a file could not exist before, so no existing file
+    changes its name.
+    """
+    name = f"{prefix}{_encode_key(key)}{suffix}"
+    if len(name) + len(_TMP_SUFFIX) > NAME_MAX:
+        name = f"{prefix}{_digest_name(key)}{suffix}"
+    return directory / name
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -43,7 +76,7 @@ def atomic_write(path: Path, text: str) -> None:
     file.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(path.name + _TMP_SUFFIX)
     tmp.write_text(text)
     os.replace(tmp, path)
 

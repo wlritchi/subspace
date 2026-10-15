@@ -1129,7 +1129,7 @@ def append_events(t: PRTracker, events: list[dict]) -> None:
 
 def save_subscriber(t: PRTracker, session_id: str) -> None:
     _atomic_write(
-        _tracker_dir(t.storage_key) / f"sub-{storage.key_filename(session_id)}.json",
+        storage.key_path(_tracker_dir(t.storage_key), session_id, prefix="sub-"),
         json.dumps(
             {
                 "session_id": session_id,
@@ -1142,9 +1142,8 @@ def save_subscriber(t: PRTracker, session_id: str) -> None:
 
 def delete_subscriber(t: PRTracker, session_id: str) -> None:
     try:
-        (
-            _tracker_dir(t.storage_key) / f"sub-{storage.key_filename(session_id)}.json"
-        ).unlink()
+        path = storage.key_path(_tracker_dir(t.storage_key), session_id, prefix="sub-")
+        path.unlink()
     except OSError:
         pass
 

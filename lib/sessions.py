@@ -169,7 +169,7 @@ class SessionRegistry:
                 self._by_handle[(record.account, record.handle)] = record.key
 
     def _path(self, key: str) -> Path:
-        return self._dir / f"{storage.key_filename(key)}.json"
+        return storage.key_path(self._dir, key)
 
     def persist(self, record: SessionRecord) -> None:
         storage.atomic_write(self._path(record.key), json.dumps(record.to_dict()))

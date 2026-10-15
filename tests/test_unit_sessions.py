@@ -2,7 +2,9 @@
 """Unit tests for the session registry: session keys, handles, the handle
 ownership rules, validation, expiry, and persistence. The clock is injected."""
 
+import json
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -231,6 +233,53 @@ def test_failed_creation_does_not_publish_record(tmp_path, monkeypatch) -> None:
     with pytest.raises(OSError):
         reg.ensure("default/new", 1.0)
     assert reg.get("default/new") is None
+
+
+def test_long_session_ids_persist_and_remove(tmp_path: Path) -> None:
+    reg = s.SessionRegistry(tmp_path)
+    key = s.session_key("a" * 64, ":" * 128)
+    s.validate_session_id(s.split_key(key)[1])
+    reg.ensure(key, 1.0)
+    assert s.SessionRegistry(tmp_path).get(key) is not None
+    reg.remove(key)
+    assert s.SessionRegistry(tmp_path).get(key) is None
+
+
+def test_existing_long_session_filename_is_kept(tmp_path: Path) -> None:
+    key = "bots/" + "!" * 70
+    directory = tmp_path / "sessions"
+    directory.mkdir()
+    existing = directory / (quote(key, safe="") + ".json")
+    existing.write_text(json.dumps(s.SessionRecord(key=key, last_seen=1).to_dict()))
+    reg = s.SessionRegistry(tmp_path)
+    reg.touch(key, now=2, persist=True)
+    assert list(directory.glob("*.json")) == [existing]
+    assert s.SessionRegistry(tmp_path).get(key).last_seen == 2
+    reg.remove(key)
+    assert not existing.exists()
+
+
+def test_key_names_change_only_when_too_long(tmp_path: Path) -> None:
+    # atomic_write writes "<name>.tmp", so a file name has 4 bytes less.
+    fits = "a" * (storage.NAME_MAX - len(".json.tmp"))
+    assert storage.key_path(tmp_path, fits).name == fits + ".json"
+    name = storage.key_path(tmp_path, fits + "a").name
+    assert name.startswith("sha256:") and name.endswith(".json")
+    sub = storage.key_path(tmp_path, fits + "a", prefix="sub-").name
+    assert sub == "sub-" + name
+    assert storage.key_filename("a" * storage.NAME_MAX) == "a" * storage.NAME_MAX
+    assert storage.key_filename("a" * (storage.NAME_MAX + 1)).startswith("sha256:")
+
+
+def test_scheduler_long_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    key = s.session_key("a" * 64, ":" * 128)
+    callback_id = scheduler.schedule(key, 0.0)
+    assert [e["id"] for e in scheduler.pending(key)] == [callback_id]
+    scheduler.delete(key, callback_id)
+    assert scheduler.pending(key) == []
 
 
 def test_scheduler_delete_ignores_ids_it_did_not_make(

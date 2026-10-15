@@ -15,6 +15,23 @@ import messaging as m
 from message_topic import Message, MessageTopic
 
 
+def test_long_dm_topic_and_member_paths_roundtrip(tmp_path: Path) -> None:
+    members = ["bots/" + char * 128 for char in ("!", "?")]
+    topic = MessageTopic(m.dm_key(members), "dm")
+    for member in members:
+        topic.join(member, now=1)
+        mt.save_subscriber(tmp_path, topic, member)
+    mt.save_state(tmp_path, topic)
+    message = topic.post(members[0], now=2, body="hello")
+    mt.append_messages(tmp_path, topic, [message])
+    loaded = mt.load_all_topics(tmp_path)[0]
+    assert loaded.key == topic.key
+    assert loaded.members == set(members)
+    assert loaded.messages[0].id == message.id
+    mt.delete_topic(tmp_path, topic.key)
+    assert mt.load_all_topics(tmp_path) == []
+
+
 def test_load_recovers_sequence_and_activity_after_log_only_append(
     tmp_path: Path,
 ) -> None:

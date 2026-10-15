@@ -117,7 +117,8 @@ def _migrate_topics(data_dir: Path, prefix: str, name_to_key: dict[str, str]) ->
         # Keep originals until both their replacements and membership are durable.
         # A retry can load both names: rekey_member keeps the migrated state.
         retained = {
-            f"sub-{storage.key_filename(member)}.json" for member in topic.members
+            storage.key_path(directory, member, prefix="sub-").name
+            for member in topic.members
         }
         for member in sorted(topic.members):
             message_topic.save_subscriber(data_dir, topic, member)
@@ -148,7 +149,7 @@ def _migrate_pr_subscribers(data_dir: Path, prefix: str) -> set[str]:
                 continue
             key = session_id if session_id.startswith(prefix) else prefix + session_id
             keys.add(key)
-            new_path = directory / f"sub-{storage.key_filename(key)}.json"
+            new_path = storage.key_path(directory, key, prefix="sub-")
             if new_path == sub_path:
                 continue
             storage.atomic_write(new_path, json.dumps({**sub, "session_id": key}))
