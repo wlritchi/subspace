@@ -5,6 +5,8 @@ docs/specs/2026-10-10-remote-agent-mcp.md."""
 
 import asyncio
 import contextlib
+import importlib.util
+import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -343,6 +345,53 @@ def test_pulled_batch_does_not_come_back_after_idle_reap(tmp_path: Path) -> None
             await alice.close()
 
         asyncio.run(scenario())
+
+
+def test_idle_reaper_survives_revocation_during_close(monkeypatch) -> None:
+    path = Path(__file__).resolve().parents[1] / "server" / "subspace-gateway.py"
+    spec = importlib.util.spec_from_file_location("gateway_reaper_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+
+    async def scenario() -> None:
+        gateway = module.Gateway()
+        gateway.idle_seconds = 0
+        closing = asyncio.Event()
+        release = asyncio.Event()
+
+        class DelayedClose:
+            async def close(self) -> None:
+                closing.set()
+                await release.wait()
+
+        first = gateway.session("test-token", "first")
+        gateway.session("test-token", "second")
+        first.ws = DelayedClose()
+        reaper = asyncio.create_task(gateway.reap_idle())
+        try:
+            await asyncio.wait_for(closing.wait(), 3)
+            gateway.forget_token("test-token")
+            release.set()
+            # An entry later in the reaper's snapshot has disappeared. The
+            # reaper must survive and collect a newly idle session next pass.
+            gateway.session("another-token", "third")
+            for _ in range(200):
+                if reaper.done():
+                    reaper.result()
+                if not gateway.sessions:
+                    break
+                await asyncio.sleep(0.02)
+            assert not gateway.sessions
+            assert not reaper.done()
+        finally:
+            release.set()
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
+
+    asyncio.run(scenario())
 
 
 def test_revoked_credential(tmp_path: Path) -> None:

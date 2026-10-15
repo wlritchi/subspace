@@ -573,7 +573,11 @@ class Gateway:
             await asyncio.sleep(min(30.0, max(1.0, self.idle_seconds / 4)))
             now = time.monotonic()
             for key, session in list(self.sessions.items()):
-                if session.calls == 0 and now - session.last_used > self.idle_seconds:
+                if (
+                    self.sessions.get(key) is session
+                    and session.calls == 0
+                    and now - session.last_used > self.idle_seconds
+                ):
                     del self.sessions[key]
                     await session.close()
             for key, verdict in list(self.verdicts.items()):
