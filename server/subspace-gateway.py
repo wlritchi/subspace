@@ -240,10 +240,12 @@ class CoreSession:
                 )
             )
             reply = await self._round_trip(ws, {"type": proto.WHOAMI})
-            if reply.get("type") == proto.ERROR:
+            if reply.get("type") == proto.ERROR or not reply.get("session_id"):
                 await ws.close()
-                raise GatewayError(f"Could not attach: {reply.get('error')}")
-            self.session_id = reply.get("session_id") or self.session_id
+                raise GatewayError(
+                    f"Could not attach: {reply.get('error') or 'the server refused the session'}"
+                )
+            self.session_id = reply["session_id"]
 
     async def _recv(self, ws: ClientConnection) -> None:
         try:

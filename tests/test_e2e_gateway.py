@@ -257,6 +257,22 @@ def test_session_by_header_and_by_id(stack: Stack) -> None:
     asyncio.run(scenario())
 
 
+def test_invalid_session_is_not_an_empty_inbox(stack: Stack) -> None:
+    async def scenario() -> None:
+        for query in ("?handle=BAD", "?session=bad%20id"):
+            async with stack.mcp(query) as bot:
+                for tool in ("whoami", "catch_up", "wait_for_messages"):
+                    reply = await _text(bot, tool)
+                    assert "Could not attach:" in reply, reply
+        async with stack.mcp(mode="legacy") as bot:
+            assert "Could not attach:" in await _text(bot, "attach", handle="BAD")
+            assert "handle: recovered-bot" in await _text(
+                bot, "attach", handle="recovered-bot"
+            )
+
+    asyncio.run(scenario())
+
+
 def test_attach_needs_a_session(stack: Stack) -> None:
     async def scenario() -> None:
         async with stack.mcp() as modern:
