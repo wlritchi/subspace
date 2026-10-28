@@ -31,8 +31,8 @@ The hyperspace server receives the webhook, because it already has an ingress
 and knows the session's status and lease. It records a _wake request_ on the
 session. The launcher of the host that holds the lease sees the request in the
 session list that it already reads on each tick, and resumes the session. The
-resumed session connects to subspace through the relay and gets its messages as
-usual.
+resumed session connects to subspace through the relay, which puts the messages
+into its first turn.
 
 The session id is the key across both systems. For a relay session, the subspace
 session id is the Claude Code session id, which is also hyperspace's session id.
@@ -147,23 +147,53 @@ and also in workstation mode with `--stay`. In workstation mode it resumes only
 for a pending wake request, not for `working` or `waiting` + `wake: local`.
 
 `needs_process` resumes a held, non-live session with a pending wake request,
-whatever its status, and also if it has no status. If the session also needs a
-process for its status (runner mode, `working` or `waiting` + `wake: local`),
-the status prompt wins: the relay delivers the messages in either case. Else the
-prompt is fixed text with the pending count, for example: "Subspace messages
-arrived while this session was stopped (2 pending). Read them with catch_up if
-they do not arrive by themselves." It does not repeat message content or
-senders.
+whatever its status, and also if it has no status. The prompt is the status
+prompt if the session also needs a process for its status (runner mode,
+`working` or `waiting` + `wake: local`), and then a fixed suffix, for example:
+"[hyperspace] Messages arrived while this session was stopped." The prompt does
+not hold the messages and does not tell the agent to fetch them: the relay
+delivers them in the same turn (see "Delivery at resume").
 
 The existing limits apply: the launcher does not resume a session that runs,
 whose restore is pending, or that it resumed 5 times in the last hour.
 
 Hyperspace's session-status spec states the id requirement above as a launcher
-rule, next to the resume command.
+rule, next to the resume command. The launcher always loads the relay as a
+channel in a resumed process: runner images do this today through
+`launcher_claude_args`.
 
-The relay must load as a channel in the resumed process
-(`launcher_claude_args`), so that the messages arrive by themselves. Without it,
-the prompt still makes the agent read them.
+## Delivery at resume
+
+The agent gets the pending messages in its first turn after the resume, before
+it acts, with no tool call. Each message gets into the context once.
+
+The relay (the notifications plugin) does this, not hyperspace. Hyperspace does
+not read or carry message content, and it has no subspace credential; the relay
+already holds the session's connection and its acks.
+
+- When the relay connects, it sends `register` and then `whoami`. The core sends
+  the `whoami` reply after the pending items, so the relay then has the whole
+  backlog.
+- The relay holds this first backlog for a short time (some seconds) and does
+  not send it as channel notifications yet.
+- The relay's SessionStart hook, for a resumed session, asks the relay process
+  for the held backlog (local IPC, found as the hook finds the session id
+  today). It waits for the backlog for a short time. It returns the messages as
+  `additionalContext`, with a header that says that they arrived while the
+  session was stopped. The relay then acks them.
+- Messages that the hook did not take (no hook, a timeout) go out as channel
+  notifications as usual, after the hold.
+
+The hook connects to the relay, not to the core: each connection to a session
+gets each unacked message, so a second connection would put the messages in the
+context twice.
+
+This works for each resume, also an interactive `claude --resume` by a user.
+
+To check before implementation: in `claude --bg --resume`, Claude Code starts
+the relay's MCP server while the SessionStart hook runs, not after it. If it
+starts it after, the hook does the same work on the first UserPromptSubmit
+instead.
 
 ## How the rules fit
 
@@ -182,9 +212,33 @@ the prompt still makes the agent read them.
 - **Two copies.** The launcher's existing checks (not `live` on the server, not
   running locally) stop a resume that would make a second copy.
 
+## Later: events other than messages
+
+This spec wakes a session only for messages. Wakes for other events will follow,
+with the same rules (offline, threshold, grace, cooldown, covered):
+
+- GitHub and Forgejo PR events;
+- cron-style wake-ups that the subspace server holds;
+- Slack messages in followed channels, threads, and DMs;
+- scopes that a private deployment adds as plugins.
+
+Slack and plugin scopes have their own sender and recipient identities. Thus
+subspace will probably need a more pluggable message and event model. This spec
+does not design it. Its parts are not specific to messages: the account webhook
+also matches a session with no handle, the wake body lists pointers by
+`context`, and delivery at resume takes what the relay holds, whatever its kind.
+
+**PR polling.** Today the core polls a PR only while a subscriber is connected
+(`_tracker_loop`), so it does not see an event for an offline session. With PR
+event wakes, a subscriber that has a webhook counts as connected for this check.
+To stop polling for a session that will not wake, the core uses the webhook's
+answer, not a copy of the hyperspace state: a refusal (for example `409` for a
+`done` session) makes the session _dormant_, which is not wakeable and does not
+count for polling, until it connects again. The cost is one polled event for
+each `done` session. The session expiry (30 days) limits the rest.
+
 ## Not in this spec
 
-- Wakes for events other than messages (PR events, callbacks).
 - Notices to the sender, and `reopen` for a `done` session.
 - Session ids as the primary identity in subspace. This design does not depend
   on handles, so it does not block that change.
