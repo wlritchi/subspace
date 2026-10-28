@@ -400,6 +400,9 @@ A webhook lets the core start the agent instead: for example a bot run, a
 scheduled cloud agent, or a CI workflow. The core sends it, not the gateway,
 so it works for every kind of session, and its state survives restarts.
 
+[2026-10-28-launcher-wake.md](2026-10-28-launcher-wake.md) adds a webhook for
+each account (an entry with no `handle`) and the `session` field in the body.
+
 **Configuration.** An `[[account.webhook]]` entry in `accounts.toml` names a
 handle in the account, a URL, and an optional key. The URL must be `https`,
 except on a loopback host. The key goes in `Authorization: Bearer <key>`. It

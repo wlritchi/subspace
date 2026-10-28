@@ -4,8 +4,7 @@ Status: draft. Date: 2026-10-28.
 
 Extends "Webhook wake-up" in
 [2026-10-10-remote-agent-mcp.md](2026-10-10-remote-agent-mcp.md). On the
-hyperspace side, it replaces the transport in "Messages to a session" of
-hyperspace's `docs/specs/2026-10-15-session-status.md`.
+hyperspace side, see hyperspace's `docs/specs/2026-10-28-wake.md`.
 
 ## Problem
 
@@ -90,77 +89,36 @@ launcher accepts the wake but does not resume the session.
 
 **Responses.** No change in the rules: a 2xx is accepted, a 5xx, 429, or network
 error is tried again, and any other status is a refusal. The core logs the
-body's `message` for a refusal. Notices to the sender (not delivered, queued)
+body's `verdict` or `message`. Notices to the sender (not delivered, queued)
 stay a later step.
 
 Protocol: `session` in the body is a minor addition. The wire frames do not
 change.
 
-## Hyperspace changes
+## Hyperspace side
 
-### Endpoint
+Hyperspace's spec, `docs/specs/2026-10-28-wake.md` in the hyperspace repository,
+owns the server and launcher details. Subspace depends only on this:
 
-`POST /v1/wake/{harness}`, with the subspace wake body. It needs a credential
-with a new scope, `wake`, which allows only this endpoint. The session is
-`(credential's account, harness, body.session)`. The subspace `account` and
-`handle` fields are for logs only.
+- `POST /v1/wake/{harness}` with the body above, and a credential with the
+  `wake` scope (the key file). Hyperspace finds the session by the credential's
+  account, the harness, and `session`.
+- `200` with a `verdict` means accepted. `waking`: a launcher that acts on wakes
+  holds the lease. `queued`: the request is recorded, but no such launcher runs
+  there now (later, the sender gets a "queued" notice). `live`: the session
+  shows as running. Subspace treats all three the same.
+- `409` means that the session's state refuses this wake (`done`, or no host
+  holds the session). It refuses this wake only: the state can change with no
+  subspace connection (a `reopen` or a restore from a shell), so a later message
+  gives a new wake after the cooldown. `404`: hyperspace does not know the
+  session.
+- An accepted wake stays as a request until a new run of the session starts, so
+  a run that was live with a disconnected relay does not use it up. The launcher
+  resumes the session with its status prompt, if any, and a fixed suffix that
+  says that messages arrived while it was stopped. The prompt has no message
+  content. The launcher always loads the relay as a channel.
 
-| Session state                   | Response                                          |
-| ------------------------------- | ------------------------------------------------- |
-| Not found                       | `404`                                             |
-| `done`                          | `409`, `message: "session done: <note>"`          |
-| Lease `free` (no host holds it) | `409`, `message: "no host holds the session"`     |
-| `live` on a host                | `200`, `{"verdict": "live"}`; records a request   |
-| Else                            | `200`, `{"verdict": "waking"}`; records a request |
-
-The server records a request for a `live` session too, because liveness can be
-one heartbeat old: a session that stopped without its SessionEnd hook shows
-`live` until the next tick. A `reserved` lease (a teleport in flight) also gets
-a request: the launcher of the target host acts on it when that host holds the
-lease.
-
-Each status apart from `done` gets a wake. `ready` is included: the agent ended
-its turn, and the message can be what it waits for. Stopping a session from
-waking is what `done` is for.
-
-### Wake request
-
-The server keeps at most one wake request for each session: `{received, count}`
-(the wake's `pending`). A new wake replaces it. The request is _pending_ while
-`received` is later than each time that a host listed the session in a heartbeat
-(`last_listed`), and the session is not `done`. The session summary shows
-`wake_request` only while it is pending.
-
-Pending is a value that the server calculates when it reads the session, as it
-does for liveness, so nothing clears a request. A process that runs, or that the
-resume started, is listed at the next heartbeat, and the request is then not
-pending. The launcher does not acknowledge a request. Status events have no
-effect: a client can send a queued status write from before the wake after the
-wake. A request that the launcher cannot act on (for example, no local copy)
-stays pending, and the launcher tries again on later ticks within its resume
-limit.
-
-### Launcher
-
-The launcher lists the sessions that its host holds in runner mode, as today,
-and also in workstation mode with `--stay`. In workstation mode it resumes only
-for a pending wake request, not for `working` or `waiting` + `wake: local`.
-
-`needs_process` resumes a held, non-live session with a pending wake request,
-whatever its status, and also if it has no status. The prompt is the status
-prompt if the session also needs a process for its status (runner mode,
-`working` or `waiting` + `wake: local`), and then a fixed suffix, for example:
-"[hyperspace] Messages arrived while this session was stopped." The prompt does
-not hold the messages and does not tell the agent to fetch them: the relay
-normally delivers them in the same turn (see "Delivery at resume").
-
-The existing limits apply: the launcher does not resume a session that runs,
-whose restore is pending, or that it resumed 5 times in the last hour.
-
-Hyperspace's session-status spec states the id requirement above as a launcher
-rule, next to the resume command. The launcher always loads the relay as a
-channel in a resumed process: runner images do this today through
-`launcher_claude_args`.
+Hyperspace never reads or keeps message content: it ignores `items`.
 
 ## Delivery at resume
 
@@ -226,7 +184,7 @@ a running session:
   its retries, whatever the response. If no POST is accepted, the next new
   message gives a new wake; the old ones wait until the session connects for
   another reason. After an accepted POST, the request stays on the hyperspace
-  server while it is pending (see "Wake request").
+  server until a new run of the session starts.
 - **Two copies.** The launcher's existing checks (not `live` on the server, not
   running locally) stop a resume that would make a second copy.
 
@@ -249,22 +207,20 @@ whatever their kind.
 
 **PR polling.** Today the core polls a PR only while a subscriber is connected
 (`_tracker_loop`), so it does not see an event for an offline session. With PR
-event wakes, a subscriber that has a webhook counts as connected for this check.
-To stop polling for a session that will not wake, the core uses the webhook's
-answer, not a copy of the hyperspace state: a `409` makes the session _dormant_,
-which is not wakeable and does not count for polling, until it connects again.
-The cost is one polled event for each `done` session. The session expiry (30
-days) limits the rest.
+event wakes, a subscriber that has a webhook counts as connected for this check,
+unless the last wake of that session got a `409`. The core uses the webhook's
+answer, not a copy of the hyperspace state. A `409` refuses that wake only, so
+message wakes continue after it; a later accepted wake, or a connect, makes the
+session count for polling again. The cost is one polled event for each `done`
+session. The session expiry (30 days) limits the rest.
 
-Only `409` makes a session dormant: it says that the session's state refuses the
-wake (`done`, or a lease that a user set free). Other refusals (`401`, `403`,
-`404`) are usually configuration errors that an operator corrects; if they made
-the session dormant, a session that only runs when a wake starts it would never
-wake again. An infrastructure failure does not cause a `409`: a runner that
-stops keeps its leases, so its wakes wait as pending requests, and a hyperspace
-server that stops gives errors that the core tries again. Thus dormancy needs no
-override; a sender that must reach a `done` session uses `reopen` (see "Not in
-this spec").
+Only `409` has this effect: it says that the session's state refuses the wake.
+Other refusals (`401`, `403`, `404`) are usually configuration errors that an
+operator corrects. An infrastructure failure does not cause a `409`: a runner
+that stops keeps its leases, so its wakes wait as requests, and a hyperspace
+server that stops gives errors that the core tries again. Thus no sender needs
+to force a wake; a sender that must reach a `done` session uses `reopen` (see
+"Not in this spec").
 
 ## Not in this spec
 
