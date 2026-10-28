@@ -232,10 +232,20 @@ also matches a session with no handle, the wake body lists pointers by
 (`_tracker_loop`), so it does not see an event for an offline session. With PR
 event wakes, a subscriber that has a webhook counts as connected for this check.
 To stop polling for a session that will not wake, the core uses the webhook's
-answer, not a copy of the hyperspace state: a refusal (for example `409` for a
-`done` session) makes the session _dormant_, which is not wakeable and does not
-count for polling, until it connects again. The cost is one polled event for
-each `done` session. The session expiry (30 days) limits the rest.
+answer, not a copy of the hyperspace state: a `409` makes the session _dormant_,
+which is not wakeable and does not count for polling, until it connects again.
+The cost is one polled event for each `done` session. The session expiry (30
+days) limits the rest.
+
+Only `409` makes a session dormant: it says that the session's state refuses the
+wake (`done`, or a lease that a user set free). Other refusals (`401`, `403`,
+`404`) are usually configuration errors that an operator corrects; if they made
+the session dormant, a session that only runs when a wake starts it would never
+wake again. An infrastructure failure does not cause a `409`: a runner that
+stops keeps its leases, so its wakes wait as pending requests, and a hyperspace
+server that stops gives errors that the core tries again. Thus dormancy needs no
+override; a sender that must reach a `done` session uses `reopen` (see "Not in
+this spec").
 
 ## Not in this spec
 
