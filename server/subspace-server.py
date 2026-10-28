@@ -1457,13 +1457,27 @@ async def _handle_list_agents(websocket, conn: Connection, msg: dict) -> None:
 
 
 def _webhook_for(key: str) -> tuple[accounts.Account, accounts.Webhook] | None:
-    """The account and webhook of the session's handle, or None."""
+    """The account and webhook of the session: the entry for its handle, else
+    the account's webhook. None if there is neither."""
     record = SESSIONS.get(key)
     account = _scope(key)
-    if record is None or not record.handle or account is None:
+    if record is None or account is None:
         return None
     webhook = account.webhook(record.handle)
     return (account, webhook) if webhook is not None else None
+
+
+def _message_wake_target(
+    key: str,
+) -> tuple[accounts.Account, accounts.Webhook] | None:
+    """The webhook for a message wake: as _webhook_for, but only for a session
+    that holds a handle. A session that lost its handle keeps its channels and
+    unread messages; without this rule, each old run would wake for each
+    @here."""
+    record = SESSIONS.get(key)
+    if record is None or not record.handle:
+        return None
+    return _webhook_for(key)
 
 
 def _wake_items(key: str, after: int) -> list[tuple[int, dict]]:
@@ -1521,7 +1535,7 @@ def _poke_webhook(key: str) -> None:
     if running is not None:
         running[1].set()
         return
-    if _webhook_for(key) is None:
+    if _message_wake_target(key) is None:
         return
     event = asyncio.Event()
     WAKE_TASKS[key] = (asyncio.create_task(_webhook_loop(key, event)), event)
@@ -1532,7 +1546,7 @@ async def _webhook_loop(key: str, event: asyncio.Event) -> None:
     try:
         while True:
             event.clear()
-            target = _webhook_for(key)
+            target = _message_wake_target(key)
             record = SESSIONS.get(key)
             if target is None or record is None:
                 return
@@ -1585,32 +1599,39 @@ async def _send_wake(
         if record is None or _live(key) or record.last_seen > started:
             return
         # Configuration and handle ownership may change during the retry sleep.
-        target = _webhook_for(key)
+        target = _message_wake_target(key)
         if target is None:
             return
         account, webhook = target
+        session_id = sessions.split_key(key)[1]
         # The URL can hold a secret: log only its host.
-        where = f"{webhook.handle}@{account.id} ({httpx.URL(webhook.url).host})"
+        where = (
+            f"{record.handle}@{account.id} (session {session_id}, "
+            f"{httpx.URL(webhook.url).host})"
+        )
         if delay:
             # Messages can have been acked or added during the delay.
             items = _wake_items(key, record.wake_covered)
             if not items:
                 return
-        body = wake.body(account.id, webhook.handle, [item for _, item in items])
+        body = wake.body(
+            account.id, session_id, record.handle, [item for _, item in items]
+        )
         try:
             bearer = webhook.bearer_key()
         except accounts.AccountsError as exc:
             print(f"subspace: wake of {where} failed: {exc}", file=sys.stderr)
             break
-        status = await _post_webhook(webhook.url, bearer, body)
+        status, note = await _post_webhook(webhook.url, bearer, body)
+        suffix = f" ({note})" if note else ""
         if status is not None and 200 <= status < 300:
             print(
-                f"subspace: woke {where} for {body['pending']} message(s)",
+                f"subspace: woke {where} for {body['pending']} message(s){suffix}",
                 file=sys.stderr,
             )
             break
         print(
-            f"subspace: wake of {where} failed: {status or 'no response'}",
+            f"subspace: wake of {where} failed: {status or 'no response'}{suffix}",
             file=sys.stderr,
         )
         if not wake.retryable(status):
@@ -1624,8 +1645,9 @@ async def _send_wake(
         SESSIONS.persist(record)
 
 
-async def _post_webhook(url: str, bearer: str, body: dict) -> int | None:
-    """Return the HTTP status, or None on a network error or timeout."""
+async def _post_webhook(url: str, bearer: str, body: dict) -> tuple[int | None, str]:
+    """Return the HTTP status (None on a network error or timeout), and the
+    response's note for the log (see wake.response_note)."""
     headers = {"User-Agent": "subspace"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
@@ -1633,8 +1655,8 @@ async def _post_webhook(url: str, bearer: str, body: dict) -> int | None:
         async with httpx.AsyncClient(timeout=WAKE_TIMEOUT_SECONDS) as client:
             response = await client.post(url, json=body, headers=headers)
     except httpx.HTTPError:
-        return None
-    return response.status_code
+        return None, ""
+    return response.status_code, wake.response_note(response.content)
 
 
 # --------------------------------------------------------------------------- #

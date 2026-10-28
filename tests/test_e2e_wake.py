@@ -29,7 +29,7 @@ COOLDOWN = 3.0
 
 class Hooks:
     """A webhook receiver that records each request. A path answers with the
-    statuses queued for it, then 200."""
+    statuses queued for it, then 200. The body has a note for the core's log."""
 
     def __init__(self) -> None:
         self.requests: list[dict] = []
@@ -52,9 +52,13 @@ class Hooks:
                     )
                     queued = hooks.statuses.get(self.path) or []
                     status = queued.pop(0) if queued else 200
+                note = {"verdict": "queued"} if status < 300 else {"message": "no"}
+                reply = json.dumps(note).encode()
                 self.send_response(status)
-                self.send_header("Content-Length", "0")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(reply)))
                 self.end_headers()
+                self.wfile.write(reply)
 
             def log_message(self, *args: object) -> None:
                 pass
@@ -171,6 +175,7 @@ def test_offline_handle_is_woken(stack: Stack, hooks: Hooks) -> None:
         assert "secret text" not in json.dumps(wake["body"])
         assert wake["body"]["event"] == "wake"
         assert wake["body"]["account"] == "ci"
+        assert wake["body"]["session"] == "@wk-bot"
         assert wake["body"]["handle"] == "wk-bot"
         assert wake["body"]["pending"] == 1
         [item] = wake["body"]["items"]
@@ -308,3 +313,58 @@ def test_key_file_is_read_for_each_wake(stack: Stack, hooks: Hooks) -> None:
         await alice.close()
 
     asyncio.run(scenario())
+
+
+def test_account_webhook(tmp_path: Path, hooks: Hooks) -> None:
+    """An entry with no handle wakes each session in the account that holds a
+    handle. An entry for the handle takes precedence."""
+    token, credential_id, digest = accounts.new_token()
+    base = f"http://127.0.0.1:{hooks.port}"
+    (tmp_path / "accounts.toml").write_text(
+        f'[[account]]\nid = "team"\n'
+        f'[[account.credential]]\nid = "{credential_id}"\n'
+        f'secret_sha256 = "{digest}"\n'
+        f'[[account.webhook]]\nurl = "{base}/team"\ngrace_seconds = {GRACE}\n'
+        f'[[account.webhook]]\nhandle = "tm-own"\nurl = "{base}/own"\n'
+        f"grace_seconds = {GRACE}\n"
+    )
+    core_port = free_port()
+    gateway_port = free_port()
+    stack = Stack(core_port, gateway_port, tmp_path, {"team": token})
+
+    async def scenario() -> None:
+        alice = await stack.local("tm-s1", "tm-alice")
+        async with stack.mcp("?session=tm-run-1", account="team") as bot:
+            reply = await _text(bot, "register_agent", name="tm-any")
+            assert "Registered as 'tm-any'" in reply
+        async with stack.mcp("?session=tm-run-2", account="team") as own:
+            await _text(own, "register_agent", name="tm-own")
+
+        agents = await alice.request({"type": proto.LIST_AGENTS})
+        wakeable = {a["name"]: a.get("wakeable") for a in agents["agents"]}
+        assert wakeable["tm-any@team"] is True
+        assert wakeable["tm-own@team"] is True
+        assert wakeable["tm-alice"] is False
+
+        await asyncio.sleep(0.5)
+        await _dm(alice, "tm-any@team", "for any")
+        await _dm(alice, "tm-own@team", "for own")
+        [team] = await hooks.wait_for("/team", 1, 5.0)
+        [own] = await hooks.wait_for("/own", 1, 5.0)
+        assert team["body"]["account"] == "team"
+        assert team["body"]["session"] == "tm-run-1"
+        assert team["body"]["handle"] == "tm-any"
+        assert "authorization" not in team["headers"]
+        assert own["body"]["session"] == "tm-run-2"
+        assert own["body"]["handle"] == "tm-own"
+        await asyncio.sleep(1.0)
+        # The entry for tm-own took precedence: the account's webhook got one
+        # wake only.
+        assert len(hooks.calls("/team")) == 1
+        await alice.close()
+
+    with (
+        server_process(_core_env(core_port, tmp_path)),
+        gateway_process(core_port, gateway_port, linger_seconds="0.2"),
+    ):
+        asyncio.run(scenario())

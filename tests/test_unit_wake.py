@@ -80,8 +80,32 @@ def test_retryable(status: int | None, expected: bool) -> None:
 
 def test_body_lists_at_most_max_items() -> None:
     items = [{"id": f"m{i}"} for i in range(wake.MAX_ITEMS + 3)]
-    payload = wake.body("bots", "runner", items)
+    payload = wake.body("bots", "run-42", "runner", items)
     assert payload["event"] == "wake"
-    assert payload["account"] == "bots" and payload["handle"] == "runner"
+    assert payload["account"] == "bots" and payload["session"] == "run-42"
+    assert payload["handle"] == "runner"
     assert payload["pending"] == wake.MAX_ITEMS + 3
     assert payload["items"] == items[: wake.MAX_ITEMS]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (b'{"verdict": "queued", "message": "x"}', "verdict 'queued'"),
+        (b'{"message": "session is done"}', "message 'session is done'"),
+        (b'{"verdict": 1}', ""),
+        (b"[]", ""),
+        (b"", ""),
+        (b"not json", ""),
+        (b"\xff\xfe", ""),
+        (b"[" * 100_000, ""),
+        (b'{"message": "a\\nb"}', "message 'a\\nb'"),
+    ],
+)
+def test_response_note(content: bytes, expected: str) -> None:
+    assert wake.response_note(content) == expected
+
+
+def test_response_note_is_cut() -> None:
+    note = wake.response_note(b'{"verdict": "' + b"v" * 1000 + b'"}')
+    assert note == f"verdict {'v' * wake.MAX_NOTE!r}"

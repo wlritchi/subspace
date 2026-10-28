@@ -439,6 +439,7 @@ does not contain them:
 {
   "event": "wake",
   "account": "ci",
+  "session": "run-42",
   "handle": "reviewer",
   "pending": 3,
   "items": [

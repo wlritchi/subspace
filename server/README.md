@@ -113,7 +113,7 @@ secret_sha256 = "…"
 expires_at = 2027-01-01T00:00:00Z  # optional
 
 [[account.webhook]]              # optional: wake the agent with this handle
-handle = "reviewer"
+handle = "reviewer"              # omit for the account's webhook (at most one)
 url = "https://hooks.example.com/run/abc"  # https, or http on loopback
 key_file = "/etc/subspace-keys/reviewer"  # optional; or key = "…"
 grace_seconds = 60               # wait this long after its last connection
@@ -131,16 +131,22 @@ The `pr` permission gives access to every repository that the server's GitHub
 and Forgejo tokens can see. Do not give it to an account that you do not trust
 with those repositories.
 
-A webhook wakes an agent that is offline. When a message at or above the
-session's threshold arrives for the handle, and the session has had no
-connection for the grace time, the server POSTs a JSON body that lists the
-messages (ids, sender, context, level; not the text) to the URL. The agent then
-pulls as usual. A burst gives one wake. Network errors, 5xx, and 429 are tried
-again three times. `list_agents` shows the session as wakeable. The key goes in `Authorization: Bearer <key>`. Prefer `key_file`: the server
-reads the file for each wake, so the key can live in a Kubernetes Secret
-mounted as a volume (not with `subPath`), and a new key takes effect without a
-restart. `key` puts the key in the accounts file itself. See "Webhook wake-up" in
-`docs/specs/2026-10-10-remote-agent-mcp.md`.
+A webhook wakes an agent that is offline. An entry with a `handle` applies to
+the session that holds that handle. An entry with no `handle` applies to each
+session in the account that holds a handle, if no entry names its handle. When a
+message at or above the session's threshold arrives for the session, and the
+session has had no connection for the grace time, the server POSTs a JSON body
+that names the session (`session`, `handle`) and lists the messages (ids,
+sender, context, level; not the text) to the URL. The agent then pulls as usual.
+A burst gives one wake. Network errors, 5xx, and 429 are tried again three
+times. The server logs the `verdict` or `message` of a JSON response.
+`list_agents` shows the session as wakeable. The key goes in
+`Authorization: Bearer <key>`. Prefer `key_file`: the server reads the file for
+each wake, so the key can live in a Kubernetes Secret mounted as a volume (not
+with `subPath`), and a new key takes effect without a restart. `key` puts the
+key in the accounts file itself. See "Webhook wake-up" in
+`docs/specs/2026-10-10-remote-agent-mcp.md` and
+`docs/specs/2026-10-28-launcher-wake.md`.
 
 ### Migration to session keys
 

@@ -240,7 +240,6 @@ def test_webhook_parse() -> None:
         'handle = "runner"\nurl = "ftp://hooks.example.com/run"\n',
         'handle = "runner"\nurl = "not a url"\n',
         'handle = "Runner"\nurl = "https://hooks.example.com/run"\n',
-        'url = "https://hooks.example.com/run"\n',
         'handle = "runner"\nurl = "https://hooks.example.com/run"\nkey = 1\n',
         'handle = "runner"\nurl = "https://hooks.example.com/run"\nkey = "k\u00e9y"\n',
         'handle = "runner"\nurl = "https://hooks.example.com/run"\nkey = "a b"\n',
@@ -258,6 +257,38 @@ def test_one_webhook_per_handle() -> None:
     block = '[[account.webhook]]\nhandle = "runner"\nurl = "https://h.example.com/"\n'
     with pytest.raises(a.AccountsError):
         a.parse('[[account]]\nid = "bots"\n' + block + block, "default")
+
+
+def test_account_webhook_and_precedence() -> None:
+    accounts = a.parse(
+        '[[account]]\nid = "bots"\n'
+        '[[account.webhook]]\nurl = "https://h.example.com/account"\n'
+        '[[account.webhook]]\nhandle = "runner"\nurl = "https://h.example.com/runner"\n',
+        "default",
+    )
+    account = accounts["bots"]
+    runner = account.webhook("runner")
+    assert runner is not None and runner.url == "https://h.example.com/runner"
+    other = account.webhook("other")
+    assert other is not None and other.url == "https://h.example.com/account"
+    assert other.handle == ""
+    # A session with no handle also matches the account's webhook.
+    assert account.webhook("") is other
+
+
+def test_one_account_webhook() -> None:
+    block = '[[account.webhook]]\nurl = "https://h.example.com/"\n'
+    with pytest.raises(a.AccountsError, match="no handle"):
+        a.parse('[[account]]\nid = "bots"\n' + block + block, "default")
+
+
+def test_empty_handle_is_not_the_account_webhook() -> None:
+    with pytest.raises(a.AccountsError, match="handle"):
+        a.parse(
+            '[[account]]\nid = "bots"\n[[account.webhook]]\nhandle = ""\n'
+            'url = "https://h.example.com/"\n',
+            "default",
+        )
 
 
 def test_webhook_key_file(tmp_path: Path) -> None:

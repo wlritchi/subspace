@@ -4,6 +4,7 @@ server's warm-retention reaper."""
 
 import asyncio
 import importlib.util
+from types import ModuleType
 
 import accounts
 import sessions
@@ -119,14 +120,64 @@ def test_wake_retry_resolves_current_target(server, tmp_path, monkeypatch, chang
                 account = accounts.Account(
                     id="bots", webhooks=(new,) if change == "replace" else ()
                 )
-            return 503
-        return 200
+            return 503, ""
+        return 200, ""
 
     monkeypatch.setattr(server, "_post_webhook", post)
     asyncio.run(server._send_wake(record.key, account, old, items))
     assert posts == [(old.url, old.key)] + (
         [(new.url, new.key)] if change == "replace" else []
     )
+
+
+def test_account_webhook_wakes_a_session_that_holds_a_handle(
+    server: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = sessions.SessionRegistry(tmp_path)
+    one, _ = registry.register_handle(
+        "bots/one", "runner", now=1, is_live=lambda _: False, idle=60
+    )
+    hook = accounts.Webhook("", "https://account.invalid/wake", key="k")
+    named = accounts.Webhook("named", "https://named.invalid/wake", key="k")
+    account = accounts.Account(id="bots", webhooks=(hook, named))
+    monkeypatch.setattr(server, "SESSIONS", registry, raising=False)
+    monkeypatch.setattr(server, "WAKE_TASKS", {})
+    monkeypatch.setattr(server, "_scope", lambda _: account)
+    monkeypatch.setattr(server, "_live", lambda _: False)
+    monkeypatch.setattr(server, "_wake_retry_delays", list)
+    items = [(1, {"id": "message"})]
+    monkeypatch.setattr(server, "_wake_items", lambda *_: items)
+    bodies: list[dict] = []
+
+    async def post(url: str, bearer: str, body: dict) -> tuple[int, str]:
+        bodies.append(body)
+        return 200, "verdict 'queued'"
+
+    monkeypatch.setattr(server, "_post_webhook", post)
+    assert server._message_wake_target(one.key) == (account, hook)
+    asyncio.run(server._send_wake(one.key, account, hook, items))
+    [body] = bodies
+    # The session's own handle, not the handle of the entry (none).
+    assert body["session"] == "one" and body["handle"] == "runner"
+
+    # An entry for the handle takes precedence.
+    registry.register_handle(
+        "bots/one", "named", now=2, is_live=lambda _: False, idle=60
+    )
+    assert server._message_wake_target(one.key) == (account, named)
+
+    # A session that lost its handle is not woken for messages, though the
+    # account's webhook still applies to it.
+    registry.register_handle(
+        "bots/two", "named", now=3, is_live=lambda _: False, idle=60, takeover=True
+    )
+    assert one.handle == ""
+    assert server._webhook_for(one.key) == (account, hook)
+    assert server._message_wake_target(one.key) is None
+    server._poke_webhook(one.key)
+    assert server.WAKE_TASKS == {}
+    asyncio.run(server._send_wake(one.key, account, hook, items))
+    assert len(bodies) == 1
 
 
 def test_reactions_do_not_wake_at_all_threshold(server, tmp_path, monkeypatch):

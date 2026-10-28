@@ -81,8 +81,10 @@ class Credential:
 
 @dataclass(frozen=True)
 class Webhook:
-    """Wake-up for the session that holds ``handle``. See "Webhook wake-up" in
-    docs/specs/2026-10-10-remote-agent-mcp.md."""
+    """Wake-up for the session that holds ``handle``, or for each session in the
+    account if ``handle`` is empty. See "Webhook wake-up" in
+    docs/specs/2026-10-10-remote-agent-mcp.md and
+    docs/specs/2026-10-28-launcher-wake.md."""
 
     handle: str
     url: str
@@ -125,10 +127,15 @@ class Account:
     webhooks: tuple[Webhook, ...] = ()
 
     def webhook(self, handle: str) -> Webhook | None:
+        """The webhook of a session that holds ``handle`` ("" if none): the
+        entry for the handle, else the account's webhook, else None."""
+        fallback: Webhook | None = None
         for webhook in self.webhooks:
             if webhook.handle == handle:
                 return webhook
-        return None
+            if not webhook.handle:
+                fallback = webhook
+        return fallback
 
     def allows_channel(self, name: str) -> bool:
         if self.channels is None:
@@ -253,8 +260,9 @@ def _parse_webhook(raw: object, where: str) -> Webhook:
         {"handle", "url", "key", "key_file", "grace_seconds", "cooldown_seconds"},
         where,
     )
-    handle = raw.get("handle")
-    if (
+    # No handle: the account's webhook.
+    handle = raw.get("handle", "")
+    if "handle" in raw and (
         not isinstance(handle, str)
         or not (2 <= len(handle) <= _ID_MAX)
         or not _ID_RE.match(handle)
@@ -353,6 +361,8 @@ def _parse_account(raw: object, index: int) -> Account:
         _parse_webhook(w, f"{where} webhook[{i}]") for i, w in enumerate(raw_webhooks)
     )
     handles = [w.handle for w in webhooks]
+    if handles.count("") > 1:
+        raise AccountsError(f"{where}: more than one webhook with no handle")
     if len(set(handles)) != len(handles):
         raise AccountsError(f"{where}: more than one webhook for a handle")
     return Account(
