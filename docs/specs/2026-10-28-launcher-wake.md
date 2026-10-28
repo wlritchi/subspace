@@ -179,12 +179,13 @@ already holds the session's connection and its acks.
 - **Claim.** The hook sends its session id to the relay process over local IPC
   (found as the hook finds the relay today), and waits up to about 10 s: the
   relay sleeps 3 s before it connects, and `whoami` can take 5 s. If the id is
-  not the one that the relay registered (a resume can start with a temporary
-  id), the relay registers it. It then sends `whoami`; the core sends the reply
-  after the items that were pending, or after 5 s. The relay answers the hook
-  with the held messages that pass the session's threshold. Messages below the
-  threshold stay held, as today. The claim takes the messages out of channel
-  delivery, so the two paths cannot both send one message.
+  not the one that the relay registered (after `/resume` in a running session,
+  the relay started under the earlier session's id), the relay registers it,
+  with a new hold. It then sends `whoami`; the core sends the reply after the
+  items that were pending, or after 5 s. The relay answers the hook with the
+  held messages that pass the session's threshold. Messages below the threshold
+  stay held, as today. The claim takes the messages out of channel delivery, so
+  the two paths cannot both send one message.
 - **Output.** The hook returns the messages as `additionalContext`, with a
   header that says that they arrived while the session was stopped. After it has
   written its output, it tells the relay, and the relay acks them. If the IPC
@@ -199,11 +200,18 @@ context twice.
 
 This works for each resume, also an interactive `claude --resume` by a user.
 
-To check before implementation: in `claude --bg --resume`, Claude Code starts
-the relay's MCP server while the SessionStart hook runs, not after it. If it
-starts it after, the hook does the same work on the first UserPromptSubmit
-instead; then check also that UserPromptSubmit runs for the prompt that
-`claude --bg --resume <sid> <prompt>` gives on the command line.
+Checked on 2026-10-28 with Claude Code 2.1.301, for `claude --bg --resume`
+(cold, and into a `bg-spare` worker), `claude --resume <sid>`, and `/resume` in
+a running session:
+
+- Claude Code starts the MCP servers while the SessionStart hook runs, and the
+  first prompt waits until the hook ends. So the hook can wait for the relay,
+  and its `additionalContext` comes before the first turn.
+- UserPromptSubmit runs for the prompt on the command line.
+- The relay's environment has the resumed session id in each case except
+  `/resume` in a running session: there the MCP servers keep the id of the
+  session that started the process. The hook payload has the right id in each
+  case, so the claim carries it.
 
 ## How the rules fit
 
