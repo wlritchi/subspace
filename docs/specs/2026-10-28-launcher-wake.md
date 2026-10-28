@@ -152,7 +152,7 @@ prompt if the session also needs a process for its status (runner mode,
 `working` or `waiting` + `wake: local`), and then a fixed suffix, for example:
 "[hyperspace] Messages arrived while this session was stopped." The prompt does
 not hold the messages and does not tell the agent to fetch them: the relay
-delivers them in the same turn (see "Delivery at resume").
+normally delivers them in the same turn (see "Delivery at resume").
 
 The existing limits apply: the launcher does not resume a session that runs,
 whose restore is pending, or that it resumed 5 times in the last hour.
@@ -165,24 +165,33 @@ channel in a resumed process: runner images do this today through
 ## Delivery at resume
 
 The agent gets the pending messages in its first turn after the resume, before
-it acts, with no tool call. Each message gets into the context once.
+it acts, with no tool call. This is best effort: a message that misses the
+handoff arrives as a channel notification, as today. In normal operation each
+message gets into the context once.
 
 The relay (the notifications plugin) does this, not hyperspace. Hyperspace does
 not read or carry message content, and it has no subspace credential; the relay
 already holds the session's connection and its acks.
 
-- When the relay connects, it sends `register` and then `whoami`. The core sends
-  the `whoami` reply after the pending items, so the relay then has the whole
-  backlog.
-- The relay holds this first backlog for a short time (some seconds) and does
-  not send it as channel notifications yet.
-- The relay's SessionStart hook, for a resumed session, asks the relay process
-  for the held backlog (local IPC, found as the hook finds the session id
-  today). It waits for the backlog for a short time. It returns the messages as
-  `additionalContext`, with a header that says that they arrived while the
-  session was stopped. The relay then acks them.
-- Messages that the hook did not take (no hook, a timeout) go out as channel
-  notifications as usual, after the hold.
+- **Hold.** At start, the relay does not send messages as channel notifications
+  (its push flush included) until its SessionStart hook claims them or declines.
+  If no hook contacts it within about 15 s, it stops the hold.
+- **Claim.** The hook sends its session id to the relay process over local IPC
+  (found as the hook finds the relay today), and waits up to about 10 s: the
+  relay sleeps 3 s before it connects, and `whoami` can take 5 s. If the id is
+  not the one that the relay registered (a resume can start with a temporary
+  id), the relay registers it. It then sends `whoami`; the core sends the reply
+  after the items that were pending, or after 5 s. The relay answers the hook
+  with the held messages that pass the session's threshold. Messages below the
+  threshold stay held, as today. The claim takes the messages out of channel
+  delivery, so the two paths cannot both send one message.
+- **Output.** The hook returns the messages as `additionalContext`, with a
+  header that says that they arrived while the session was stopped. After it has
+  written its output, it tells the relay, and the relay acks them. If the IPC
+  closes before that, the relay keeps the messages unacked and sends them as
+  channel notifications.
+- **Decline.** For a start that is not a resume, the hook declines, and the
+  relay stops the hold at once.
 
 The hook connects to the relay, not to the core: each connection to a session
 gets each unacked message, so a second connection would put the messages in the
@@ -193,7 +202,8 @@ This works for each resume, also an interactive `claude --resume` by a user.
 To check before implementation: in `claude --bg --resume`, Claude Code starts
 the relay's MCP server while the SessionStart hook runs, not after it. If it
 starts it after, the hook does the same work on the first UserPromptSubmit
-instead.
+instead; then check also that UserPromptSubmit runs for the prompt that
+`claude --bg --resume <sid> <prompt>` gives on the command line.
 
 ## How the rules fit
 
@@ -226,7 +236,8 @@ Slack and plugin scopes have their own sender and recipient identities. Thus
 subspace will probably need a more pluggable message and event model. This spec
 does not design it. Its parts are not specific to messages: the account webhook
 also matches a session with no handle, the wake body lists pointers by
-`context`, and delivery at resume takes what the relay holds, whatever its kind.
+`context`, and delivery at resume takes the held items that pass the threshold,
+whatever their kind.
 
 **PR polling.** Today the core polls a PR only while a subscriber is connected
 (`_tracker_loop`), so it does not see an event for an offline session. With PR
