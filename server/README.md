@@ -139,7 +139,7 @@ session has had no connection for the grace time, the server POSTs a JSON body
 that names the session (`session`, `handle`) and lists the messages (ids,
 sender, context, level; not the text) to the URL. The agent then pulls as usual.
 A burst gives one wake. Network errors, 5xx, and 429 are tried again three
-times. The server logs the `verdict` or `message` of a JSON response.
+times. The server logs the `verdict`, `detail` or `message` of a JSON response.
 `list_agents` shows the session as wakeable. The key goes in
 `Authorization: Bearer <key>`. Prefer `key_file`: the server reads the file for
 each wake, so the key can live in a Kubernetes Secret mounted as a volume (not

@@ -93,6 +93,10 @@ def test_body_lists_at_most_max_items() -> None:
     [
         (b'{"verdict": "queued", "message": "x"}', "verdict 'queued'"),
         (b'{"message": "session is done"}', "message 'session is done'"),
+        (
+            b'{"error": "lease_free", "detail": "no host holds the session"}',
+            "detail 'no host holds the session'",
+        ),
         (b'{"verdict": 1}', ""),
         (b"[]", ""),
         (b"", ""),

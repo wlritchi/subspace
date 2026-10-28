@@ -66,16 +66,16 @@ def body(account: str, session: str, handle: str, items: list[dict]) -> dict:
 
 
 def response_note(content: bytes) -> str:
-    """The ``verdict`` or ``message`` of a JSON response body, for the log, or
-    "" if the body has neither. The receiver is not trusted: the note is
-    quoted, so it cannot add lines to the log."""
+    """The ``verdict``, ``detail`` or ``message`` of a JSON response body, for
+    the log, or "" if the body has none. The receiver is not trusted: the note
+    is quoted, so it cannot add lines to the log."""
     try:
         data = json.loads(content)
     except (ValueError, RecursionError):
         return ""
     if not isinstance(data, dict):
         return ""
-    for name in ("verdict", "message"):
+    for name in ("verdict", "detail", "message"):
         value = data.get(name)
         if isinstance(value, str) and value:
             return f"{name} {value[:MAX_NOTE]!r}"

@@ -92,8 +92,8 @@ launcher accepts the wake but does not resume the session.
 
 **Responses.** No change in the rules: a 2xx is accepted, a 5xx, 429, or network
 error is tried again, and any other status is a refusal. The core logs the
-body's `verdict` or `message`. Notices to the sender (not delivered, queued)
-stay a later step.
+body's `verdict`, `detail`, or `message`. Notices to the sender (not delivered,
+queued) stay a later step.
 
 Protocol: `session` in the body is a minor addition. The wire frames do not
 change.
