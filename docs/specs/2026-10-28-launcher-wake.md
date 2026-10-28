@@ -63,13 +63,16 @@ url = "https://hyperspace.example/v1/wake/claude-code"
 key_file = "/etc/subspace-keys/hyperspace"
 ```
 
-A session can match the account webhook with no handle. Today a session without
-a handle cannot have a message that counts for a wake (channels and DMs need a
-handle), so behavior does not change. The config does not stop a later change
-that lets other events (PR events, callbacks) cause a wake.
+A message wake still needs a session that holds a handle, as today. A session
+whose handle another session took keeps its channel memberships and unread
+messages, so without this rule each old run would resume for every `@here` in
+its channels. The account webhook itself does not depend on a handle, so a later
+change can let other events (PR events, callbacks) wake a session with no
+handle.
 
-**Body.** The wake body gets `session`, the session id. `handle` stays, and is
-`""` if the session has none. A receiver should use `session` to find the agent.
+**Body.** The wake body gets `session`, the session id. `handle` is the
+session's current handle, not the webhook entry's. A receiver should use
+`session` to find the agent.
 
 ```json
 {
@@ -131,19 +134,25 @@ The relay (the notifications plugin) does this, not hyperspace. Hyperspace does
 not read or carry message content, and it has no subspace credential; the relay
 already holds the session's connection and its acks.
 
-- **Hold.** At start, the relay does not send messages as channel notifications
-  (its push flush included) until its SessionStart hook claims them or declines.
-  If no hook contacts it within about 15 s, it stops the hold.
-- **Claim.** The hook sends its session id to the relay process over local IPC
-  (found as the hook finds the relay today), and waits up to about 10 s: the
-  relay sleeps 3 s before it connects, and `whoami` can take 5 s. If the id is
-  not the one that the relay registered (after `/resume` in a running session,
-  the relay started under the earlier session's id), the relay registers it,
-  with a new hold. It then sends `whoami`; the core sends the reply after the
-  items that were pending, or after 5 s. The relay answers the hook with the
-  held messages that pass the session's threshold. Messages below the threshold
-  stay held, as today. The claim takes the messages out of channel delivery, so
-  the two paths cannot both send one message.
+- **Hold.** At start, and at each change of the session that it registers, the
+  relay does not send messages as channel notifications (its push flush
+  included) until its SessionStart hook claims them or declines. If no hook
+  contacts it within about 15 s, it stops the hold. A change of session also
+  discards the local buffers of the earlier session; their messages stay unacked
+  in the core. This applies to the change that a claim makes and to the change
+  that the existing session-id watcher makes.
+- **Claim.** The relay listens on a local socket at a path keyed by the Claude
+  Code process id, which the hook and the relay both find today for the session
+  state file. The hook sends its session id there, and waits up to about 10 s:
+  the relay sleeps 3 s before it connects, and `whoami` can take 5 s. If the id
+  is not the one that the relay registered (after `/resume` in a running
+  session, the relay started under the earlier session's id), the relay
+  registers it. If the watcher already made that change, the claim takes its
+  hold. The relay then sends `whoami`; the core sends the reply after the items
+  that were pending, or after 5 s. The relay answers the hook with the held
+  messages that pass the session's threshold. Messages below the threshold stay
+  held, as today. The claim takes the messages out of channel delivery, so the
+  two paths cannot both send one message.
 - **Output.** The hook returns the messages as `additionalContext`, with a
   header that says that they arrived while the session was stopped. After it has
   written its output, it tells the relay, and the relay acks them. If the IPC
@@ -182,9 +191,9 @@ a running session:
   one request. A burst of messages gives one resume.
 - **Covered messages.** Subspace treats a message as covered after the POST and
   its retries, whatever the response. If no POST is accepted, the next new
-  message gives a new wake; the old ones wait until the session connects for
-  another reason. After an accepted POST, the request stays on the hyperspace
-  server until a new run of the session starts.
+  message gives a new wake after the cooldown; the old ones wait until the
+  session connects for another reason. After an accepted POST, the request stays
+  on the hyperspace server until a new run of the session starts.
 - **Two copies.** The launcher's existing checks (not `live` on the server, not
   running locally) stop a resume that would make a second copy.
 
