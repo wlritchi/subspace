@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Image for the subspace server, which the `notifications` Claude Code plugin's relay
+# Image for the subspace server, which the `subspace` Claude Code plugin's relay
 # connects to (PR monitoring + agent messaging), and for the remote-agent gateway.
 # Both are PEP 723 uv scripts; their deps are baked from the committed locks
 # (server/*.py.lock) into one venv each, so the running pod never reaches PyPI.

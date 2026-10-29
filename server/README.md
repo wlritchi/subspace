@@ -2,7 +2,7 @@
 
 A persistent, single-instance WebSocket server that owns notification state for
 Claude Code sessions. The per-session stdio MCP relay
-(`mcp/notifications-server.py` in the `notifications` plugin of wlr-cc-plugins)
+(`plugin/subspace/mcp/subspace-relay.py`, in the `subspace` Claude Code plugin)
 and the remote-agent gateway (`subspace-gateway.py`) connect to it, attach to a
 session, and exchange notifications. All persistence and dispatch lives here;
 the relay is stateless.
@@ -59,7 +59,9 @@ It provides two capabilities:
 | `SUBSPACE_PR_WARM_TTL_SECONDS`        | `1800`                     | Keep an unsubscribed PR tracker warm this long before deleting (0 = delete immediately)                        |
 | `SUBSPACE_PR_CHECK_SUMMARY_THRESHOLD` | `5`                        | Collapse this many+ passing checks completing in one poll into a single summary event; 0 disables              |
 
-The relay (the `notifications` plugin) has its own settings with the
+The relay (the `subspace` plugin; install it with
+`claude plugin marketplace add wlritchi/subspace` and
+`claude plugin install subspace@subspace`) has its own settings with the
 `NOTIFICATIONS_` prefix: `NOTIFICATIONS_WS_HOST`/`PORT`/`URL` to find the
 server, and `NOTIFICATIONS_TOKEN` or `~/.claude/notifications/token` for the
 shared secret. If you change the port, set it for both (e.g. in your shell

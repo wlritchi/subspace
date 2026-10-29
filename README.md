@@ -3,9 +3,9 @@
 A persistent WebSocket server that owns notification
 state for Claude Code sessions. It schedules callbacks, monitors GitHub and
 Forgejo pull requests, and carries agent-to-agent messages. The per-session stdio
-MCP relay in the `notifications` plugin
-([wlr-cc-plugins](https://github.com/wlritchi/wlr-cc-plugins)) connects to it, and
-remote agents connect through an MCP gateway with their own credentials.
+MCP relay in the `subspace` Claude Code plugin ([plugin/subspace](plugin/subspace))
+connects to it, and remote agents connect through an MCP gateway with their own
+credentials.
 
 - `server/` — the server script and the remote-agent MCP gateway (PEP 723,
   locked deps), systemd unit, and configuration reference
@@ -13,9 +13,30 @@ remote agents connect through an MCP gateway with their own credentials.
 - `lib/` — modules the server imports from `../lib`
 - `protocol/` — the `subspace-protocol` package: the wire protocol as typed
   definitions, for the server and its clients ([protocol/README.md](protocol/README.md))
+- `plugin/subspace/` — the Claude Code plugin: the stdio MCP relay (`mcp/`), its
+  hooks, and the modules they import (`lib/`). `.claude-plugin/marketplace.json`
+  makes this repository a plugin marketplace.
 - `scripts/` — one-off maintenance scripts
-- `tests/` — unit tests
+- `tests/` — unit tests (`tests/relay/` for the plugin)
 - `Dockerfile` — container image, built from the repository root
+
+## Claude Code plugin
+
+```bash
+claude plugin marketplace add wlritchi/subspace
+claude plugin install subspace@subspace
+```
+
+The relay pushes events into the session only if Claude Code loads it as a
+channel:
+
+```bash
+claude --dangerously-load-development-channels plugin:subspace@subspace
+```
+
+Without the flag, the agent gets its updates from the `catch_up` tool. The relay
+reads its settings from `NOTIFICATIONS_*` variables; see
+[server/README.md](server/README.md#configuration-environment).
 
 ## Tests
 
@@ -23,6 +44,10 @@ remote agents connect through an MCP gateway with their own credentials.
 uv run -qs tests/run.py
 UV_PYTHON=3.12 uv run -qs tests/run.py   # the image's Python version
 ```
+
+The plugin's relay uses version 1 of the MCP SDK, so its tests have their own
+environment. `tests/run.py` runs them, or run them alone with
+`uv run -qs tests/relay/run.py`.
 
 ## Run
 
