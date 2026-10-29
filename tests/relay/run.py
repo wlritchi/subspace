@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run -qs
 # vim: filetype=python
-"""Run the relay plugin's unit tests.
+"""Run the relay plugin's tests: unit tests, and end-to-end tests that spawn the
+server and the relay.
 
     uv run -qs tests/relay/run.py            # all relay tests
     uv run -qs tests/relay/run.py -k hold    # filter

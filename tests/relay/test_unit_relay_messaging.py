@@ -146,6 +146,12 @@ def test_invalid_channel_names(bad: str) -> None:
         m.validate_channel_name(bad)
 
 
+def test_channel_name_rejects_trailing_newline() -> None:
+    # `$` matches before a final newline; the server's rule uses `\Z`.
+    with pytest.raises(m.InvalidChannelName):
+        m.validate_channel_name("room\n")
+
+
 @pytest.mark.parametrize("good", ["all", "direct", "urgent"])
 def test_valid_thresholds(good: str) -> None:
     m.validate_threshold(good)  # must not raise

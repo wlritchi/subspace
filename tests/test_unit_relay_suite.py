@@ -1,5 +1,5 @@
 # vim: filetype=python
-"""Run the relay plugin's unit tests (tests/relay/) in their own environment.
+"""Run the relay plugin's tests (tests/relay/) in their own environment.
 
 The relay uses version 1 of the MCP SDK and the gateway uses version 2, so the
 relay tests cannot run in this environment.
@@ -20,6 +20,6 @@ def test_relay_unit_tests() -> None:
         capture_output=True,
         text=True,
         check=False,
-        timeout=600,
+        timeout=1200,
     )
     assert result.returncode == 0, result.stdout + result.stderr

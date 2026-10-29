@@ -28,7 +28,7 @@ THRESHOLD_NAMES = frozenset(_THRESHOLDS)
 
 # Channel names reuse the agent-name rule: lowercase kebab-case, 2-64 chars, no
 # leading/trailing hyphen.
-_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\Z")
 _NAME_MIN = 2
 _NAME_MAX = 64
 
