@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "subspace": {
+      "command": "uv",
+      "args": ["run", "-qs", "${CLAUDE_PLUGIN_ROOT}/mcp/subspace-relay.py"]
+    }
+  }
+}

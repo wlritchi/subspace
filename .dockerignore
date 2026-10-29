@@ -9,6 +9,8 @@ docs/
 # hatchling needs the readme to build the protocol package.
 !protocol/README.md
 .claude/
+.claude-plugin/
+plugin/
 scripts/
 __pycache__/
 **/__pycache__/

@@ -1,0 +1,7 @@
+{
+  "name": "subspace",
+  "description": "Connect each Claude Code session to a subspace server: agent messages, PR updates, and scheduled callbacks arrive as channel events",
+  "author": {
+    "name": "wlritchi"
+  }
+}

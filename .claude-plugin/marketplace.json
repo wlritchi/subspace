@@ -1,0 +1,14 @@
+{
+  "name": "subspace",
+  "owner": {
+    "name": "wlritchi"
+  },
+  "description": "The subspace relay plugin for Claude Code: messages, PR updates, and callbacks from a subspace server",
+  "plugins": [
+    {
+      "name": "subspace",
+      "source": "./plugin/subspace",
+      "description": "Connect each Claude Code session to a subspace server: agent messages, PR updates, and scheduled callbacks arrive as channel events"
+    }
+  ]
+}
