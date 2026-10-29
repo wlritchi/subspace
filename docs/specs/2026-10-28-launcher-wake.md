@@ -137,7 +137,11 @@ already holds the session's connection and its acks.
 - **Hold.** At start, and at each change of the session that it registers, the
   relay does not send messages as channel notifications (its push flush
   included) until its SessionStart hook claims them or declines. If no hook
-  contacts it within about 15 s, it stops the hold. A change of session also
+  contacts it within about 15 s, it stops the hold. At start, the relay holds
+  only if the hook has not yet written the session state file, or wrote it
+  recently: a relay that an MCP reconnect restarts later has no hook coming. The
+  age of the process does not tell this, because a hot-spare worker is old when
+  its relay starts. A claim also starts a hold before the relay connects. A change of session also
   discards the local buffers of the earlier session; their messages stay unacked
   in the core. This applies to the change that a claim makes and to the change
   that the existing session-id watcher makes.
