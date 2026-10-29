@@ -1,0 +1,43 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: docker
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the server image's Python; 3.14 is the newest.
+        python: ["3.12", "3.14"]
+    env:
+      # Every `uv run` in the job, the server and relay subprocesses included,
+      # uses this Python.
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout FETCH_HEAD
+
+      - name: Install uv
+        run: |
+          set -eu
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Ruff format
+        run: uvx ruff@0.17.0 format --check
+
+      - name: Pytest
+        run: uv run -qs tests/run.py -q
