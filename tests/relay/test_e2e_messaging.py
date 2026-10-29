@@ -5,8 +5,6 @@ threshold and arrives as a channel event; a plain fyi is below it and is held
 until B's catch_up drains it."""
 
 import re
-import time
-from collections.abc import Callable
 from itertools import count
 
 import anyio
@@ -28,31 +26,6 @@ async def _join(read, write, ids, channel: str, **extra) -> str:
     )
     assert f"Joined #{channel}" in text
     return text
-
-
-async def _poll_call_until(
-    read,
-    write,
-    ids,
-    tool: str,
-    predicate: Callable[[str], bool],
-    *,
-    arguments: dict | None = None,
-    timeout: float = 20.0,
-    interval: float = 0.2,
-) -> str:
-    """Poll a tool until `predicate` holds on its text, or until `timeout`."""
-    deadline = time.monotonic() + timeout
-    text = ""
-    while True:
-        result, _ = await h.mcp_try_call(read, write, next(ids), tool, arguments or {})
-        if result is not None:
-            text = result
-            if predicate(text):
-                return text
-        if time.monotonic() >= deadline:
-            return text
-        await anyio.sleep(interval)
 
 
 def test_post_surfaces_or_holds_by_threshold(tmp_path):
@@ -210,7 +183,7 @@ def test_mention_surfaces_only_for_mentioned(tmp_path):
                     await h.mcp_await_channel_with(read_c, "look here", timeout=5)
                     is None
                 )
-                drained = await _poll_call_until(
+                drained = await h.poll_call_until(
                     read_c, write_c, ids_c, "catch_up", lambda t: "look here" in t
                 )
                 assert "look here" in drained
@@ -449,7 +422,7 @@ def test_reaction_is_ambient_and_visible_in_status(tmp_path):
                 )
                 assert "👍" in status and "agent-b" in status
 
-                drained = await _poll_call_until(
+                drained = await h.poll_call_until(
                     read_a, write_a, ids_a, "catch_up", lambda t: "reacted" in t
                 )
                 assert "👍" in drained
@@ -495,12 +468,12 @@ def test_message_status_reflects_gating(tmp_path):
                 assert "pending: agent-b" in status
                 assert "agent-a" not in status
 
-                drained = await _poll_call_until(
+                drained = await h.poll_call_until(
                     read_b, write_b, ids_b, "catch_up", lambda t: "fyi thing" in t
                 )
                 assert "fyi thing" in drained
 
-                status = await _poll_call_until(
+                status = await h.poll_call_until(
                     read_a,
                     write_a,
                     ids_a,
@@ -648,7 +621,7 @@ def test_message_status_annotates_offline_recipient(tmp_path):
                     {"to": ["target"], "body": "anyone home?"},
                 )
                 assert "Sent DM to target" in text
-                status = await _poll_call_until(
+                status = await h.poll_call_until(
                     read_s,
                     write_s,
                     ids_s,

@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 
 import anyio
@@ -394,6 +394,32 @@ async def mcp_try_call(
     return resp.result["content"][0]["text"], channels
 
 
+async def poll_call_until(
+    read,
+    write,
+    ids,
+    tool: str,
+    predicate: Callable[[str], bool],
+    *,
+    arguments: dict | None = None,
+    timeout: float = 20.0,
+    interval: float = 0.2,
+) -> str:
+    """Poll a tool until `predicate` holds on its text, or until `timeout`. `ids`
+    is an iterator of request ids. A reply that is late is one more try."""
+    deadline = time.monotonic() + timeout
+    text = ""
+    while True:
+        result, _ = await mcp_try_call(read, write, next(ids), tool, arguments or {})
+        if result is not None:
+            text = result
+            if predicate(text):
+                return text
+        if time.monotonic() >= deadline:
+            return text
+        await anyio.sleep(interval)
+
+
 async def mcp_list_tools(read, write, request_id: int) -> list[str]:
     await mcp_send(
         write,
@@ -423,6 +449,7 @@ __all__ = [
     "mcp_list_tools",
     "mcp_send",
     "mcp_try_call",
+    "poll_call_until",
     "relay_env",
     "relay_params",
     "seed_channel_log",
