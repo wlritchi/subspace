@@ -95,8 +95,14 @@ error is tried again, and any other status is a refusal. The core logs the
 body's `verdict`, `detail`, or `message`. Notices to the sender (not delivered,
 queued) stay a later step.
 
-Protocol: `session` in the body is a minor addition. The wire frames do not
-change.
+**Session on each notify.** Each `notify` frame gets `session_id`: the session
+that the frame is for, in the form that the client registered. A client that
+registers another session on its connection (the relay after `/resume` or
+`/clear`) can then drop a frame for the earlier session that was still in
+transit. That frame stays unacked under its own session.
+
+Protocol: `session` in the wake body and `session_id` on `notify` are minor
+additions.
 
 ## Hyperspace side
 
@@ -137,14 +143,16 @@ already holds the session's connection and its acks.
 - **Hold.** At start, and at each change of the session that it registers, the
   relay does not send messages as channel notifications (its push flush
   included) until its SessionStart hook claims them or declines. If no hook
-  contacts it within about 15 s, it stops the hold. At start, the relay holds
-  only if the hook has not yet written the session state file, or wrote it
-  recently: a relay that an MCP reconnect restarts later has no hook coming. The
-  age of the process does not tell this, because a hot-spare worker is old when
-  its relay starts. A claim also starts a hold before the relay connects. A change of session also
-  discards the local buffers of the earlier session; their messages stay unacked
-  in the core. This applies to the change that a claim makes and to the change
-  that the existing session-id watcher makes.
+  contacts it within about 15 s, it stops the hold. After a change, the relay
+  drops each `notify` whose `session_id` is the earlier session's. At start, the
+  relay holds only if the hook has not yet written the session state file, or
+  wrote it recently: a relay that an MCP reconnect restarts later has no hook
+  coming. The age of the process does not tell this, because a hot-spare worker
+  is old when its relay starts. A claim also starts a hold before the relay
+  connects. A change of session also discards the local buffers of the earlier
+  session; their messages stay unacked in the core. This applies to the change
+  that a claim makes and to the change that the existing session-id watcher
+  makes.
 - **Claim.** The relay listens on a local socket at a path keyed by the Claude
   Code process id, which the hook and the relay both find today for the session
   state file. The hook sends its session id there, and waits up to about 10 s:
