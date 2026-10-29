@@ -470,6 +470,19 @@ async def _send_notify(conn: Connection, key: str, payload: dict) -> bool:
     return await _safe_send(conn, payload)
 
 
+class _SessionChanged(Exception):
+    """The connection attached to another session during a delivery pass."""
+
+
+def _check_attached(conn: Connection, key: str) -> None:
+    """Raise _SessionChanged if the connection no longer has session ``key``.
+    Call it after each send of a delivery pass, before the next change to
+    ``conn.inflight``. The new session can need the same ids, so the old pass
+    must not mark them."""
+    if conn.session_key != key:
+        raise _SessionChanged
+
+
 def _wake(key: str | None) -> None:
     """Nudge the dispatch loops of a session's connections to deliver newly
     available notifications. Setting an asyncio.Event is sync and safe anywhere."""
@@ -658,82 +671,91 @@ async def _dispatch_loop(conn: Connection) -> None:
         key = conn.session_key
         timeout: float | None = None
         account = _scope(key) if key else None
-        if key and account is not None:
-            now = time.time()
-            due = (
-                scheduler.due_callbacks(key, now)
-                if "schedule" in account.permissions
-                else []
-            )
-            for entry in due:
-                callback_id = str(entry.get("id", ""))
-                if callback_id and callback_id not in conn.inflight:
-                    content, meta = _build_callback_notification(entry, key, now)
-                    if not await _send_notify(
-                        conn,
-                        key,
-                        {
-                            "type": proto.NOTIFY,
-                            "id": callback_id,
-                            "content": content,
-                            "meta": meta,
-                        },
+        try:
+            if key and account is not None:
+                now = time.time()
+                due = (
+                    scheduler.due_callbacks(key, now)
+                    if "schedule" in account.permissions
+                    else []
+                )
+                for entry in due:
+                    callback_id = str(entry.get("id", ""))
+                    if callback_id and callback_id not in conn.inflight:
+                        content, meta = _build_callback_notification(entry, key, now)
+                        if not await _send_notify(
+                            conn,
+                            key,
+                            {
+                                "type": proto.NOTIFY,
+                                "id": callback_id,
+                                "content": content,
+                                "meta": meta,
+                            },
+                        ):
+                            return
+                        _check_attached(conn, key)
+                        conn.inflight.add(callback_id)
+                for tracker in list(TRACKERS.values()):
+                    if (
+                        key not in tracker.subscribers
+                        or "pr" not in account.permissions
                     ):
-                        return
-                    conn.inflight.add(callback_id)
-            for tracker in list(TRACKERS.values()):
-                if key not in tracker.subscribers or "pr" not in account.permissions:
-                    continue
-                # If events were dropped from the cache while this subscriber was
-                # away, surface a one-time "history truncated" notice ahead of the
-                # surviving events, so they know to check the PR for what was lost.
-                missed = tracker.missed.get(key, 0)
-                trunc_id = f"trunc:{tracker.storage_key}"
-                if missed > 0 and trunc_id not in conn.inflight:
-                    content = (
-                        f"⚠️ {tracker.key}: {missed} earlier update(s) were dropped "
-                        "from the cache before they reached you (the PR was very "
-                        "active while this session was away). Check the PR directly "
-                        "for anything important."
-                    )
-                    meta = {
-                        "severity": "high",
-                        "kind": "pr_truncated",
-                        "pr": tracker.key,
-                    }
-                    if not await _send_notify(
-                        conn,
-                        key,
-                        {
+                        continue
+                    # If events were dropped from the cache while this subscriber was
+                    # away, surface a one-time "history truncated" notice ahead of the
+                    # surviving events, so they know to check the PR for what was lost.
+                    missed = tracker.missed.get(key, 0)
+                    trunc_id = f"trunc:{tracker.storage_key}"
+                    if missed > 0 and trunc_id not in conn.inflight:
+                        content = (
+                            f"⚠️ {tracker.key}: {missed} earlier update(s) were dropped "
+                            "from the cache before they reached you (the PR was very "
+                            "active while this session was away). Check the PR directly "
+                            "for anything important."
+                        )
+                        meta = {
+                            "severity": "high",
+                            "kind": "pr_truncated",
+                            "pr": tracker.key,
+                        }
+                        if not await _send_notify(
+                            conn,
+                            key,
+                            {
+                                "type": proto.NOTIFY,
+                                "id": trunc_id,
+                                "content": content,
+                                "meta": meta,
+                            },
+                        ):
+                            return
+                        _check_attached(conn, key)
+                        conn.inflight.add(trunc_id)
+                    acked = tracker.acked.get(key, set())
+                    for event in tracker.events:
+                        event_id = event["id"]
+                        if event_id in acked:
+                            continue
+                        nid = f"pr:{tracker.storage_key}:{event_id}"
+                        if nid in conn.inflight:
+                            continue
+                        payload = {
                             "type": proto.NOTIFY,
-                            "id": trunc_id,
-                            "content": content,
-                            "meta": meta,
-                        },
-                    ):
-                        return
-                    conn.inflight.add(trunc_id)
-                acked = tracker.acked.get(key, set())
-                for event in tracker.events:
-                    event_id = event["id"]
-                    if event_id in acked:
-                        continue
-                    nid = f"pr:{tracker.storage_key}:{event_id}"
-                    if nid in conn.inflight:
-                        continue
-                    payload = {
-                        "type": proto.NOTIFY,
-                        "id": nid,
-                        "content": event["content"],
-                        "meta": event["meta"],
-                    }
-                    if not await _send_notify(conn, key, payload):
-                        return
-                    conn.inflight.add(nid)
-            if not await _deliver_messages(conn, key):
-                return
-            if "schedule" in account.permissions:
-                timeout = _next_callback_timeout(key, now)
+                            "id": nid,
+                            "content": event["content"],
+                            "meta": event["meta"],
+                        }
+                        if not await _send_notify(conn, key, payload):
+                            return
+                        _check_attached(conn, key)
+                        conn.inflight.add(nid)
+                if not await _deliver_messages(conn, key):
+                    return
+                if "schedule" in account.permissions:
+                    timeout = _next_callback_timeout(key, now)
+        except _SessionChanged:
+            continue
         conn.delivered.set()
         try:
             await asyncio.wait_for(conn.wake.wait(), timeout)
@@ -1850,7 +1872,8 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
     (compute_level) and `threshold` (the per-topic override or the session's default)
     so the client can make the surface-vs-hold decision. The server never gates — it
     ships eagerly, exactly as the PR path does. Returns False if the send failed (so
-    the dispatch loop tears down), True otherwise."""
+    the dispatch loop tears down), True otherwise. Raises _SessionChanged if the
+    connection attaches to another session during a send."""
     record = SESSIONS.get(key)
     default_threshold = (
         record.default_threshold if record is not None else sessions.DEFAULT_THRESHOLD
@@ -1895,6 +1918,7 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
                 conn.topic_truncations.pop(trunc_id, None)
                 conn.inflight.discard(trunc_id)
                 return False
+            _check_attached(conn, key)
         is_dm = topic.kind == "dm"
         for message in topic.messages:
             if message.id in acked or message.id in conn.inflight:
@@ -1925,6 +1949,7 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
             }
             if not await _send_notify(conn, key, payload):
                 return False
+            _check_attached(conn, key)
             conn.inflight.add(message.id)
     return True
 

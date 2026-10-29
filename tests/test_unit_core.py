@@ -300,6 +300,55 @@ def test_notify_carries_registered_session_id(server, monkeypatch):
     assert [f["session_id"] for f in ws.frames] == ["@runner", "s1"]
 
 
+def test_pass_stops_when_connection_changes_session(server, tmp_path, monkeypatch):
+    import message_topic
+
+    monkeypatch.setenv("SUBSPACE_DATA_DIR", str(tmp_path))
+    registry = sessions.SessionRegistry(tmp_path)
+    old = registry.ensure("bots/one", now=1).key
+    new = registry.ensure("bots/two", now=1).key
+    topic = message_topic.MessageTopic("chan:room", "channel")
+    topic.join(old, now=1)
+    topic.join(new, now=1)
+    first = topic.post("bots/three", now=2, body="first")
+    second = topic.post("bots/three", now=3, body="second")
+    monkeypatch.setattr(server, "SESSIONS", registry, raising=False)
+    monkeypatch.setattr(server, "TOPICS", {topic.key: topic})
+    monkeypatch.setattr(server, "TRACKERS", {})
+    monkeypatch.setattr(
+        server, "_scope", lambda _: accounts.Account(id="bots", channels=None)
+    )
+    conn = server.Connection(None, "bots", "credential")
+    conn.session_key = old
+    sent: list[tuple[str, str, bool]] = []
+
+    async def send(conn, key, payload):
+        sent.append((key, payload["id"], payload["id"] in conn.inflight))
+        if key == old:
+            # A REGISTER for another session completes while this send waits.
+            conn.session_key = new
+            conn.inflight.clear()
+            conn.wake.set()
+        return True
+
+    async def run() -> None:
+        monkeypatch.setattr(server, "_send_notify", send)
+        task = asyncio.create_task(server._dispatch_loop(conn))
+        await asyncio.wait_for(conn.delivered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    # The old pass stops after its first send. The new pass sends both ids.
+    assert sent == [
+        (old, first.id, False),
+        (new, first.id, False),
+        (new, second.id, False),
+    ]
+    assert conn.inflight == {first.id, second.id}
+
+
 @pytest.mark.parametrize("same_pr", [True, False])
 def test_concurrent_subscriptions_keep_one_tracker_and_enforce_quota(
     server, tmp_path, monkeypatch, same_pr
