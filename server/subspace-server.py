@@ -430,6 +430,9 @@ class Connection:
         self.credential_id: str = credential_id
         # The session key this connection is attached to, or None.
         self.session_key: str | None = None
+        # The session id as the client sent it in register, for example
+        # "@<handle>". Each notify carries it.
+        self.session_id: str | None = None
         self.inflight: set[str] = set()  # notification ids sent, awaiting ack
         self.topic_truncations: dict[str, tuple[str, int]] = {}  # id -> (topic, count)
         self.wake = asyncio.Event()  # set to nudge the dispatch loop to deliver now
@@ -450,11 +453,18 @@ async def _safe_send(conn: Connection, payload: dict) -> bool:
         return False
 
 
-async def _send_notify(conn: Connection, payload: dict) -> bool:
-    """Send a NOTIFY frame. While more than one connection is attached to the
-    session, the meta carries the count, so that the client can warn that
-    delivery is split."""
-    count = len(CONNECTIONS.get(conn.session_key or "", ()))
+async def _send_notify(conn: Connection, key: str, payload: dict) -> bool:
+    """Send a NOTIFY frame for the session ``key``. While more than one
+    connection is attached to the session, the meta carries the count, so that
+    the client can warn that delivery is split."""
+    # A frame for a session that the connection left gets the id of that
+    # session, so that the client can drop it.
+    if key == conn.session_key and conn.session_id:
+        session_id = conn.session_id
+    else:
+        session_id = sessions.split_key(key)[1]
+    payload = {**payload, "session_id": session_id}
+    count = len(CONNECTIONS.get(key, ()))
     if count > 1:
         payload = {**payload, "meta": {**payload["meta"], "connections": count}}
     return await _safe_send(conn, payload)
@@ -548,12 +558,14 @@ async def _announce_connections(key: str) -> None:
         },
     }
     for conn in conns:
-        await _safe_send(conn, payload)
+        await _send_notify(conn, key, payload)
 
 
-async def _attach(conn: Connection, key: str) -> None:
-    """Attach a connection to a session, and detach it from its previous one."""
+async def _attach(conn: Connection, key: str, session_id: str) -> None:
+    """Attach a connection to a session, and detach it from its previous one.
+    ``session_id`` is the id as the client sent it."""
     if conn.session_key == key:
+        conn.session_id = session_id
         return
     _ensure_session(conn, key)
     await _detach(conn)
@@ -561,6 +573,7 @@ async def _attach(conn: Connection, key: str) -> None:
     conns = CONNECTIONS.setdefault(key, [])
     conns.append(conn)
     conn.session_key = key
+    conn.session_id = session_id
     conn.inflight.clear()
     conn.topic_truncations.clear()
     conn.delivered.clear()
@@ -582,6 +595,7 @@ async def _detach(conn: Connection) -> None:
     if key is None:
         return
     conn.session_key = None
+    conn.session_id = None
     conns = CONNECTIONS.get(key, [])
     if conn in conns:
         conns.remove(conn)
@@ -657,6 +671,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                     content, meta = _build_callback_notification(entry, key, now)
                     if not await _send_notify(
                         conn,
+                        key,
                         {
                             "type": proto.NOTIFY,
                             "id": callback_id,
@@ -688,6 +703,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                     }
                     if not await _send_notify(
                         conn,
+                        key,
                         {
                             "type": proto.NOTIFY,
                             "id": trunc_id,
@@ -711,7 +727,7 @@ async def _dispatch_loop(conn: Connection) -> None:
                         "content": event["content"],
                         "meta": event["meta"],
                     }
-                    if not await _send_notify(conn, payload):
+                    if not await _send_notify(conn, key, payload):
                         return
                     conn.inflight.add(nid)
             if not await _deliver_messages(conn, key):
@@ -963,10 +979,10 @@ async def _handle_register(conn: Connection, msg: dict) -> None:
     if handle and SESSIONS.get(key) is None:
         holder = SESSIONS.by_handle(conn.account_id, handle)
         if holder is not None:
-            await _attach(conn, holder.key)
+            await _attach(conn, holder.key, session_id)
             return
     existed = SESSIONS.get(key) is not None
-    await _attach(conn, key)
+    await _attach(conn, key, session_id)
     # Only a new session takes the handle. An existing one keeps whatever handle
     # it has now, so a reconnect does not undo a rename or an unregister.
     if handle and not existed and SESSIONS.by_handle(conn.account_id, handle) is None:
@@ -1395,7 +1411,7 @@ async def _send_handle_lost(key: str, handle: str, account_id: str) -> None:
         },
     }
     for conn in CONNECTIONS.get(key, ()):
-        await _send_notify(conn, payload)
+        await _send_notify(conn, key, payload)
 
 
 async def _handle_unregister_agent(websocket, conn: Connection, msg: dict) -> None:
@@ -1859,6 +1875,7 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
             conn.inflight.add(trunc_id)
             if not await _send_notify(
                 conn,
+                key,
                 {
                     "type": proto.NOTIFY,
                     "id": trunc_id,
@@ -1906,7 +1923,7 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
                 "content": _render_message(topic, message, addressed, reader_account),
                 "meta": meta,
             }
-            if not await _send_notify(conn, payload):
+            if not await _send_notify(conn, key, payload):
                 return False
             conn.inflight.add(message.id)
     return True

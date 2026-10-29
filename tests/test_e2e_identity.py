@@ -334,6 +334,34 @@ def test_multiple_connections_warning(srv: Server) -> None:
     asyncio.run(scenario())
 
 
+def test_notify_carries_session_id(srv: Server) -> None:
+    async def scenario() -> None:
+        alice = await _agent(srv, "ns-s1", "ns-alice")
+        sender = await _agent(srv, "ns-s3", "ns-sender")
+        await sender.request({"type": proto.DM, "to": ["ns-alice"], "body": "one"})
+        frame = await alice.notify_of_kind("message")
+        assert frame["session_id"] == "ns-s1"
+        await alice.register("ns-s2")
+        reply = await alice.request({"type": proto.REGISTER_AGENT, "name": "ns-bob"})
+        assert reply["type"] == proto.AGENT_OK, reply
+        await sender.request({"type": proto.DM, "to": ["ns-bob"], "body": "two"})
+        frame = await alice.notify_of_kind("message")
+        assert frame["session_id"] == "ns-s2"
+        assert "two" in frame["content"]
+        # A connection that registers a handle gets the id that it sent.
+        other = await srv.local()
+        await other.register("@ns-bob")
+        frame = await other.notify_of_kind("multiple_connections")
+        assert frame["session_id"] == "@ns-bob"
+        frame = await alice.notify_of_kind("multiple_connections")
+        assert frame["session_id"] == "ns-s2"
+        await other.close()
+        await alice.close()
+        await sender.close()
+
+    asyncio.run(scenario())
+
+
 def test_unregister_leaves_topics(srv: Server) -> None:
     async def scenario() -> None:
         alice = await _agent(srv, "ur-s1", "ur-alice")

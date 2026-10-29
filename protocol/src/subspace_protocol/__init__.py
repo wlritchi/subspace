@@ -646,12 +646,19 @@ ClientFrame = (
 
 
 class Notify(TypedDict):
-    """Show ``content`` to the agent, then send ``ack`` with ``id``."""
+    """Show ``content`` to the agent, then send ``ack`` with ``id``.
+
+    ``session_id`` is the session that the frame is for, in the form that the
+    connection sent in ``register``.
+    """
 
     type: Literal["notify"]
     id: str
     content: str
     meta: Annotated[NotifyMeta, Open]
+    # A client that changes session on one connection can drop frames for the
+    # earlier session.
+    session_id: NotRequired[str]
 
 
 class Scheduled(TypedDict):

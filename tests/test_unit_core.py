@@ -4,6 +4,7 @@ server's warm-retention reaper."""
 
 import asyncio
 import importlib.util
+import json
 from types import ModuleType
 
 import accounts
@@ -234,7 +235,7 @@ def test_topic_truncation_delivered_once_until_ack_and_persisted(
     conn.session_key = key
     sent = []
 
-    async def send(conn, payload):
+    async def send(conn, key, payload):
         sent.append(payload)
         return True
 
@@ -277,6 +278,26 @@ def test_topic_truncation_delivered_once_until_ack_and_persisted(
     count = len(sent)
     asyncio.run(server._deliver_messages(conn, key))
     assert len(sent) == count
+
+
+def test_notify_carries_registered_session_id(server, monkeypatch):
+    class Ws:
+        def __init__(self) -> None:
+            self.frames: list[dict] = []
+
+        async def send(self, raw: str) -> None:
+            self.frames.append(json.loads(raw))
+
+    ws = Ws()
+    conn = server.Connection(ws, "bots", "credential")
+    conn.session_key = "bots/s2"
+    conn.session_id = "@runner"
+    monkeypatch.setattr(server, "CONNECTIONS", {"bots/s2": [conn]})
+    payload = {"type": "notify", "id": "n", "content": "c", "meta": {}}
+    asyncio.run(server._send_notify(conn, "bots/s2", payload))
+    # A frame for a session that the connection left gets that session's id.
+    asyncio.run(server._send_notify(conn, "bots/s1", payload))
+    assert [f["session_id"] for f in ws.frames] == ["@runner", "s1"]
 
 
 @pytest.mark.parametrize("same_pr", [True, False])
