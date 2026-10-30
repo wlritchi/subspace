@@ -65,8 +65,20 @@ else is a patch), pushes the tag, and then builds and pushes the image. Before
 leave 0.x. To merge without a release, put `[skip release]` in the merge commit
 message.
 
+Only commits that change the image's inputs (`Dockerfile`, `protocol/`,
+`server/`, `lib/`) count. A merge that changes only the plugin, the tests or the
+docs releases nothing.
+
 To build a release again, run the workflow by hand on the release tag, or push
 an `X.Y.Z` tag yourself.
+
+The plugin has no releases. Installs track `main` and take its commit as their
+version, so a plugin change reaches agents when it merges, which can be before
+the server it needs is deployed. A plugin change must therefore work with the
+server release that is deployed now: when the relay starts to use a new frame or
+field, it must also work when the server does not send it. Break compatibility
+only for a strong reason, such as a security fix, and then deploy the server
+before you merge the plugin change.
 
 The `subspace-protocol` package has its own `protocol-v*` tags, which do not
 trigger an image build. When a merge to `main` changes the package, CI runs

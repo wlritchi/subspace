@@ -10,6 +10,10 @@ repo). The relay keeps its own copy of the names it uses, so that it has no
 dependency on that package at run time. tests/test_unit_relay_protocol.py checks
 that the two agree.
 
+The plugin tracks main and can reach agents before the server it needs is
+deployed. A new frame or field must be optional here: the relay must also work
+with an older server that does not send it. See "Releases" in README.md.
+
 stdlib only.
 """
 

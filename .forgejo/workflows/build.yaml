@@ -4,6 +4,8 @@ name: Build and push image
 #   last X.Y.Z tag, push an annotated [auto-release] tag, then build and push
 #   the image. If two runs compute the same version, the second tag push fails
 #   and that run stops. Put [skip release] in the merge commit to opt out.
+#   Only commits that change the image's inputs (IMAGE_PATHS) count, so a push
+#   that changes only the plugin, tests or docs releases nothing.
 # - Push of a numeric tag: build that tag. Tags made by auto-release are
 #   skipped, because the main run that made them builds them.
 # - workflow_dispatch: rebuild the release tag at the selected ref, e.g. after
@@ -32,6 +34,8 @@ jobs:
       REGISTRY: ${{ vars.REGISTRY }}
       IMAGE: ${{ vars.REGISTRY }}/${{ github.repository }}
       RELEASE_EMAIL: ${{ vars.RELEASE_EMAIL || 'auto-release@users.noreply.invalid' }}
+      # The files the Dockerfile copies, as git pathspecs. Keep in sync with it.
+      IMAGE_PATHS: Dockerfile protocol server lib :(exclude)*.md
 
     steps:
       - name: Checkout
@@ -82,10 +86,11 @@ jobs:
             # Only tags on main's history count toward the next version.
             LAST="$(git tag -l --merged HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
             if [ -n "${LAST}" ]; then RANGE="${LAST}..HEAD"; else LAST=0.0.0; RANGE=HEAD; fi
-            SUBJECTS="$(git log --format=%s ${RANGE})"
-            BODIES="$(git log --format=%B ${RANGE})"
+            # IMAGE_PATHS is unquoted on purpose: it splits into pathspecs.
+            SUBJECTS="$(git log --format=%s ${RANGE} -- ${IMAGE_PATHS})"
+            BODIES="$(git log --format=%B ${RANGE} -- ${IMAGE_PATHS})"
             if [ -z "${SUBJECTS}" ]; then
-              echo "No commits since ${LAST}; nothing to release."
+              echo "No commits since ${LAST} change the image; nothing to release."
               echo 1 > /tmp/skip
               exit 0
             fi
