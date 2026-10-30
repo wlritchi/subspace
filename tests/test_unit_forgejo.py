@@ -133,6 +133,17 @@ class TestSnapshotMapping:
         snap = fj(pr=_pr(requested_reviewers=[{"login": "bob"}, {"login": "amy"}]))
         assert snap["requested_reviewers"] == ["amy", "bob"]
 
+    def test_summary_counts_commit_statuses(self):
+        snap = fj(
+            statuses=[
+                {"context": "build", "status": "success"},
+                {"context": "lint", "status": "failure"},
+                {"context": "deploy", "status": "error"},
+                {"context": "validate", "status": "pending"},
+            ]
+        )
+        assert "checks 1 pass / 2 fail / 1 pending" in pm.summarize(snap)
+
     def test_review_state_normalization(self):
         reviews = [
             {

@@ -685,9 +685,18 @@ def summarize(snap: dict | None) -> str:
     if not snap:
         return "unknown"
     checks = snap["check_runs"].values()
-    passed = sum(1 for c in checks if c.get("conclusion") == "success")
-    failed = sum(1 for c in checks if c.get("conclusion") in _FAILED_CONCLUSIONS)
-    pending = sum(1 for c in checks if c.get("status") != "completed")
+    # Forgejo reports CI only as commit statuses, so a count of check runs alone
+    # always reads 0/0/0 there.
+    statuses = (snap.get("statuses") or {}).values()
+    passed = sum(1 for c in checks if c.get("conclusion") == "success") + sum(
+        1 for s in statuses if s.get("state") == "success"
+    )
+    failed = sum(1 for c in checks if c.get("conclusion") in _FAILED_CONCLUSIONS) + sum(
+        1 for s in statuses if s.get("state") in ("failure", "error")
+    )
+    pending = sum(1 for c in checks if c.get("status") != "completed") + sum(
+        1 for s in statuses if s.get("state") == "pending"
+    )
     parts = [snap.get("state") or "?"]
     if snap.get("merged"):
         parts.append("merged")
