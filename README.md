@@ -72,9 +72,13 @@ docs releases nothing.
 To build a release again, run the workflow by hand on the release tag, or push
 an `X.Y.Z` tag yourself.
 
-The plugin has no releases. Installs track `main` and take its commit as their
-version, so a plugin change reaches agents when it merges, which can be before
-the server it needs is deployed. A plugin change must therefore work with the
+The plugin has its own `plugin-v*` tags, which do not trigger an image build.
+When a merge to `main` changes `plugin/`, CI pushes the next one, with the bump
+taken from the subjects of the commits that touch `plugin/`. The tag is the
+whole release. An image that bakes the plugin can pin a tag. Marketplace
+installs still track `main` and take its commit as their version, so a plugin
+change reaches agents when it merges, which can be before the server it needs
+is deployed. A plugin change must therefore work with the
 server release that is deployed now: when the relay starts to use a new frame or
 field, it must also work when the server does not send it. Break compatibility
 only for a strong reason, such as a security fix, and then deploy the server

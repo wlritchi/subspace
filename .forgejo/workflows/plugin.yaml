@@ -1,0 +1,91 @@
+name: Tag plugin release
+
+# On a push to main that changes the plugin, push the next plugin-v<version>
+# tag. The bump comes from the Conventional Commits subjects since the last
+# tag, counting only commits that touch plugin/: `feat` is minor, `!` or
+# BREAKING CHANGE is major, anything else is a patch. The tag is the whole
+# release; nothing is built. [skip release] in the merge commit opts out. The
+# first tag is pushed by hand.
+#
+# Repository variable RELEASE_EMAIL (optional) sets the tagger email of
+# release tags.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'plugin/**'
+
+jobs:
+  tag:
+    runs-on: docker
+    timeout-minutes: 30
+    env:
+      RELEASE_EMAIL: ${{ vars.RELEASE_EMAIL || 'auto-release@users.noreply.invalid' }}
+
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          # The tag push at the end uses this header too.
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
+          # Tag the commit that triggered this run, not the current branch tip
+          # (the branch can advance while the run is queued). Fetch it by id if
+          # the fetch above did not bring it.
+          git cat-file -e "${GITHUB_SHA}^{commit}" 2>/dev/null \
+            || git fetch origin "${GITHUB_SHA}"
+          git checkout --detach "${GITHUB_SHA}"
+
+      - name: Tag
+        run: |
+          set -eu
+          if git log -1 --format=%B | grep -qi '\[skip release\]'; then
+            echo "[skip release] in HEAD commit; not tagging."
+            exit 0
+          fi
+          LAST="$(git tag -l --merged HEAD 'plugin-v*' | sed 's/^plugin-v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+          if [ -z "${LAST}" ]; then
+            echo "No plugin-v<version> tag yet. Push the first one by hand."
+            exit 0
+          fi
+          if git diff --quiet "plugin-v${LAST}" HEAD -- plugin; then
+            echo "No plugin changes since plugin-v${LAST}."
+            exit 0
+          fi
+
+          RANGE="plugin-v${LAST}..HEAD"
+          BUMP=patch
+          if git log --format=%s "${RANGE}" -- plugin/ | grep -qE '^feat(\([^)]*\))?!?:'; then
+            BUMP=minor
+          fi
+          if git log --format=%s "${RANGE}" -- plugin/ | grep -qE '^[a-z]+(\([^)]*\))?!:' \
+              || git log --format=%B "${RANGE}" -- plugin/ | grep -q '^BREAKING CHANGE'; then
+            BUMP=major
+          fi
+
+          MAJOR="${LAST%%.*}"; REST="${LAST#*.}"; MINOR="${REST%%.*}"; PATCH="${LAST##*.}"
+          case "${BUMP}" in
+            major) VERSION="$((MAJOR + 1)).0.0" ;;
+            minor) VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+            patch) VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+          esac
+          TAG="plugin-v${VERSION}"
+          echo "Plugin release: ${LAST} -> ${VERSION} (${BUMP})"
+
+          git config user.name "auto-release"
+          git config user.email "${RELEASE_EMAIL}"
+          {
+            printf '[auto-release] %s\n\n' "${TAG}"
+            git log --format='- %s' "${RANGE}" -- plugin/
+          } > /tmp/message
+          git tag -a "${TAG}" -F /tmp/message
+          # Fails if another run already pushed this version.
+          git push origin "refs/tags/${TAG}"
+          echo "Pushed tag ${TAG}"
