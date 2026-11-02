@@ -80,9 +80,12 @@ same value.
 See `docs/specs/2026-10-10-identity.md` for the design.
 
 - **Account.** The token that a client connects with selects an account. The
-  master token always selects the default account, which has every permission
-  and every channel unless the accounts file defines it. Every other account is
-  defined in the accounts file.
+  master token always selects the default account, which has every permission,
+  every channel, `max_severity = "high"`, and no limits. An entry for it in the
+  accounts file keeps these values for each key that it omits, so an entry can
+  add a webhook or a credential without restricting the account. Every other
+  account is defined in the accounts file, and omitted keys get the defaults
+  shown below.
 - **Session.** A client attaches to a session in its account with a session id
   that it supplies. All state (channel memberships, unread messages, PR
   subscriptions, callbacks) belongs to the session.

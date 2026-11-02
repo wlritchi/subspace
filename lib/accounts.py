@@ -17,7 +17,7 @@ import secrets
 import sys
 import tomllib
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -213,9 +213,9 @@ def _check_keys(table: dict, allowed: set[str], where: str) -> None:
         raise AccountsError(f"{where}: unknown keys {sorted(unknown)}")
 
 
-def _parse_limits(raw: object, where: str) -> Limits:
+def _parse_limits(raw: object, where: str, base: Limits) -> Limits:
     if raw is None:
-        return Limits()
+        return base
     if not isinstance(raw, dict):
         raise AccountsError(f"{where}: limits must be a table")
     _check_keys(raw, set(_LIMIT_KEYS), f"{where}.limits")
@@ -224,7 +224,7 @@ def _parse_limits(raw: object, where: str) -> Limits:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise AccountsError(f"{where}.limits.{key} must be an integer >= 0")
         values[key] = value
-    return Limits(**values)
+    return replace(base, **values)
 
 
 def _parse_credential(raw: object, where: str) -> Credential:
@@ -300,7 +300,7 @@ def _parse_webhook(raw: object, where: str) -> Webhook:
     )
 
 
-def _parse_account(raw: object, index: int) -> Account:
+def _parse_account(raw: object, index: int, default_id: str) -> Account:
     where = f"account[{index}]"
     if not isinstance(raw, dict):
         raise AccountsError(f"{where} must be a table")
@@ -323,6 +323,13 @@ def _parse_account(raw: object, index: int) -> Account:
         raise AccountsError(f"{where}: id is required")
     validate_account_id(account_id)
     where = f"account {account_id!r}"
+    # Keys that the default account's entry omits keep the built-in values, so
+    # that an entry which only adds a webhook or a credential restricts nothing.
+    base = (
+        builtin_default(account_id)
+        if account_id == default_id
+        else Account(id=account_id)
+    )
     label = raw.get("label", "")
     if not isinstance(label, str):
         raise AccountsError(f"{where}: label must be a string")
@@ -337,7 +344,7 @@ def _parse_account(raw: object, index: int) -> Account:
                 "ending in '*'"
             )
         channels = tuple(patterns)
-    permissions = raw.get("permissions", sorted(DEFAULT_PERMISSIONS))
+    permissions = raw.get("permissions", sorted(base.permissions))
     if (
         not isinstance(permissions, list)
         or not all(isinstance(p, str) for p in permissions)
@@ -346,7 +353,7 @@ def _parse_account(raw: object, index: int) -> Account:
         raise AccountsError(
             f"{where}: permissions must be a list of {sorted(PERMISSIONS)}"
         )
-    max_severity = raw.get("max_severity", "normal")
+    max_severity = raw.get("max_severity", base.max_severity)
     if not isinstance(max_severity, str) or max_severity not in _SEVERITY_ORDER:
         raise AccountsError(
             f"{where}: max_severity must be one of {list(_SEVERITY_ORDER)}"
@@ -371,7 +378,7 @@ def _parse_account(raw: object, index: int) -> Account:
         channels=channels,
         permissions=frozenset(permissions),
         max_severity=max_severity,
-        limits=_parse_limits(raw.get("limits"), where),
+        limits=_parse_limits(raw.get("limits"), where, base.limits),
         credentials=tuple(
             _parse_credential(c, f"{where} credential[{i}]")
             for i, c in enumerate(credentials)
@@ -393,7 +400,7 @@ def parse(text: str, default_id: str) -> dict[str, Account]:
     accounts: dict[str, Account] = {}
     credential_ids: set[str] = set()
     for i, raw in enumerate(raw_accounts):
-        account = _parse_account(raw, i)
+        account = _parse_account(raw, i, default_id)
         if account.id in accounts:
             raise AccountsError(f"account {account.id!r} is defined twice")
         for credential in account.credentials:

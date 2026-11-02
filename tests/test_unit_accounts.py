@@ -83,6 +83,30 @@ def test_file_can_redefine_default_account(tmp_path: Path) -> None:
     assert store.authenticate(f"Bearer {MASTER}", 0.0) == ("home", "master")
 
 
+def test_default_account_entry_keeps_builtin_values(tmp_path: Path) -> None:
+    path = tmp_path / "accounts.toml"
+    _write(
+        path,
+        '[[account]]\nid = "default"\n'
+        "[account.limits]\nsessions = 50\n"
+        '[[account.webhook]]\nurl = "https://hooks.example.com/wake"\n',
+    )
+    store = a.AccountStore(path, MASTER, "default")
+    default = store.get("default")
+    assert default.permissions == a.PERMISSIONS
+    assert default.channels is None
+    assert default.max_severity == "high"
+    # A limit that the entry sets applies; the others stay unlimited.
+    assert default.limits == a.Limits(
+        sessions=50,
+        posts_per_minute=None,
+        channels=None,
+        pr_subscriptions=None,
+        callbacks=None,
+    )
+    assert default.webhook("anyone") is not None
+
+
 def test_expired_credential(tmp_path: Path) -> None:
     parts = a.new_token()
     path = tmp_path / "accounts.toml"
