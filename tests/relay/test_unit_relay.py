@@ -758,6 +758,29 @@ def test_wait_connected_does_not_nudge_when_already_connected(relay):
     assert not client._reconnect_now.is_set()
 
 
+@pytest.mark.parametrize(
+    ("error", "expected", "absent"),
+    [
+        (TimeoutError(), "did not answer in time", "Start it"),
+        (ConnectionError(), "not reachable", "did not answer"),
+    ],
+)
+def test_request_failure_messages(relay, monkeypatch, error, expected, absent):
+    """A slow server must not read as a dead one: only a connection failure
+    tells the agent to start the server."""
+
+    async def connected(timeout: float = 8.0) -> bool:
+        return True
+
+    async def failing(payload: dict, *, timeout: float = 10.0) -> dict:
+        raise error
+
+    monkeypatch.setattr(relay.DAEMON, "wait_connected", connected)
+    monkeypatch.setattr(relay.DAEMON, "request", failing)
+    text = anyio.run(relay._daemon_request, {"type": "list_agents"})
+    assert expected in text and absent not in text
+
+
 def test_run_survives_reconnect_exception_group(relay, monkeypatch):
     """Regression (side-door daemon-roll crash): an abnormal WS close bubbles out of
     _connect_once's task group as an anyio ExceptionGroup, which is neither an OSError

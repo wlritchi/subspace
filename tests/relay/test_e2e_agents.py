@@ -225,6 +225,35 @@ def test_unregister_removes_from_directory(tmp_path):
         anyio.run(scenario)
 
 
+def test_takeover_moves_a_name_from_an_online_session(tmp_path):
+    """Without takeover, a name held by an online session is refused; with it,
+    a successor gets the name at once."""
+    with h.core(tmp_path) as stack:
+
+        async def scenario():
+            async with stack.session("sid-old") as (read_a, write_a):
+                text, _ = await h.mcp_call(
+                    read_a, write_a, 2, "register_agent", {"name": "worker"}
+                )
+                assert "Registered as 'worker'" in text
+
+                async with stack.session("sid-new") as (read_b, write_b):
+                    text, _ = await h.mcp_call(
+                        read_b, write_b, 2, "register_agent", {"name": "worker"}
+                    )
+                    assert "already taken" in text
+                    text, _ = await h.mcp_call(
+                        read_b,
+                        write_b,
+                        3,
+                        "register_agent",
+                        {"name": "worker", "takeover": True},
+                    )
+                    assert "Registered as 'worker'" in text
+
+        anyio.run(scenario)
+
+
 def test_superseded_session_told_to_stand_down(tmp_path):
     """The relay keeps (name, session_id) in its identity file on registration.
     When a later register fails with 'already taken' and the file shows that

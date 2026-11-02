@@ -1046,6 +1046,15 @@ def _daemon_unreachable_message() -> str:
     )
 
 
+def _daemon_timeout_message() -> str:
+    # A timeout is not a connection failure: the connection is up and the server
+    # is slow. Advice to start or restart it would make a slow server worse.
+    return (
+        "The subspace server is connected but did not answer in time. Try again "
+        "shortly. Do not restart the server for this."
+    )
+
+
 @mcp.tool()
 async def catch_up() -> str:
     """Retrieve and acknowledge pending notifications and quiet agent messages.
@@ -1096,7 +1105,9 @@ async def schedule_test_notification(delay_seconds: int = 300) -> str:
                 "kind": "scheduled_test",
             }
         )
-    except (ConnectionError, TimeoutError):
+    except TimeoutError:
+        return _daemon_timeout_message()
+    except ConnectionError:
         return _daemon_unreachable_message()
     if reply.get("type") == wsproto.ERROR:
         return f"Server rejected the schedule request: {reply.get('error')}"
@@ -1117,7 +1128,9 @@ async def list_scheduled_notifications() -> str:
         return _daemon_unreachable_message()
     try:
         reply = await DAEMON.request({"type": wsproto.LIST, "session_id": session_id})
-    except (ConnectionError, TimeoutError):
+    except TimeoutError:
+        return _daemon_timeout_message()
+    except ConnectionError:
         return _daemon_unreachable_message()
     items = reply.get("items", [])
     if not items:
@@ -1142,7 +1155,9 @@ async def _daemon_request(
         return _daemon_unreachable_message()
     try:
         return await DAEMON.request(payload, timeout=timeout)
-    except (ConnectionError, TimeoutError):
+    except TimeoutError:
+        return _daemon_timeout_message()
+    except ConnectionError:
         return _daemon_unreachable_message()
 
 
@@ -1672,6 +1687,7 @@ async def register_agent(
     description: str = "",
     capabilities: str = "",
     default_threshold: str | None = None,
+    takeover: bool = False,
 ) -> str:
     """Register this session in the shared agent directory under a self-chosen name.
 
@@ -1682,7 +1698,8 @@ async def register_agent(
 
     Re-registering with the same name updates your profile in place. Registering a
     different name renames you, releasing the old one. A name held by another
-    session is rejected, unless that session has been offline for long enough.
+    session is rejected, unless that session has been offline for long enough or
+    you pass takeover.
 
     Args:
         name: your directory name (lowercase kebab-case, 2-64 chars).
@@ -1691,6 +1708,9 @@ async def register_agent(
         default_threshold: optional wake threshold ('all', 'direct', or 'urgent').
             Leave unset to keep your current setting (brand-new agents default to
             'direct'). See set_availability for what each level means.
+        takeover: take the name from the session that holds it, even if that
+            session is online. Use it only when you are that session's successor
+            (a handoff). The other session keeps its own messages and state.
     """
     session_id, _ = session_state.effective_session_id()
     if not session_id:
@@ -1707,6 +1727,8 @@ async def register_agent(
     # set earlier via set_availability just by re-registering.
     if default_threshold is not None:
         payload["default_threshold"] = default_threshold
+    if takeover:
+        payload["takeover"] = True
     reply = await _daemon_request(payload)
     if isinstance(reply, str):
         return reply
