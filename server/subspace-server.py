@@ -1508,19 +1508,20 @@ def _webhook_for(key: str) -> tuple[accounts.Account, accounts.Webhook] | None:
 def _message_wake_target(
     key: str,
 ) -> tuple[accounts.Account, accounts.Webhook] | None:
-    """The webhook for a message wake: as _webhook_for, but only for a session
-    that holds a handle. A session that lost its handle keeps its channels and
-    unread messages; without this rule, each old run would wake for each
-    @here."""
-    record = SESSIONS.get(key)
-    if record is None or not record.handle:
-        return None
+    """The webhook for a message wake: as _webhook_for. A session with no handle
+    wakes only for DMs (see _wake_items)."""
     return _webhook_for(key)
 
 
 def _wake_items(key: str, after: int) -> list[tuple[int, dict]]:
     """Unacked messages for the session at or above its threshold, with an
-    ordinal above ``after``: (ordinal, description) pairs, oldest first."""
+    ordinal above ``after``: (ordinal, description) pairs, oldest first.
+
+    A session with no handle gets only DM messages. A session that lost its
+    handle keeps its channels and unread messages; without this rule, each old
+    run would wake for each @here. It keeps its DM threads too, but a new
+    message reaches an old thread only when a sender addresses the session by
+    its id."""
     record = SESSIONS.get(key)
     if record is None:
         return []
@@ -1529,6 +1530,8 @@ def _wake_items(key: str, after: int) -> list[tuple[int, dict]]:
     found: list[tuple[int, dict]] = []
     for topic in TOPICS.values():
         if key not in topic.members or not _topic_in_scope(scope, topic):
+            continue
+        if not record.handle and topic.kind != "dm":
             continue
         acked = topic.acked.get(key, set())
         threshold = messaging.effective_threshold(
@@ -1644,7 +1647,7 @@ async def _send_wake(
         session_id = sessions.split_key(key)[1]
         # The URL can hold a secret: log only its host.
         where = (
-            f"{record.handle}@{account.id} (session {session_id}, "
+            f"{record.handle or '(no handle)'}@{account.id} (session {session_id}, "
             f"{httpx.URL(webhook.url).host})"
         )
         if delay:
@@ -1706,16 +1709,13 @@ async def _resolve_sender(
     websocket, conn: Connection, msg: dict
 ) -> tuple[str | None, sessions.SessionRecord | None]:
     """Resolve (session key, record) for a messaging request, or (None, None)
-    after sending an ERROR. A messaging request needs a handle: other sessions see
-    it as the sender."""
+    after sending an ERROR. A session with no handle can send: other sessions see
+    it as ``session:<id>``."""
     key = _session_key_for(conn, msg)
     if not key:
         await _send(websocket, proto.ERROR, msg, error="no session id")
         return None, None
-    record = SESSIONS.get(key)
-    if record is None or not record.handle:
-        await _send(websocket, proto.ERROR, msg, error="register_agent first")
-        return None, None
+    record = SESSIONS.get(key) or SESSIONS.ensure(key, time.time())
     return key, record
 
 
@@ -1728,30 +1728,76 @@ def _resolve_handle(ref: str, own_account: str) -> sessions.SessionRecord | None
     return SESSIONS.by_handle(account, handle)
 
 
+def _resolve_recipient(conn: Connection, ref: str) -> sessions.SessionRecord | None:
+    """The session that ``ref`` names: ``session:<id>`` in the caller's account,
+    else a handle. A session id that the server has not seen gets a record, so
+    that the message waits for the session. None if ``ref`` names no session.
+    Raises RequestError if the account is at its sessions limit."""
+    try:
+        key = sessions.parse_session_ref(ref, conn.account_id)
+    except sessions.SessionError:
+        return None
+    if key is None:
+        return _resolve_handle(ref, conn.account_id)
+    _ensure_session(conn, key)
+    return SESSIONS.get(key)
+
+
+def _mention_key(conn: Connection, ref: str) -> str:
+    """The session key for a mention, or ``ref`` unchanged if it names no
+    session. A mention does not make a session record."""
+    try:
+        key = sessions.parse_session_ref(ref, conn.account_id)
+    except sessions.SessionError:
+        return ref
+    if key is not None:
+        return key
+    target = _resolve_handle(ref, conn.account_id)
+    return target.key if target is not None else ref
+
+
 def _qualified(record: sessions.SessionRecord) -> str:
-    return f"{record.handle}@{record.account}"
+    name = record.handle or sessions.session_ref(record.session_id)
+    return f"{name}@{record.account}"
+
+
+def _unnamed_display(key: str, reader_account: str) -> str:
+    """A session with no handle as a reader sees it: ``session:<id>`` in its own
+    account, which a reader can address, else ``(unnamed@<account>)``."""
+    account, session_id = sessions.split_key(key)
+    if account == reader_account:
+        return sessions.session_ref(session_id)
+    return f"(unnamed@{account})"
 
 
 def _member_display(key: str, reader_account: str) -> str:
-    """How a topic member appears to a reader: its handle, or a placeholder for a
-    session that holds none."""
+    """How a topic member appears to a reader: its handle, else as
+    _unnamed_display."""
     record = SESSIONS.get(key)
     if record is not None and record.handle:
         return sessions.display_handle(record, reader_account)
-    account, session_id = sessions.split_key(key)
-    if account == reader_account:
-        return f"(session {session_id})"
-    return f"(unnamed@{account})"
+    return _unnamed_display(key, reader_account)
 
 
 def _sender_display(message: message_topic.Message, reader_account: str) -> str:
     """The sender as a reader sees it: the handle it held when it posted, bare in
-    the reader's account, else qualified."""
+    the reader's account, else qualified. A sender with no handle shows as
+    _unnamed_display."""
     if "/" not in message.sender:  # "system"
         return message.sender
     account = sessions.split_key(message.sender)[0]
-    handle = message.sender_handle or "(unnamed)"
+    if not message.sender_handle:
+        return _unnamed_display(message.sender, reader_account)
+    handle = message.sender_handle
     return handle if account == reader_account else f"{handle}@{account}"
+
+
+def _sender_session(message: message_topic.Message, reader_account: str) -> str:
+    """The sender's session id for a reader in the same account, else ""."""
+    if "/" not in message.sender:
+        return ""
+    account, session_id = sessions.split_key(message.sender)
+    return session_id if account == reader_account else ""
 
 
 def _sender_account(message: message_topic.Message) -> str:
@@ -1941,6 +1987,8 @@ async def _deliver_messages(conn: Connection, key: str) -> bool:
             }
             if sender_account := _sender_account(message):
                 meta["account"] = sender_account
+            if sender_session := _sender_session(message, reader_account):
+                meta["session"] = sender_session
             payload = {
                 "type": proto.NOTIFY,
                 "id": message.id,
@@ -2135,12 +2183,11 @@ async def _handle_post(websocket, conn: Connection, msg: dict) -> None:
     if (err := _limit_error(conn, key, "posts_per_minute")) is not None:
         await _send(websocket, proto.ERROR, msg, error=err)
         return
-    mentions: list[str] = []
-    for ref in msg.get("mentions") or ():
-        if not isinstance(ref, str):
-            continue
-        target = _resolve_handle(ref, conn.account_id)
-        mentions.append(target.key if target is not None else ref)
+    mentions = [
+        _mention_key(conn, ref)
+        for ref in msg.get("mentions") or ()
+        if isinstance(ref, str)
+    ]
     now = time.time()
     topic = _get_or_create_topic(channel_key, "channel")
     if key not in topic.members:  # posting auto-joins the sender
@@ -2202,7 +2249,7 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
         return
     participants: dict[str, sessions.SessionRecord] = {key: record}
     for ref in to:
-        target = _resolve_handle(ref, conn.account_id) if isinstance(ref, str) else None
+        target = _resolve_recipient(conn, ref) if isinstance(ref, str) else None
         if target is None:
             await _send(websocket, proto.ERROR, msg, error=f"unknown agent {ref!r}")
             return

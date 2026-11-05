@@ -151,6 +151,62 @@ def test_local_dm(srv: Server) -> None:
     asyncio.run(scenario())
 
 
+def test_dm_by_session_id(srv: Server) -> None:
+    async def scenario() -> None:
+        alice = await _agent(srv, "sid-a1", "sid-alice")
+        plain = await srv.local()
+        await plain.register("sid-p1")  # no handle
+        # A session with no handle can send; the reader sees its session id.
+        reply = await plain.request(
+            {"type": proto.DM, "to": ["sid-alice"], "body": "hello"}
+        )
+        assert reply["type"] == proto.POSTED, reply
+        assert reply["context"] == "dm:session:sid-p1@default,sid-alice@default"
+        frame = await alice.notify_of_kind("message")
+        assert frame["meta"]["from"] == "session:sid-p1"
+        assert frame["meta"]["session"] == "sid-p1"
+        assert "[dm] session:sid-p1: hello (→ you)" in frame["content"]
+        # The reader can reply to that id; the same pair keeps one thread.
+        reply = await alice.request(
+            {"type": proto.DM, "to": ["session:sid-p1"], "body": "hi back"}
+        )
+        assert reply["context"] == "dm:session:sid-p1@default,sid-alice@default"
+        frame = await plain.notify_of_kind("message")
+        assert frame["meta"]["from"] == "sid-alice"
+        assert frame["meta"]["session"] == "sid-a1"
+        # A session with a handle can be addressed by its id too.
+        reply = await plain.request(
+            {"type": proto.DM, "to": ["session:sid-a1"], "body": "by id"}
+        )
+        assert reply["context"] == "dm:session:sid-p1@default,sid-alice@default"
+        await alice.notify_of_kind("message")
+        # A session id that the server has not seen gets the message when it
+        # connects.
+        reply = await alice.request(
+            {"type": proto.DM, "to": ["session:sid-new1"], "body": "for later"}
+        )
+        assert reply["type"] == proto.POSTED, reply
+        later = await srv.local()
+        await later.register("sid-new1")
+        frame = await later.notify_of_kind("message")
+        assert "for later" in frame["content"]
+        # A session id is always in the caller's account: from another account,
+        # the same id names another session.
+        bot = await srv.remote()
+        await bot.register("@sid-bot")
+        reply = await bot.request(
+            {"type": proto.DM, "to": ["session:sid-p1"], "body": "x"}
+        )
+        assert reply["context"] == "dm:session:sid-p1@ci,sid-bot@ci"
+        # A bad session id names no session.
+        reply = await alice.request({"type": proto.DM, "to": ["session:"], "body": "x"})
+        assert reply["error"] == "unknown agent 'session:'"
+        for client in (alice, plain, later, bot):
+            await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_cross_account_messaging(srv: Server) -> None:
     async def scenario() -> None:
         alice = await _agent(srv, "x-s1", "x-alice")
@@ -290,8 +346,16 @@ def test_handle_takeover(srv: Server) -> None:
         assert reply["agent"]["generation"] == 1
         lost = await old.notify_of_kind("handle_lost")
         assert lost["meta"]["handle"] == "tk-name"
-        reply = await old.request({"type": proto.POST, "channel": "x1", "body": "hi"})
-        assert reply["error"] == "register_agent first"
+        # The old session can still post, as its session id.
+        reply = await new.request({"type": proto.JOIN_CHANNEL, "channel": "tk-x1"})
+        assert reply["type"] == proto.CHANNEL_JOINED, reply
+        reply = await old.request(
+            {"type": proto.POST, "channel": "tk-x1", "body": "hi"}
+        )
+        assert reply["type"] == proto.POSTED, reply
+        frame = await new.notify_of_kind("message")
+        assert frame["meta"]["from"] == "session:tk-s1"
+        assert frame["meta"]["session"] == "tk-s1"
         await old.close()
         await new.close()
 

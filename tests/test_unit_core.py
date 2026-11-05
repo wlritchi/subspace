@@ -167,25 +167,51 @@ def test_account_webhook_wakes_a_session_that_holds_a_handle(
     )
     assert server._message_wake_target(one.key) == (account, named)
 
-    # A session that lost its handle is not woken for messages, though the
-    # account's webhook still applies to it.
+    # A session that lost its handle keeps the account's webhook. Which messages
+    # can wake it is the rule of _wake_items (DMs only).
     registry.register_handle(
         "bots/two", "named", now=3, is_live=lambda _: False, idle=60, takeover=True
     )
     assert one.handle == ""
-    assert server._webhook_for(one.key) == (account, hook)
-    assert server._message_wake_target(one.key) is None
-    server._poke_webhook(one.key)
-    assert server.WAKE_TASKS == {}
+    assert server._message_wake_target(one.key) == (account, hook)
     asyncio.run(server._send_wake(one.key, account, hook, items))
-    assert len(bodies) == 1
+    assert bodies[-1]["session"] == "one" and bodies[-1]["handle"] == ""
+
+
+def test_session_with_no_handle_wakes_only_for_dms(server, tmp_path, monkeypatch):
+    from message_topic import MessageTopic
+
+    registry = sessions.SessionRegistry(tmp_path)
+    plain = registry.ensure("bots/plain", now=1)
+    named, _ = registry.register_handle(
+        "bots/named", "runner", now=1, is_live=lambda _: False, idle=60
+    )
+    channel = MessageTopic("chan:room", "channel")
+    dm = MessageTopic("dm:x", "dm")
+    for topic in (channel, dm):
+        topic.join(plain.key, now=1)
+        topic.join(named.key, now=1)
+    channel.post("bots/other", now=2, body="all", severity="high", ordinal=1)
+    dm.post("bots/other", now=3, body="for you", ordinal=2)
+    monkeypatch.setattr(server, "SESSIONS", registry, raising=False)
+    monkeypatch.setattr(
+        server, "TOPICS", {channel.key: channel, dm.key: dm}, raising=False
+    )
+    monkeypatch.setattr(server, "_scope", lambda _: accounts.Account(id="bots"))
+    # An @here in a channel does not wake a session with no handle; a DM does.
+    assert [o for o, _ in server._wake_items(plain.key, 0)] == [2]
+    assert [o for o, _ in server._wake_items(named.key, 0)] == [1, 2]
 
 
 def test_reactions_do_not_wake_at_all_threshold(server, tmp_path, monkeypatch):
     from message_topic import MessageTopic
 
     registry = sessions.SessionRegistry(tmp_path)
-    record = registry.ensure("bots/one", now=1)
+    # The session holds a handle, because only such a session wakes for channel
+    # messages.
+    record, _ = registry.register_handle(
+        "bots/one", "runner", now=1, is_live=lambda _: False, idle=60
+    )
     record.default_threshold = "all"
     topic = MessageTopic("chan:room", "channel")
     topic.join(record.key, now=1)

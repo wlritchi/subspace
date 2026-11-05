@@ -17,6 +17,7 @@ import pytest
 import accounts
 import subspace_protocol as proto
 from _harness import free_port, gateway_process, server_env, server_process
+from _wsclient import Client as WsClient
 from test_e2e_gateway import Stack, _text
 from test_e2e_identity import MASTER
 
@@ -367,4 +368,51 @@ def test_account_webhook(tmp_path: Path, hooks: Hooks) -> None:
         server_process(_core_env(core_port, tmp_path)),
         gateway_process(core_port, gateway_port, linger_seconds="0.2"),
     ):
+        asyncio.run(scenario())
+
+
+def test_dm_by_session_id_wakes_a_session_with_no_handle(
+    tmp_path: Path, hooks: Hooks
+) -> None:
+    """A DM to ``session:<id>`` wakes that session through the account's webhook,
+    also when the server has not seen the id and the session holds no handle. An
+    @here in a channel does not wake a session with no handle."""
+    token, credential_id, digest = accounts.new_token()
+    base = f"http://127.0.0.1:{hooks.port}"
+    (tmp_path / "accounts.toml").write_text(
+        f'[[account]]\nid = "team"\n'
+        f'[[account.credential]]\nid = "{credential_id}"\n'
+        f'secret_sha256 = "{digest}"\n'
+        f'[[account.webhook]]\nurl = "{base}/sid"\ngrace_seconds = {GRACE}\n'
+    )
+    core_port = free_port()
+
+    async def scenario() -> None:
+        old = await WsClient.open(core_port, token)
+        await old.register("sw-old-2")  # no handle
+        reply = await old.request({"type": proto.JOIN_CHANNEL, "channel": "sw-room"})
+        assert reply["type"] == proto.CHANNEL_JOINED, reply
+        await old.close()
+        warden = await WsClient.open(core_port, token)
+        await warden.register("sw-warden")  # no handle
+        await asyncio.sleep(0.5)
+        await _dm(warden, "session:sw-old-1", "please accept a handoff")
+        [call] = await hooks.wait_for("/sid", 1, 5.0)
+        assert call["body"]["session"] == "sw-old-1"
+        assert call["body"]["handle"] == ""
+        assert call["body"]["pending"] == 1
+        reply = await warden.request(
+            {
+                "type": proto.POST,
+                "channel": "sw-room",
+                "body": "all",
+                "severity": "high",
+            }
+        )
+        assert reply["type"] == proto.POSTED, reply
+        await asyncio.sleep(GRACE * 3)
+        assert len(hooks.calls("/sid")) == 1
+        await warden.close()
+
+    with server_process(_core_env(core_port, tmp_path)):
         asyncio.run(scenario())

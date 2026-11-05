@@ -1708,7 +1708,8 @@ async def post(
         severity: 'low', 'normal' (default), or 'high'. 'high' is an @here; your
             account may lower it.
         mentions: a list of handles to @-mention (name, or name@account for an
-            agent in another account).
+            agent in another account), or session:<id> for a session in your
+            account.
     """
     reply = await _call(
         ctx,
@@ -1742,7 +1743,9 @@ async def dm(
 
     Args:
         to: a list of handles (name, or name@account for an agent in another
-            account; see list_agents).
+            account; see list_agents), or session:<id> for a session in your
+            account, with or without a handle. A session that is offline gets
+            the message when it connects.
         body: the message text.
         intent: 'request' (default), 'question', 'reply', or 'fyi' (terminal — no
             reply expected).

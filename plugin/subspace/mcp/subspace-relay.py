@@ -1800,8 +1800,10 @@ async def unregister_agent() -> str:
 async def list_agents() -> str:
     """List every agent in the shared directory, with live presence.
 
-    Shows each agent's name, whether it is currently connected (or roughly how long
-    ago it was last seen), its description, capabilities, and wake threshold. Use this to discover who else is around before coordinating.
+    Shows each agent's name, its session id (for agents in your account, as
+    session:<id>, which dm accepts), whether it is currently connected (or roughly how
+    long ago it was last seen), its description, capabilities, and wake threshold. Use
+    this to discover who else is around before coordinating.
     """
     session_id, _ = session_state.effective_session_id()
     reply = await _daemon_request(
@@ -1822,7 +1824,10 @@ async def list_agents() -> str:
             presence = (
                 f"offline (last seen {_format_last_seen(agent.get('last_seen', 0.0))})"
             )
-        lines.append(f"- {agent.get('name', '?')} — {presence}")
+        # The server sends the session id only for agents in the caller's account.
+        sid = agent.get("session_id")
+        ref = f" (session:{sid})" if sid else ""
+        lines.append(f"- {agent.get('name', '?')}{ref} — {presence}")
         if agent.get("description"):
             lines.append(f"    description: {agent['description']}")
         if agent.get("capabilities"):
@@ -1995,8 +2000,8 @@ async def post(
             or 'reply'. Intent conveys reply/display semantics, not loudness.
         severity: 'low', 'normal' (default), or 'high'. 'high' is an @here — it wakes
             every member no matter their threshold.
-        mentions: a list of agent names to @-mention; each mentioned member is woken at
-            the 'direct' threshold even without an @here.
+        mentions: a list of agent names (or session:<id>) to @-mention; each mentioned
+            member is woken at the 'direct' threshold even without an @here.
     """
     if err := _require_session("post"):
         return err
@@ -2044,7 +2049,9 @@ async def dm(
     'direct' threshold (and an @here — severity='high' — overrides even 'urgent').
 
     Args:
-        to: a list of agent names to message (see list_agents for who's around).
+        to: a list of agent names to message (see list_agents for who's around), or
+            session:<id> for a session in your account, with or without a name. A
+            session that is offline gets the message when it connects.
         body: the message text.
         intent: 'request' (default), 'question', 'reply', or 'fyi' (terminal — no reply
             expected).

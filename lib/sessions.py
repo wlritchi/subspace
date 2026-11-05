@@ -28,6 +28,10 @@ _SESSION_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}\Z")
 # A session id with this prefix names a session that attached by handle.
 HANDLE_SESSION_PREFIX = "@"
 
+# A message recipient with this prefix is a session id, not a handle. The prefix is
+# necessary because a session id such as a UUID is also a valid handle.
+SESSION_REF_PREFIX = "session:"
+
 
 class SessionError(ValueError):
     """Base class for registry errors. The server sends them as ERROR replies."""
@@ -142,6 +146,25 @@ def parse_handle_ref(ref: str, own_account: str) -> tuple[str, str]:
     validate_name(handle)
     validate_name(account, "account id")
     return account, handle
+
+
+def session_ref(session_id: str) -> str:
+    """The recipient form of a session id: ``session:<id>``."""
+    return SESSION_REF_PREFIX + session_id
+
+
+def parse_session_ref(ref: str, own_account: str) -> str | None:
+    """The session key for ``session:<id>``, or None if ``ref`` has no
+    ``session:`` prefix. Raises InvalidSessionId for a bad id.
+
+    The session is always in ``own_account``: other accounts do not see session
+    ids, so a session id cannot address a session in another account.
+    """
+    if not ref.startswith(SESSION_REF_PREFIX):
+        return None
+    session_id = ref[len(SESSION_REF_PREFIX) :]
+    validate_session_id(session_id)
+    return session_key(own_account, session_id)
 
 
 def display_handle(record: SessionRecord, reader_account: str) -> str:

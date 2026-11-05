@@ -278,6 +278,9 @@ MessageMeta = TypedDict(
         "threshold": Threshold,
         # The sender's account. Absent for "system".
         "account": NotRequired[str],
+        # The sender's session id, for a reader in the sender's account. A
+        # reader can address it as "session:<id>".
+        "session": NotRequired[str],
         "connections": NotRequired[int],
     },
 )
@@ -532,7 +535,8 @@ class Post(TypedDict):
     intent: NotRequired[Intent]  # default "fyi"
     # Default "normal". The server lowers it to the account's maximum.
     severity: NotRequired[Severity]
-    mentions: NotRequired[list[str]]  # handles, bare or "handle@account"
+    # Handles, bare or "handle@account", or "session:<id>" in the same account.
+    mentions: NotRequired[list[str]]
 
 
 class Dm(TypedDict):
@@ -541,7 +545,9 @@ class Dm(TypedDict):
     type: Literal["dm"]
     req_id: ReqId
     session_id: str
-    to: list[str]  # handles, bare or "handle@account"
+    # Handles, bare or "handle@account", or "session:<id>" for a session in the
+    # same account, with or without a handle.
+    to: list[str]
     body: str  # at most 16 KiB of UTF-8
     intent: NotRequired[Intent]  # default "request"
     # Default "normal". The server lowers it to the account's maximum.

@@ -63,11 +63,17 @@ url = "https://hyperspace.example/v1/wake/claude-code"
 key_file = "/etc/subspace-keys/hyperspace"
 ```
 
-A message wake still needs a session that holds a handle, as today. A session
-whose handle another session took keeps its channel memberships and unread
-messages, so without this rule each old run would resume for every `@here` in
-its channels. The account webhook itself does not depend on a handle, so a later
-change can let other events (PR events, callbacks) wake a session with no
+A session that holds a handle wakes for its messages in channels and DMs. A
+session with no handle wakes for **DM messages only**. A session whose handle
+another session took keeps its channel memberships and unread messages, so
+without this rule each old run would resume for every `@here` in its channels.
+It keeps its DM threads too, but a new message reaches an old thread only when a
+sender addresses the session by its id (`session:<id>`, see the identity spec).
+That is the case this rule is for: a session can DM another session in its
+account by id, for example to ask an old session to accept a handoff, and the
+wake starts it although it has no handle. The wake body then has
+`"handle": ""`. The account webhook itself does not depend on a handle, so a
+later change can let other events (PR events, callbacks) wake a session with no
 handle.
 
 **Body.** The wake body gets `session`, the session id. `handle` is the
