@@ -98,6 +98,8 @@ SESSION_TTL_DEFAULT_DAYS = 30.0
 MAX_BODY_BYTES = 16 * 1024
 # The longest channel topic, in characters.
 MAX_TOPIC_CHARS = 200
+# The longest reopen reason on a dm, in characters.
+MAX_REOPEN_CHARS = 200
 # How often to check the accounts file for changes and credentials for expiry.
 ACCOUNTS_CHECK_SECONDS = 5.0
 # How long a memberless+silent message topic (channel or DM) is kept before the
@@ -1593,13 +1595,16 @@ async def _webhook_loop(key: str, event: asyncio.Event) -> None:
                 return
             account, webhook = target
             items = _wake_items(key, record.wake_covered)
+            # A request to reopen does not wait out the cooldown: the refusal
+            # that it answers usually started one.
+            reopening = _reopen_request(items) is not None
             due = wake.due_at(
                 live=_live(key),
                 has_new=bool(items),
                 last_seen=record.last_seen,
                 sent_at=record.wake_sent_at,
                 grace=webhook.grace_seconds,
-                cooldown=webhook.cooldown_seconds,
+                cooldown=0.0 if reopening else webhook.cooldown_seconds,
                 started_at=STARTED_AT,
             )
             if due is None:
@@ -1658,13 +1663,20 @@ async def _send_wake(
         body = wake.body(
             account.id, session_id, record.handle, [item for _, item in items]
         )
+        if (reopen := _reopen_request(items)) is not None:
+            body["reopen"] = reopen
         try:
             bearer = webhook.bearer_key()
         except accounts.AccountsError as exc:
             print(f"subspace: wake of {where} failed: {exc}", file=sys.stderr)
             break
-        status, note = await _post_webhook(webhook.url, bearer, body)
+        status, content = await _post_webhook(webhook.url, bearer, body)
+        note = wake.response_note(content)
         suffix = f" ({note})" if note else ""
+        if (detail := wake.done_detail(status, content)) is not None:
+            print(f"subspace: {where} is done; bounced{suffix}", file=sys.stderr)
+            _bounce(key, items, detail)
+            break
         if status is not None and 200 <= status < 300:
             print(
                 f"subspace: woke {where} for {body['pending']} message(s){suffix}",
@@ -1686,9 +1698,9 @@ async def _send_wake(
         SESSIONS.persist(record)
 
 
-async def _post_webhook(url: str, bearer: str, body: dict) -> tuple[int | None, str]:
+async def _post_webhook(url: str, bearer: str, body: dict) -> tuple[int | None, bytes]:
     """Return the HTTP status (None on a network error or timeout), and the
-    response's note for the log (see wake.response_note)."""
+    response body."""
     headers = {"User-Agent": "subspace"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
@@ -1696,8 +1708,64 @@ async def _post_webhook(url: str, bearer: str, body: dict) -> tuple[int | None, 
         async with httpx.AsyncClient(timeout=WAKE_TIMEOUT_SECONDS) as client:
             response = await client.post(url, json=body, headers=headers)
     except httpx.HTTPError:
-        return None, ""
-    return response.status_code, wake.response_note(response.content)
+        return None, b""
+    return response.status_code, response.content
+
+
+def _reopen_request(items: list[tuple[int, dict]]) -> dict | None:
+    """The wake's reopen request: from the newest message in ``items`` that asks
+    to reopen the session, or None if no message asks."""
+    for _, item in sorted(items, key=lambda pair: pair[0], reverse=True):
+        message = _covered_message(item)
+        if message is not None and message.reopen and "/" in message.sender:
+            return {
+                "reason": message.reopen,
+                "by": sessions.split_key(message.sender)[1],
+            }
+    return None
+
+
+def _covered_message(item: dict) -> message_topic.Message | None:
+    """The message that a wake item (from _wake_items) describes, or None."""
+    topic = TOPICS.get(str(item.get("context", "")))
+    if topic is None:
+        return None
+    for message in topic.messages:
+        if message.id == item.get("id"):
+            return message
+    return None
+
+
+def _bounce(key: str, items: list[tuple[int, dict]], detail: str) -> None:
+    """Tell the senders of the DMs in ``items`` that the session ``key`` is done:
+    one system line in each DM thread. The messages stay unacked, so the session
+    gets them if it is reopened. The session itself does not get the line, so
+    the line cannot cause another wake."""
+    record = SESSIONS.get(key)
+    if record is None:
+        return
+    name = record.handle or sessions.session_ref(record.session_id)
+    by_topic: dict[str, list[str]] = {}
+    for _, item in items:
+        message = _covered_message(item)
+        topic = TOPICS.get(str(item.get("context", "")))
+        if message is None or topic is None or topic.kind != "dm":
+            continue
+        by_topic.setdefault(topic.key, []).append(_msg_handle(message) or message.id)
+    now = time.time()
+    for topic_key, handles in by_topic.items():
+        topic = TOPICS[topic_key]
+        line = topic.post(
+            "system",
+            now=now,
+            body=f"{', '.join(handles)} to {name} not delivered yet: {detail}",
+            ordinal=_alloc_ordinal(),
+        )
+        topic.acked.setdefault(key, set()).add(line.id)
+        message_topic.append_messages(settings.data_dir(), topic, [line])
+        message_topic.save_state(settings.data_dir(), topic)
+        message_topic.save_subscriber(settings.data_dir(), topic, key)
+        _wake_topic_members(topic)
 
 
 # --------------------------------------------------------------------------- #
@@ -2254,6 +2322,10 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
             await _send(websocket, proto.ERROR, msg, error=f"unknown agent {ref!r}")
             return
         participants[target.key] = target
+    reopen = msg.get("reopen") or ""
+    if reopen and (err := _reopen_error(reopen, key, participants)) is not None:
+        await _send(websocket, proto.ERROR, msg, error=err)
+        return
     if (err := _limit_error(conn, key, "posts_per_minute")) is not None:
         await _send(websocket, proto.ERROR, msg, error=err)
         return
@@ -2271,6 +2343,7 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
         intent=intent,
         severity=severity,
         ordinal=_alloc_ordinal(),
+        reopen=reopen,
     )
     _persist_post(topic, key, message)
     _wake_topic_members(topic)
@@ -2283,6 +2356,24 @@ async def _handle_dm(websocket, conn: Connection, msg: dict) -> None:
         context=topic.key,
         members=len(topic.members),
     )
+
+
+def _reopen_error(
+    reopen: object, sender: str, participants: dict[str, sessions.SessionRecord]
+) -> str | None:
+    """Why a DM cannot ask to reopen its recipient, or None if it can. A reopen
+    names exactly one recipient in the sender's account: the reopen acts for the
+    sender, and other accounts do not see whether a session is done."""
+    if not isinstance(reopen, str) or not reopen.strip() or "\n" in reopen:
+        return "reopen must be one non-empty line"
+    if len(reopen) > MAX_REOPEN_CHARS:
+        return f"reopen is longer than {MAX_REOPEN_CHARS} characters"
+    recipients = [k for k in participants if k != sender]
+    if len(recipients) != 1:
+        return "reopen needs exactly one recipient"
+    if sessions.split_key(recipients[0])[0] != sessions.split_key(sender)[0]:
+        return "reopen needs a recipient in your account"
+    return None
 
 
 async def _handle_set_threshold(websocket, conn: Connection, msg: dict) -> None:

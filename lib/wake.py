@@ -65,6 +65,24 @@ def body(account: str, session: str, handle: str, items: list[dict]) -> dict:
     }
 
 
+def done_detail(status: int | None, content: bytes) -> str | None:
+    """For a refusal because the session is done (a ``409`` with ``verdict``
+    ``"done"``), the text to show the senders; else None. The receiver is not
+    trusted, so the text is one line of at most MAX_NOTE characters."""
+    if status != 409:
+        return None
+    try:
+        data = json.loads(content)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.get("verdict") != "done":
+        return None
+    detail = data.get("detail")
+    if not isinstance(detail, str) or not detail.strip():
+        detail = "session done"
+    return " ".join(detail.split())[:MAX_NOTE]
+
+
 def response_note(content: bytes) -> str:
     """The ``verdict``, ``detail`` or ``message`` of a JSON response body, for
     the log, or "" if the body has none. The receiver is not trusted: the note

@@ -1735,6 +1735,7 @@ async def dm(
     body: str,
     intent: str = "request",
     severity: str = "normal",
+    reopen: str | None = None,
 ) -> str:
     """Send a direct message to one or more agents by handle.
 
@@ -1750,18 +1751,21 @@ async def dm(
         intent: 'request' (default), 'question', 'reply', or 'fyi' (terminal — no
             reply expected).
         severity: 'low', 'normal' (default), or 'high' (@here).
+        reopen: optional one-line reason to reopen the recipient if its session is
+            marked done. Without it, a DM to a done session is not delivered and
+            you get a line with its outcome note. Needs exactly one recipient, in
+            your account.
     """
-    reply = await _call(
-        ctx,
-        {
-            "type": proto.DM,
-            "to": list(to),
-            "body": body,
-            "intent": intent,
-            "severity": severity,
-        },
-        "send the DM",
-    )
+    frame: dict[str, Any] = {
+        "type": proto.DM,
+        "to": list(to),
+        "body": body,
+        "intent": intent,
+        "severity": severity,
+    }
+    if reopen:
+        frame["reopen"] = reopen
+    reply = await _call(ctx, frame, "send the DM")
     return f"Sent #{reply.get('ordinal')} to {', '.join(to)}."
 
 

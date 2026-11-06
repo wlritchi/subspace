@@ -122,7 +122,7 @@ def test_wake_retry_resolves_current_target(server, tmp_path, monkeypatch, chang
                     id="bots", webhooks=(new,) if change == "replace" else ()
                 )
             return 503, ""
-        return 200, ""
+        return 200, b""
 
     monkeypatch.setattr(server, "_post_webhook", post)
     asyncio.run(server._send_wake(record.key, account, old, items))
@@ -152,7 +152,7 @@ def test_account_webhook_wakes_a_session_that_holds_a_handle(
 
     async def post(url: str, bearer: str, body: dict) -> tuple[int, str]:
         bodies.append(body)
-        return 200, "verdict 'queued'"
+        return 200, b'{"verdict": "queued"}'
 
     monkeypatch.setattr(server, "_post_webhook", post)
     assert server._message_wake_target(one.key) == (account, hook)

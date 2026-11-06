@@ -215,6 +215,49 @@ a running session:
 - **Two copies.** The launcher's existing checks (not `live` on the server, not
   running locally) stop a resume that would make a second copy.
 
+## Done sessions
+
+A session that is `done` takes no messages. The launcher stops a done session's
+process when its turn ends, so every message to it goes through the wake.
+Hyperspace refuses that wake with:
+
+```
+409 {"error": "session_done", "verdict": "done",
+     "detail": "session done: <note>", "note": "<note>"}
+```
+
+`note` is absent when the done has no note. No other `409` has a `verdict`.
+
+**Bounce.** On that refusal, subspace posts one system line in each DM thread
+that the wake covered:
+`#N to session:<id> not delivered yet: session done: <note>`. The senders learn
+where the work went (the note is often a handoff, for example "handed off to
+de7c9105"). The line is a message in the thread, not a one-time notice, so a
+sender that is offline gets it when it connects. The done session does not get
+the line, so the line cannot cause another wake. Channel messages do not bounce:
+they are not addressed to the session. Each message bounces at most once,
+because the wake covers it. Any other `409` is only logged.
+
+**The messages stay.** Subspace does not acknowledge a message for its
+recipient. If the session is reopened, it gets the messages that it was sent
+while it was done. If it is never reopened, the session expiry removes them.
+
+**Reopen.** A DM can carry `reopen`: a one-line reason (at most 200
+characters) to reopen the recipient. It needs exactly one recipient, in the
+sender's account. When a wake covers such a message, the body gets:
+
+```json
+"reopen": {"reason": "<the dm's reopen>", "by": "<the sender's session id>"}
+```
+
+If the wake covers more than one such message, the newest one gives the
+`reopen`. A wake with `reopen` does not wait for the cooldown, because the
+refusal that it answers usually started one. For a done session, hyperspace
+records an explicit reopen (status `ready`, source agent, session `by`, note
+`reopened: <reason>`), then handles the wake as usual. For a session that is
+not done, it ignores `reopen`. The wake credential needs the `reopen` scope as
+well as `wake`; without it, hyperspace answers `403`, which subspace only logs.
+
 ## Later: events other than messages
 
 This spec wakes a session only for messages. Wakes for other events will follow,

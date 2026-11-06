@@ -50,9 +50,12 @@ class Message:
     ordinal: int = 0
     # The handle the sender held when it posted.
     sender_handle: str = ""
+    # For a DM to a session that is done: the reason to reopen it. The wake for
+    # this message asks hyperspace to reopen the session.
+    reopen: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "seq": self.seq,
             "sender": self.sender,
@@ -65,6 +68,9 @@ class Message:
             "ordinal": self.ordinal,
             "sender_handle": self.sender_handle,
         }
+        if self.reopen:
+            data["reopen"] = self.reopen
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "Message":
@@ -80,6 +86,7 @@ class Message:
             target=data.get("target", ""),
             ordinal=int(data.get("ordinal", 0)),
             sender_handle=data.get("sender_handle", ""),
+            reopen=data.get("reopen", ""),
         )
 
 
@@ -129,6 +136,7 @@ class MessageTopic:
         mentions: tuple[str, ...] = (),
         target: str = "",
         ordinal: int = 0,
+        reopen: str = "",
     ) -> Message:
         """Author a message: assign the next monotonic ``seq`` and the derived id
         ``msg:<key>:<seq>``, append it, and bump ``next_seq`` and ``last_activity``.
@@ -136,7 +144,7 @@ class MessageTopic:
         ``target`` carries the reacted-to message id for a reaction (Phase C,
         ``intent == "reaction"``); it is empty for an ordinary message. ``ordinal`` is
         the server-allocated global message handle (0 leaves it unset — the lib does
-        not own the counter)."""
+        not own the counter). ``reopen`` is the reason to reopen a done recipient."""
         seq = self.next_seq
         message = Message(
             id=f"msg:{self.key}:{seq}",
@@ -150,6 +158,7 @@ class MessageTopic:
             target=target,
             ordinal=ordinal,
             sender_handle=sender_handle,
+            reopen=reopen,
         )
         self.messages.append(message)
         self.next_seq = seq + 1

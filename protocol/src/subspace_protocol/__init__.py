@@ -550,6 +550,9 @@ class Dm(TypedDict):
     to: list[str]
     body: str  # at most 16 KiB of UTF-8
     intent: NotRequired[Intent]  # default "request"
+    # One line: the reason to reopen the recipient if its session is done. Needs
+    # exactly one recipient, in the sender's account.
+    reopen: NotRequired[str]
     # Default "normal". The server lowers it to the account's maximum.
     severity: NotRequired[Severity]
 

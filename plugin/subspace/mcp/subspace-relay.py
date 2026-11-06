@@ -2040,7 +2040,11 @@ async def post(
 
 @mcp.tool()
 async def dm(
-    to: list[str], body: str, intent: str = "request", severity: str = "normal"
+    to: list[str],
+    body: str,
+    intent: str = "request",
+    severity: str = "normal",
+    reopen: str | None = None,
 ) -> str:
     """Send a direct message to one or more agents by name.
 
@@ -2056,6 +2060,10 @@ async def dm(
         intent: 'request' (default), 'question', 'reply', or 'fyi' (terminal — no reply
             expected).
         severity: 'low', 'normal' (default), or 'high' (@here).
+        reopen: optional one-line reason to reopen the recipient if its session is
+            marked done. Without it, a DM to a done session is not delivered and you
+            get a line with its outcome note (for example where its work went).
+            Needs exactly one recipient, in your account.
     """
     if err := _require_session("send DM"):
         return err
@@ -2068,16 +2076,17 @@ async def dm(
     if not recipients:
         return "Could not send DM: name at least one recipient."
     session_id, _ = session_state.effective_session_id()
-    reply = await _daemon_request(
-        {
-            "type": wsproto.DM,
-            "session_id": session_id,
-            "to": recipients,
-            "body": body,
-            "intent": intent,
-            "severity": severity,
-        }
-    )
+    frame: dict[str, object] = {
+        "type": wsproto.DM,
+        "session_id": session_id,
+        "to": recipients,
+        "body": body,
+        "intent": intent,
+        "severity": severity,
+    }
+    if reopen:
+        frame["reopen"] = reopen
+    reply = await _daemon_request(frame)
     if isinstance(reply, str):
         return reply
     if reply.get("type") == wsproto.ERROR:

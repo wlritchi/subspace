@@ -30,11 +30,14 @@ COOLDOWN = 3.0
 
 class Hooks:
     """A webhook receiver that records each request. A path answers with the
-    statuses queued for it, then 200. The body has a note for the core's log."""
+    statuses queued for it, then 200. The body has a note for the core's log. A
+    path in ``done`` answers as hyperspace does for a done session: 409 with
+    verdict "done", until a wake carries ``reopen``."""
 
     def __init__(self) -> None:
         self.requests: list[dict] = []
         self.statuses: dict[str, list[int]] = {}
+        self.done: set[str] = set()
         self._lock = threading.Lock()
         hooks = self
 
@@ -53,7 +56,19 @@ class Hooks:
                     )
                     queued = hooks.statuses.get(self.path) or []
                     status = queued.pop(0) if queued else 200
+                    done = self.path in hooks.done
+                    if done and "reopen" in body:
+                        hooks.done.discard(self.path)
+                        done = False
                 note = {"verdict": "queued"} if status < 300 else {"message": "no"}
+                if done:
+                    status = 409
+                    note = {
+                        "error": "session_done",
+                        "verdict": "done",
+                        "detail": "session done: handed off to sd-next",
+                        "note": "handed off to sd-next",
+                    }
                 reply = json.dumps(note).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -368,6 +383,74 @@ def test_account_webhook(tmp_path: Path, hooks: Hooks) -> None:
         server_process(_core_env(core_port, tmp_path)),
         gateway_process(core_port, gateway_port, linger_seconds="0.2"),
     ):
+        asyncio.run(scenario())
+
+
+def test_done_session_bounces_and_reopens(tmp_path: Path, hooks: Hooks) -> None:
+    """A wake that hyperspace refuses because the session is done bounces the
+    DM to its sender with the outcome note, and keeps it. A DM with ``reopen``
+    asks hyperspace to reopen the session, without the cooldown, and the session
+    then gets both messages."""
+    token, credential_id, digest = accounts.new_token()
+    base = f"http://127.0.0.1:{hooks.port}"
+    (tmp_path / "accounts.toml").write_text(
+        f'[[account]]\nid = "team"\n'
+        f'[[account.credential]]\nid = "{credential_id}"\n'
+        f'secret_sha256 = "{digest}"\n'
+        f'[[account.webhook]]\nurl = "{base}/sd"\ngrace_seconds = {GRACE}\n'
+        "cooldown_seconds = 300\n"
+    )
+    hooks.done.add("/sd")
+    core_port = free_port()
+
+    async def scenario() -> None:
+        warden = await WsClient.open(core_port, token)
+        await warden.register("sd-warden")
+        await asyncio.sleep(0.5)
+        first = await _dm(warden, "session:sd-old", "please accept a handoff")
+        [refused] = await hooks.wait_for("/sd", 1, 5.0)
+        assert "reopen" not in refused["body"]
+        bounce = await warden.notify_of_kind("message")
+        assert bounce["meta"]["from"] == "system"
+        assert (
+            f"#{first} to session:sd-old not delivered yet: session done: "
+            "handed off to sd-next"
+        ) in bounce["content"]
+
+        # The reopen needs exactly one recipient in the sender's account.
+        for frame, error in (
+            ({"to": ["session:sd-old", "session:sd-x"]}, "exactly one recipient"),
+            ({"to": ["session:sd-old"], "reopen": "a\nb"}, "one non-empty line"),
+        ):
+            reply = await warden.request(
+                {"type": proto.DM, "body": "x", "reopen": "go", **frame}
+            )
+            assert error in reply["error"], reply
+
+        reply = await warden.request(
+            {
+                "type": proto.DM,
+                "to": ["session:sd-old"],
+                "body": "take it now",
+                "reopen": "accept the handoff",
+            }
+        )
+        assert reply["type"] == proto.POSTED, reply
+        # The cooldown (300 s) does not delay a reopen.
+        reopened = (await hooks.wait_for("/sd", 2, 5.0))[1]
+        assert reopened["body"]["reopen"] == {
+            "reason": "accept the handoff",
+            "by": "sd-warden",
+        }
+        old = await WsClient.open(core_port, token)
+        await old.register("sd-old")
+        bodies = [(await old.notify_of_kind("message"))["content"] for _ in range(2)]
+        assert "please accept a handoff" in bodies[0]
+        assert "take it now" in bodies[1]
+        for client in (warden, old):
+            await client.close()
+
+    with server_process(_core_env(core_port, tmp_path)):
         asyncio.run(scenario())
 
 

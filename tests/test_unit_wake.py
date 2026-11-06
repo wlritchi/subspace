@@ -113,3 +113,32 @@ def test_response_note(content: bytes, expected: str) -> None:
 def test_response_note_is_cut() -> None:
     note = wake.response_note(b'{"verdict": "' + b"v" * 1000 + b'"}')
     assert note == f"verdict {'v' * wake.MAX_NOTE!r}"
+
+
+DONE = b'{"verdict": "done", "detail": "session done: handed off to x"}'
+
+
+@pytest.mark.parametrize(
+    ("status", "content", "expected"),
+    [
+        (409, DONE, "session done: handed off to x"),
+        # A done with no note: hyperspace omits the note, the detail stays.
+        (409, b'{"verdict": "done", "detail": "session done"}', "session done"),
+        (409, b'{"verdict": "done"}', "session done"),
+        # Only a 409 with verdict "done" is a done refusal.
+        (200, DONE, None),
+        (409, b'{"detail": "session done: x"}', None),
+        (409, b'{"verdict": "busy"}', None),
+        (409, b"not json", None),
+        (None, b"", None),
+    ],
+)
+def test_done_detail(status: int | None, content: bytes, expected: str | None) -> None:
+    assert wake.done_detail(status, content) == expected
+
+
+def test_done_detail_is_one_short_line() -> None:
+    content = b'{"verdict": "done", "detail": "a\\nb ' + b"c" * 1000 + b'"}'
+    detail = wake.done_detail(409, content)
+    assert detail is not None
+    assert "\n" not in detail and len(detail) == wake.MAX_NOTE
