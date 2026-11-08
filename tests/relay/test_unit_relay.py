@@ -1137,6 +1137,26 @@ def test_claim_takes_surfacing_messages_and_acks_on_confirm(relay, monkeypatch):
     assert [content for content, _ in delivered] == ["pr event"]  # messages not pushed
 
 
+def test_catch_up_repeats_the_resume_delivery_once(relay, monkeypatch):
+    # A model can miss the session-start context and call catch_up; the hook has
+    # taken the messages, so catch_up shows them again, once.
+    client, _delivered, _acked = _holding_client(relay, monkeypatch)
+    client._pending_debounce = [_message("m1", "#9618 please hand off", "direct")]
+
+    async def scenario():
+        await client.claim("sid")
+        await client.confirm_claim()
+        first = await client.drain_buffer()
+        second = await client.drain_buffer()
+        return first, second
+
+    first, second = anyio.run(scenario)
+    assert "Already delivered at resume" in first
+    assert "#9618 please hand off" in first
+    assert "#9618" not in second
+    assert "No pending notifications." in second
+
+
 def test_claim_registers_a_new_session_and_discards_old_items(relay, monkeypatch):
     client, _delivered, acked = _holding_client(relay, monkeypatch)
     client._registered_session = "old"

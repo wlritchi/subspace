@@ -247,6 +247,10 @@ class DaemonClient:
         # registration of that session.
         self._confirmed: dict[str, str] = {}
         self._ack_pending: set[str] = set()
+        # The contents that the hook put into the session-start context, until the
+        # next catch_up shows them again. A model can miss the hook context, call
+        # catch_up, and find nothing: the hook took the messages.
+        self._resumed: list[str] = []
 
     def attach_write_stream(self, write_stream) -> None:
         self._write_stream = write_stream
@@ -449,6 +453,7 @@ class DaemonClient:
         self._claimed = []
         self._confirmed = {}
         self._ack_pending = set()
+        self._resumed = []
 
     def _take_claimable(self) -> list[dict]:
         """Remove and return the held items that pass the session's threshold.
@@ -532,6 +537,7 @@ class DaemonClient:
             self._confirmed[item["id"]] = self._claimed_session
             if not await self._ack(item["id"]):
                 self._ack_pending.add(item["id"])
+        self._resumed = [item["content"] for item in claimed]
         self._release_hold()
 
     async def _send_pending_acks(self) -> None:
@@ -776,6 +782,13 @@ class DaemonClient:
             return drained < max_messages and chars + len(content) <= max_chars
 
         sections: list[str] = []
+        resumed, self._resumed = self._resumed, []
+        if resumed:
+            sections.append(
+                f"Already delivered at resume, in the session-start context "
+                f"({len(resumed)} message(s), repeated once here):\n\n"
+                + "\n\n".join(resumed)
+            )
         if self._buffer:
             parts: list[str] = []
             for notification_id, payload in list(self._buffer.items()):

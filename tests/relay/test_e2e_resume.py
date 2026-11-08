@@ -149,10 +149,15 @@ def test_resume_puts_held_messages_into_the_first_turn(
                     await h.mcp_await_channel_with(read, "all hands", timeout=4) is None
                 )
 
-                # The quiet one is still there for catch_up; the claimed one is
-                # acked.
+                # The quiet one is still there for catch_up. The claimed one is
+                # acked: the first catch_up repeats it once, under the resume
+                # header, for a model that missed the hook context.
                 text, _ = await h.mcp_call(read, write, 2, "catch_up")
                 assert "fyi thing" in text
+                resumed, _, held = text.partition("Held agent messages")
+                assert "Already delivered at resume" in resumed
+                assert "all hands" in resumed and "all hands" not in held
+                text, _ = await h.mcp_call(read, write, 3, "catch_up")
                 assert "all hands" not in text
 
         anyio.run(scenario)
