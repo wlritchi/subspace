@@ -59,7 +59,7 @@ def test_every_relay_constant_matches_the_protocol() -> None:
 def test_every_relay_frame_name_is_a_protocol_frame() -> None:
     frames = _frame_literals(proto.ClientFrame) | _frame_literals(proto.ServerFrame)
     for name, value in _relay_constants().items():
-        if name.startswith("DEFAULT_"):
+        if name.startswith("DEFAULT_") or name.endswith("_CLOSE_CODE"):
             continue
         assert value in frames, f"{name}={value!r} names no frame"
 

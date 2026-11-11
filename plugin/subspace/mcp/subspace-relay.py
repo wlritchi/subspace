@@ -995,11 +995,15 @@ class DaemonClient:
             self._logged_failure = line
             _log(line)
 
+    def _refused(self, settings: connection.Settings, detail: str) -> None:
+        error = connection.refused_error(settings)
+        self._credential_error = f"subspace: {error}"
+        self._log_failure(f"{error} ({detail})")
+
     def _handshake_rejected(self, settings: connection.Settings, status: int) -> None:
         if status in (401, 403):
-            error = connection.refused_error(settings)
-            self._credential_error = f"subspace: {error}"
-            self._log_failure(f"{error} (HTTP {status})")
+            # A proxy or a gateway in front of the server can refuse this way.
+            self._refused(settings, f"HTTP {status}")
         else:
             # The Location value is not logged: it can hold a secret.
             self._log_failure(
@@ -1030,17 +1034,24 @@ class DaemonClient:
                 self._handshake_rejected(settings, status)
                 return
             raise
-        async with ws:
-            self._connected_once = True
-            self._logged_failure = None
-            # Register before `connected` turns true, so a waiting claim sees
-            # the registered id and does not register a second time.
-            await self._register(ws)
-            self._ws = ws
-            await self._send_pending_acks()
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(self._recv_loop, ws, tg)
-                tg.start_soon(self._session_watch, ws, tg)
+        try:
+            async with ws:
+                self._connected_once = True
+                self._logged_failure = None
+                # Register before `connected` turns true, so a waiting claim sees
+                # the registered id and does not register a second time.
+                await self._register(ws)
+                self._ws = ws
+                await self._send_pending_acks()
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(self._recv_loop, ws, tg)
+                    tg.start_soon(self._session_watch, ws, tg)
+        finally:
+            # The server accepts the handshake, and then closes with this code
+            # if it refuses the credential, at once or after a revocation.
+            # The close code is known only after the connection is closed.
+            if ws.close_code == wsproto.UNAUTHORIZED_CLOSE_CODE:
+                self._refused(settings, f"WebSocket close code {ws.close_code}")
 
     async def _register(self, ws, session_id: str | None = None) -> None:
         """Register `session_id` (default: the best-known id). A change from an

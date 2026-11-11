@@ -273,9 +273,17 @@ not exist, it is a dangling link, it is not a regular file, it cannot be
 read, or it is empty. The advice to start the server appears only if the
 file does not exist.
 
-**Refused credential.** If the server refuses the WebSocket handshake with
-`401` or `403`, the relay logs the refusal and the source of the
-credential. Each tool call then returns, for example:
+**Refused credential.** The relay treats two events as a refusal:
+
+- The handshake fails with `401` or `403`. A proxy or a gateway in front of
+  the server can refuse this way.
+- The server closes the connection with its unauthorized close code. The
+  server accepts the handshake, and then closes with this code if it refuses
+  the credential. It also closes with this code if it revokes the credential
+  later.
+
+For a refusal, the relay logs the refusal and the source of the credential.
+Each tool call then returns, for example:
 
 ```
 subspace: the server at wss://subspace.example.com refused the
@@ -367,6 +375,8 @@ again, and does not log the `Location` value.
 - No credential: the relay does not create the file and does not connect.
   The startup log and a tool call give the error.
 - A `401` handshake gives the "refused" error with the right source.
+- A close with the server's unauthorized close code gives the same error:
+  right after connect, and later on a live connection.
 
 **Unit, secrets:** a sentinel credential, and a URL with user information
 and a query. Neither the credential nor those URL parts appear in the logs

@@ -20,6 +20,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 from websockets.http11 import Request, Response
 
 import connection
+import wsproto
 
 PLUGIN = Path(__file__).resolve().parents[2] / "plugin" / "subspace"
 RELAY = PLUGIN / "mcp" / "subspace-relay.py"
@@ -471,11 +472,19 @@ def test_no_credential_error_gives_the_reason(
 
 class FakeServer:
     """A WebSocket server on a free local port. It records each handshake
-    request. If `status` is set, it answers the handshake with that status."""
+    request. If `status` is set, it answers the handshake with that status. If
+    `close_code` is set, it accepts the handshake, and closes the connection
+    with that code after the first frame from the client."""
 
-    def __init__(self, status: int | None = None, location: str | None = None) -> None:
+    def __init__(
+        self,
+        status: int | None = None,
+        location: str | None = None,
+        close_code: int | None = None,
+    ) -> None:
         self.status: int | None = status
         self.location: str | None = location
+        self.close_code: int | None = close_code
         self.requests: list[Request] = []
         self.port: int = 0
 
@@ -505,7 +514,8 @@ class FakeServer:
     async def _handler(self, conn: ServerConnection) -> None:
         with contextlib.suppress(ConnectionClosed):
             async for _ in conn:
-                pass
+                if self.close_code is not None:
+                    await conn.close(code=self.close_code, reason="unauthorized")
 
 
 @contextlib.asynccontextmanager
@@ -773,6 +783,77 @@ def test_refused_handshake_with_subspace_token(
     assert text == (
         f"subspace: the server at {url} refused the credential from SUBSPACE_TOKEN."
     )
+
+
+def test_unauthorized_close_after_connect_is_a_refusal(
+    relay: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The server accepts the handshake, and closes at the first frame (the
+    register) with the unauthorized close code."""
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+    code = wsproto.UNAUTHORIZED_CLOSE_CODE
+
+    async def scenario() -> tuple[str, str]:
+        async with running(FakeServer(close_code=code)) as server:
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            async with running_client(relay, monkeypatch) as client:
+                await _until(lambda: client.credential_error is not None)  # type: ignore[attr-defined]
+                with anyio.fail_after(5):
+                    return await relay.list_agents(), server.url
+
+    text, url = anyio.run(scenario)
+    assert text == (
+        f"subspace: the server at {url} refused the credential from SUBSPACE_TOKEN."
+    )
+    assert f"(WebSocket close code {code})" in capsys.readouterr().err
+
+
+def test_unauthorized_close_of_a_live_connection_is_a_refusal(
+    relay: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential that the server revokes while the relay is connected."""
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+
+    async def scenario() -> tuple[bool, str | None, str]:
+        async with running(FakeServer()) as server:
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            async with running_client(relay, monkeypatch) as client:
+                await _until(lambda: client.connected)  # type: ignore[attr-defined]
+                server.close_code = wsproto.UNAUTHORIZED_CLOSE_CODE
+                # A frame from the client makes the fake server close.
+                await client._ws.send(json.dumps({"type": wsproto.WHOAMI}))  # type: ignore[attr-defined]
+                await _until(lambda: client.credential_error is not None)  # type: ignore[attr-defined]
+                return (
+                    client.connected,  # type: ignore[attr-defined]
+                    client.credential_error,  # type: ignore[attr-defined]
+                    server.url,
+                )
+
+    connected, error, url = anyio.run(scenario)
+    assert not connected
+    assert error == (
+        f"subspace: the server at {url} refused the credential from SUBSPACE_TOKEN."
+    )
+
+
+def test_normal_close_is_not_a_refusal(
+    relay: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+
+    async def scenario() -> tuple[int, str | None]:
+        async with running(FakeServer(close_code=1000)) as server:
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            client = relay.DaemonClient()
+            with contextlib.suppress(ConnectionClosed):
+                await client._connect_once()
+            return len(server.requests), client.credential_error
+
+    requests, error = anyio.run(scenario)
+    assert requests == 1
+    assert error is None
 
 
 def test_unreachable_error_names_the_new_settings(

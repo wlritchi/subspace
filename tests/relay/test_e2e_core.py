@@ -134,7 +134,8 @@ def test_reconnects_when_server_appears(tmp_path):
 
 def test_wrong_token_leaves_relay_running(tmp_path):
     """A relay the server refuses stays up and reports the state; a tool call
-    still gets an answer."""
+    gets the refused error. The server accepts the handshake and then closes
+    with the unauthorized close code."""
     with h.core(tmp_path) as stack:
         env = stack.push_env("sid-A")
         env["SUBSPACE_TOKEN"] = "wrong"
@@ -146,7 +147,10 @@ def test_wrong_token_leaves_relay_running(tmp_path):
                 text, _ = await h.mcp_call(read, write, 2, "get_session_id")
                 assert "server: disconnected" in text
                 text, _ = await h.mcp_call(read, write, 3, "list_agents")
-                assert "not reachable" in text
+                assert text == (
+                    f"subspace: the server at ws://127.0.0.1:{stack.ws_port} "
+                    "refused the credential from SUBSPACE_TOKEN."
+                )
 
         anyio.run(scenario)
 

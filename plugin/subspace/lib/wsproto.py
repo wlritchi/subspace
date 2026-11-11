@@ -21,6 +21,9 @@ stdlib only.
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8137
+# The server closes a connection with this code if it refuses the credential:
+# at connect, or later if the credential is revoked.
+UNAUTHORIZED_CLOSE_CODE = 1008
 
 # relay -> server
 REGISTER = "register"  # {session_id}            attach this connection to a session
