@@ -474,18 +474,24 @@ class FakeServer:
     """A WebSocket server on a free local port. It records each handshake
     request. If `status` is set, it answers the handshake with that status. If
     `close_code` is set, it accepts the handshake, and closes the connection
-    with that code after the first frame from the client."""
+    with that code at frame `close_at_frame` from the client (the first frame
+    is the register). If `greeting` is set, it sends that frame first."""
 
     def __init__(
         self,
         status: int | None = None,
         location: str | None = None,
         close_code: int | None = None,
+        close_at_frame: int = 1,
+        greeting: str | None = None,
     ) -> None:
         self.status: int | None = status
         self.location: str | None = location
         self.close_code: int | None = close_code
+        self.close_at_frame: int = close_at_frame
+        self.greeting: str | None = greeting
         self.requests: list[Request] = []
+        self.frames: list[str] = []
         self.port: int = 0
 
     @property
@@ -513,8 +519,13 @@ class FakeServer:
 
     async def _handler(self, conn: ServerConnection) -> None:
         with contextlib.suppress(ConnectionClosed):
-            async for _ in conn:
-                if self.close_code is not None:
+            if self.greeting is not None:
+                await conn.send(self.greeting)
+            count = 0
+            async for frame in conn:
+                self.frames.append(str(frame))
+                count += 1
+                if self.close_code is not None and count >= self.close_at_frame:
                     await conn.close(code=self.close_code, reason="unauthorized")
 
 
@@ -856,6 +867,99 @@ def test_normal_close_is_not_a_refusal(
     assert error is None
 
 
+def test_repeated_refusal_logs_once(
+    relay: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each attempt passes the handshake and then gets the unauthorized close.
+    The log gives the refusal again only if the outcome or the source changes,
+    or after the server accepted the credential."""
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+    code = wsproto.UNAUTHORIZED_CLOSE_CODE
+    refused = "refused the credential from"
+
+    async def attempts(client: object, count: int) -> None:
+        for _ in range(count):
+            with contextlib.suppress(ConnectionClosed):
+                await client._connect_once()  # type: ignore[attr-defined]
+
+    async def scenario() -> list[int]:
+        counts: list[int] = []
+        server = FakeServer(close_code=code)
+        async with running(server):
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            client = relay.DaemonClient()
+            await attempts(client, 3)
+            counts.append(capsys.readouterr().err.count(refused))
+            # A different outcome, and then the close again.
+            server.status = 401
+            await attempts(client, 2)
+            server.status = None
+            await attempts(client, 2)
+            counts.append(capsys.readouterr().err.count(refused))
+            # A different source.
+            monkeypatch.setenv("SUBSPACE_OPTION_TOKEN", "option-value")
+            await attempts(client, 2)
+            counts.append(capsys.readouterr().err.count(refused))
+            # A frame from the server shows that it accepted the credential.
+            # Its later close is a revocation, and the log gives it.
+            server.greeting = json.dumps({"type": "hello"})
+            await attempts(client, 1)
+            counts.append(capsys.readouterr().err.count(refused))
+        return counts
+
+    assert anyio.run(scenario) == [1, 2, 1, 1]
+
+
+def test_refusal_after_a_request_is_sent(
+    relay: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server closes with the unauthorized code only at the first request,
+    after the register. The tool call that sent the request gets the refused
+    error, not a timeout."""
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+    code = wsproto.UNAUTHORIZED_CLOSE_CODE
+
+    async def scenario() -> tuple[str, str, list[str]]:
+        async with running(FakeServer(close_code=code, close_at_frame=2)) as server:
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            async with running_client(relay, monkeypatch) as client:
+                await _until(lambda: client.connected)  # type: ignore[attr-defined]
+                with anyio.fail_after(2):
+                    text = await relay.list_agents()
+            return text, server.url, server.frames
+
+    text, url, frames = anyio.run(scenario)
+    assert [json.loads(frame)["type"] for frame in frames] == [
+        wsproto.REGISTER,
+        wsproto.LIST_AGENTS,
+    ]
+    assert text == (
+        f"subspace: the server at {url} refused the credential from SUBSPACE_TOKEN."
+    )
+
+
+def test_request_on_a_closed_connection_is_not_reachable(
+    relay: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal close at the first request ends the request at once, with the
+    not-reachable error."""
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+
+    async def scenario() -> str:
+        async with running(FakeServer(close_code=1000, close_at_frame=2)) as server:
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            async with running_client(relay, monkeypatch) as client:
+                await _until(lambda: client.connected)  # type: ignore[attr-defined]
+                with anyio.fail_after(2):
+                    return await relay._daemon_request({"type": wsproto.LIST_AGENTS})
+
+    text = anyio.run(scenario)
+    assert isinstance(text, str)
+    assert text.startswith("The subspace server is not reachable at")
+
+
 def test_unreachable_error_names_the_new_settings(
     relay: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -873,47 +977,50 @@ def test_unreachable_error_names_the_new_settings(
 # secrets
 # --------------------------------------------------------------------------- #
 
-_SENTINELS = (
-    "SENTINEL-TOKEN-7c1d",
-    "SENTINEL-USER-2e8a",
-    "SENTINEL-PASS-3b9e",
-    "SENTINEL-QUERY-5a2f",
-    "SENTINEL-FRAG-9d4c",
+# Each secret in these tests starts with SENTINEL.
+_USERINFO = "SENTINEL-USER-2e8a:SENTINEL-PASS-3b9e"
+
+
+def _secret_url(case: str, port: int) -> str:
+    query = "?key=SENTINEL-QUERY-5a2f"
+    if case == "unreachable":
+        # The client refuses a URL with a fragment, so only this case has one.
+        return f"ws://{_USERINFO}@127.0.0.1:{port}/relay{query}#SENTINEL-FRAG-9d4c"
+    if case == "hash":
+        return f"ws://SENTINEL-USER:SENTINEL-PW1#SENTINEL-PW2@127.0.0.1:{port}/relay"
+    if case == "slash":
+        return f"ws://SENTINEL-USER:SENTINEL-PW1/SENTINEL-PW2@127.0.0.1:{port}/x"
+    return f"ws://{_USERINFO}@127.0.0.1:{port}/relay{query}"
+
+
+@pytest.mark.parametrize(
+    "case", ["refused", "closed", "redirect", "unreachable", "hash", "slash"]
 )
-
-
-def _secret_url(port: int, *, fragment: bool) -> str:
-    # The client refuses a URL with a fragment, so only the case with no
-    # server has one.
-    url = (
-        f"ws://SENTINEL-USER-2e8a:SENTINEL-PASS-3b9e@127.0.0.1:{port}/relay"
-        "?key=SENTINEL-QUERY-5a2f"
-    )
-    return url + "#SENTINEL-FRAG-9d4c" if fragment else url
-
-
-@pytest.mark.parametrize("status", [401, 302, None])
 def test_secrets_stay_out_of_logs_and_tool_errors(
     relay: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    status: int | None,
+    case: str,
 ) -> None:
-    """A refusal, a redirect, and a server that is not reachable. The URL is
-    from an option and the credential from the environment, so that the log
-    also gives the mixed-sources warning."""
+    """A refusal at the handshake and with the close code, a redirect, a
+    server that is not reachable, and two URLs with a "#" or a "/" in the
+    password. The URL is from an option and the credential from the
+    environment, so that the log also gives the mixed-sources warning."""
     monkeypatch.setenv("SUBSPACE_TOKEN", "SENTINEL-TOKEN-7c1d")
+    fakes = {
+        "refused": FakeServer(401),
+        "closed": FakeServer(close_code=wsproto.UNAUTHORIZED_CLOSE_CODE),
+        "redirect": FakeServer(302, "ws://127.0.0.1:9/?SENTINEL-QUERY-5a2f"),
+    }
 
     async def scenario() -> tuple[list[str], int]:
         texts: list[str] = []
-        location = "ws://127.0.0.1:9/?SENTINEL-QUERY-5a2f"
-        async with running(FakeServer(status or 401, location)) as server:
-            port = server.port if status is not None else 9
-            monkeypatch.setenv(
-                "SUBSPACE_OPTION_WS_URL", _secret_url(port, fragment=status is None)
-            )
+        async with running(fakes.get(case, FakeServer(401))) as server:
+            port = server.port if case in fakes else 9
+            monkeypatch.setenv("SUBSPACE_OPTION_WS_URL", _secret_url(case, port))
             async with running_client(relay, monkeypatch) as client:
-                if status == 401:
+                if case in ("refused", "closed"):
+                    await _until(lambda: client.credential_error is not None)  # type: ignore[attr-defined]
                     with anyio.fail_after(5):
                         texts.append(await relay.list_agents())
                 # A tool call waits 8 s before it gives this error.
@@ -924,15 +1031,37 @@ def test_secrets_stay_out_of_logs_and_tool_errors(
     texts, port = anyio.run(scenario)
     err = capsys.readouterr().err
     assert "warning:" in err
-    assert f"ws://127.0.0.1:{port}/relay" in texts[0]
-    if status == 401:
+    if case in ("hash", "slash"):
+        assert "<URL with user information>" in texts[0]
+        assert "is not a valid WebSocket URL" in err
+    else:
+        assert f"ws://127.0.0.1:{port}/" in texts[0]
+    if case in ("refused", "closed"):
         assert "refused the credential from SUBSPACE_TOKEN" in texts[0]
-    elif status == 302:
+    elif case == "redirect":
         assert "HTTP 302" in err
-    for sentinel in _SENTINELS:
-        assert sentinel not in err
-        for text in texts:
-            assert sentinel not in text
+    assert "SENTINEL" not in err
+    for text in texts:
+        assert "SENTINEL" not in text
+
+
+def test_secret_in_deprecated_host_stays_out_of_logs(
+    relay: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("NOTIFICATIONS_WS_HOST", f"{_USERINFO}@127.0.0.1")
+    monkeypatch.setenv("NOTIFICATIONS_WS_PORT", "9")
+    monkeypatch.setenv("SUBSPACE_TOKEN", "SENTINEL-TOKEN-7c1d")
+    client = relay.DaemonClient()
+    monkeypatch.setattr(relay, "DAEMON", client)
+    settings = client._resolve_settings()
+    assert settings.url == f"ws://{_USERINFO}@127.0.0.1:9"
+    text = relay._daemon_unreachable_message()
+    err = capsys.readouterr().err
+    assert "use SUBSPACE_WS_URL=ws://127.0.0.1:9" in err
+    assert "SENTINEL" not in err
+    assert "SENTINEL" not in text
 
 
 def test_settings_repr_hides_the_credential(
@@ -949,6 +1078,9 @@ def test_settings_repr_hides_the_credential(
     [
         ("wss://u:p@host.example:8443/a?b=c#d", "wss://host.example:8443/a"),
         ("ws://[::1]:8137/", "ws://[::1]:8137/"),
+        ("wss://alice:pa#ss@host.example", "<URL with user information>"),
+        ("wss://alice:pa/ss@host.example/x", "<URL with user information>"),
+        ("wss://alice:pa?ss@host.example", "<URL with user information>"),
         ("wss://host.example", "wss://host.example"),
         ("not a url", "<invalid URL>"),
         ("ws//u:p@host", "<invalid URL>"),

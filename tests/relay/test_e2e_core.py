@@ -6,6 +6,7 @@ These spawn the real server and relay with `uv run` and drive the relay with a
 raw MCP client over stdio."""
 
 import time
+from pathlib import Path
 
 import anyio
 import pytest
@@ -96,14 +97,14 @@ def test_schedule_deliver_and_ack(tmp_path):
 
 
 @pytest.mark.parametrize("credentials", ["option", "deprecated"])
-def test_connects_with_each_credential_setup(tmp_path, credentials):
+def test_connects_with_each_credential_setup(tmp_path: Path, credentials: str) -> None:
     """The plugin options alone, and the deprecated NOTIFICATIONS_WS_PORT and
     NOTIFICATIONS_TOKEN alone, each give a working connection."""
     with h.core(tmp_path) as stack:
         env = stack.push_env("sid-A", credentials=credentials)
         assert not any(name in env for name in ("SUBSPACE_WS_URL", "SUBSPACE_TOKEN"))
 
-        async def scenario():
+        async def scenario() -> None:
             async with h.stdio_client(h.relay_params(env)) as (read, write):
                 await h.mcp_handshake(read, write)
                 request_id = await _wait_connected(read, write, 2)

@@ -47,6 +47,7 @@ from pathlib import Path
 
 import anyio
 from anyio.streams.buffered import BufferedByteReceiveStream
+from anyio.streams.memory import MemoryObjectSendStream
 from mcp.server.fastmcp import FastMCP
 from mcp.server.lowlevel.server import NotificationOptions
 from mcp.server.stdio import stdio_server
@@ -59,6 +60,7 @@ from websockets.exceptions import (
     InvalidURI,
     WebSocketException,
 )
+from websockets.uri import parse_uri
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
@@ -224,7 +226,7 @@ class DaemonClient:
         self._ws = None
         self._write_stream = None
         self._req_id = 0
-        self._pending: dict[int, object] = {}  # req_id -> memory send stream
+        self._pending: dict[int, MemoryObjectSendStream[dict]] = {}  # by req_id
         self._registered_session: str | None = None
         self._connected_once = False  # did the current attempt establish a connection?
         # The settings of the last connection attempt, and the sources that the
@@ -916,6 +918,18 @@ class DaemonClient:
             await ws.send(json.dumps({**payload, "req_id": req_id}))
             with anyio.fail_after(timeout):
                 return await receive_stream.receive()
+        except ConnectionClosed as exc:
+            # The server can refuse the credential after the relay registers.
+            # The close can come before the connection task records it.
+            if exc.rcvd is not None and self._settings is not None:
+                if exc.rcvd.code == wsproto.UNAUTHORIZED_CLOSE_CODE:
+                    self._refused(
+                        self._settings, f"WebSocket close code {exc.rcvd.code}"
+                    )
+            raise ConnectionError("server connection closed") from exc
+        except anyio.EndOfStream as exc:
+            # The connection closed before the reply came.
+            raise ConnectionError("server connection closed") from exc
         finally:
             self._pending.pop(req_id, None)
 
@@ -995,6 +1009,12 @@ class DaemonClient:
             self._logged_failure = line
             _log(line)
 
+    def _authenticated(self) -> None:
+        """The server accepted the credential. A later failure logs again,
+        also if it is the same as the last one. The handshake alone is not
+        sufficient: the server refuses a credential after the handshake."""
+        self._logged_failure = None
+
     def _refused(self, settings: connection.Settings, detail: str) -> None:
         error = connection.refused_error(settings)
         self._credential_error = f"subspace: {error}"
@@ -1020,6 +1040,15 @@ class DaemonClient:
             self._log_failure(error)
             return
         self._credential_error = None
+        try:
+            parse_uri(settings.url)
+        except (InvalidURI, ValueError):
+            # Do not log the exception: its text can hold a part of the URL's
+            # password.
+            self._log_failure(
+                f"the URL from {settings.url_source.label} is not a valid WebSocket URL"
+            )
+            return
         headers = {"Authorization": f"Bearer {settings.token}"}
         # A proxy would send the master token of the server on this machine to
         # a different machine.
@@ -1034,10 +1063,10 @@ class DaemonClient:
                 self._handshake_rejected(settings, status)
                 return
             raise
+        opened = time.monotonic()
         try:
             async with ws:
                 self._connected_once = True
-                self._logged_failure = None
                 # Register before `connected` turns true, so a waiting claim sees
                 # the registered id and does not register a second time.
                 await self._register(ws)
@@ -1047,11 +1076,19 @@ class DaemonClient:
                     tg.start_soon(self._recv_loop, ws, tg)
                     tg.start_soon(self._session_watch, ws, tg)
         finally:
+            # The server refuses a credential at once. So a connection that
+            # stayed open had a credential that the server accepted.
+            if time.monotonic() - opened >= RECONNECT_STABLE_SECONDS:
+                self._authenticated()
             # The server accepts the handshake, and then closes with this code
             # if it refuses the credential, at once or after a revocation.
             # The close code is known only after the connection is closed.
             if ws.close_code == wsproto.UNAUTHORIZED_CLOSE_CODE:
                 self._refused(settings, f"WebSocket close code {ws.close_code}")
+            # No reply comes on a closed connection. Do not let a request wait
+            # for its timeout.
+            for stream in list(self._pending.values()):
+                stream.close()
 
     async def _register(self, ws, session_id: str | None = None) -> None:
         """Register `session_id` (default: the best-known id). A change from an
@@ -1070,6 +1107,7 @@ class DaemonClient:
     async def _recv_loop(self, ws, tg) -> None:
         try:
             async for raw in ws:
+                self._authenticated()
                 try:
                     msg = json.loads(raw)
                 except (json.JSONDecodeError, ValueError):

@@ -109,7 +109,8 @@ def read_token_file(path: Path) -> TokenFile:
 
 
 def legacy_token_path() -> Path:
-    """<NOTIFICATIONS_DATA_DIR>/token, default ~/.claude/notifications/token."""
+    """Path of the deprecated token file, which the migration script links to
+    the server's token."""
     base = _env("NOTIFICATIONS_DATA_DIR")
     return (Path(base) if base else Path.home() / ".claude" / "notifications") / "token"
 
@@ -156,7 +157,10 @@ def _resolve_url(deprecations: list[str]) -> tuple[str, Source]:
         ]
         label = " and ".join(names)
         verb = "are" if len(names) == 2 else "is"
-        deprecations.append(f"{label} {verb} deprecated: use SUBSPACE_WS_URL={url}")
+        # The host can hold user information.
+        deprecations.append(
+            f"{label} {verb} deprecated: use SUBSPACE_WS_URL={display_url(url)}"
+        )
         return url, Source(label, ENV)
     return DEFAULT_URL, Source("the default URL", DEFAULT)
 
@@ -223,6 +227,10 @@ def display_url(url: str) -> str:
     if not parts.scheme or not parts.netloc:
         # The path of a URL with no host can hold the user information.
         return "<invalid URL>"
+    if "@" in url and "@" not in parts.netloc:
+        # A "#", "?" or "/" in the password ends the host part early. Then a
+        # part of the password is in the host, path, query, or fragment.
+        return "<URL with user information>"
     host = parts.netloc.rpartition("@")[2]
     return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
 
@@ -264,7 +272,7 @@ def no_credential_error(settings: Settings) -> str:
 
 
 def refused_error(settings: Settings) -> str:
-    """The error when the server refuses the credential at the handshake."""
+    """The error when the server refuses the credential."""
     source = settings.token_source.label if settings.token_source else "no source"
     return (
         f"the server at {display_url(settings.url)} refused the credential from "
