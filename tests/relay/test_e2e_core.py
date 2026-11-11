@@ -95,6 +95,23 @@ def test_schedule_deliver_and_ack(tmp_path):
         anyio.run(scenario)
 
 
+@pytest.mark.parametrize("credentials", ["option", "deprecated"])
+def test_connects_with_each_credential_setup(tmp_path, credentials):
+    """The plugin options alone, and the deprecated NOTIFICATIONS_WS_PORT and
+    NOTIFICATIONS_TOKEN alone, each give a working connection."""
+    with h.core(tmp_path) as stack:
+        env = stack.push_env("sid-A", credentials=credentials)
+        assert not any(name in env for name in ("SUBSPACE_WS_URL", "SUBSPACE_TOKEN"))
+
+        async def scenario():
+            async with h.stdio_client(h.relay_params(env)) as (read, write):
+                await h.mcp_handshake(read, write)
+                request_id = await _wait_connected(read, write, 2)
+                await _schedule_and_receive(read, write, request_id, "sid-A")
+
+        anyio.run(scenario)
+
+
 def test_reconnects_when_server_appears(tmp_path):
     stack = h.Stack(tmp_path, h.free_port(), tmp_path / "store")
     stack.data_dir.mkdir()
@@ -120,7 +137,7 @@ def test_wrong_token_leaves_relay_running(tmp_path):
     still gets an answer."""
     with h.core(tmp_path) as stack:
         env = stack.push_env("sid-A")
-        env["NOTIFICATIONS_TOKEN"] = "wrong"
+        env["SUBSPACE_TOKEN"] = "wrong"
 
         async def scenario():
             async with h.stdio_client(h.relay_params(env)) as (read, write):

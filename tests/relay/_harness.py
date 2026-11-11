@@ -36,7 +36,7 @@ from _forges import FakeForgejo, FakeGitHub, forgejo_pr
 SERVER = str(ROOT / "server" / "subspace-server.py")
 RELAY = str(ROOT / "plugin" / "subspace" / "mcp" / "subspace-relay.py")
 CHANNEL_METHOD = "notifications/claude/channel"
-# The server's master token. The relay sends it as NOTIFICATIONS_TOKEN.
+# The server's master token. The relay sends it as SUBSPACE_TOKEN.
 TOKEN = "test-token"
 # Spawned scripts run on the test run's Python version, so that
 # `UV_PYTHON=3.12 uv run -qs tests/run.py` also tests them on that version.
@@ -130,10 +130,26 @@ def relay_env(
     cache_dir: Path | None = None,
     project_dir: str | None = None,
     debounce_seconds: str = "0.5",
+    credentials: str = "env",
 ) -> dict[str, str]:
+    """`credentials` selects the names that give the URL and the token: "env"
+    (SUBSPACE_), "option" (the plugin options), or "deprecated"
+    (NOTIFICATIONS_)."""
     env = _isolated_environ()
-    env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
-    env["NOTIFICATIONS_TOKEN"] = TOKEN
+    url = f"ws://127.0.0.1:{ws_port}"
+    if credentials == "env":
+        env["SUBSPACE_WS_URL"] = url
+        env["SUBSPACE_TOKEN"] = TOKEN
+    elif credentials == "option":
+        env["SUBSPACE_OPTION_WS_URL"] = url
+        env["SUBSPACE_OPTION_TOKEN"] = TOKEN
+    elif credentials == "deprecated":
+        env["NOTIFICATIONS_WS_PORT"] = str(ws_port)
+        env["NOTIFICATIONS_TOKEN"] = TOKEN
+    else:
+        raise ValueError(f"unknown credentials setup: {credentials}")
+    # The relay reads the deprecated token file in this directory, not the one
+    # in the home directory.
     env["NOTIFICATIONS_DATA_DIR"] = str(xdg_dir)
     # One state directory for each session: the relays of a test share one
     # Claude Code ancestor, so they would share one state file, and the file
@@ -233,7 +249,11 @@ class Stack:
         self.xdg.mkdir(exist_ok=True)
 
     def push_env(
-        self, session_id: str, *, xdg_dir: Path | None = None
+        self,
+        session_id: str,
+        *,
+        xdg_dir: Path | None = None,
+        credentials: str = "env",
     ) -> dict[str, str]:
         """A relay environment in channel (push) mode: a seeded 'registered' log."""
         cache = self.tmp_path / "cache"
@@ -244,6 +264,7 @@ class Stack:
             session_id,
             cache_dir=cache,
             project_dir=_FAKE_PROJECT,
+            credentials=credentials,
         )
 
     def pull_env(self, session_id: str) -> dict[str, str]:

@@ -2,7 +2,11 @@
   "mcpServers": {
     "subspace": {
       "command": "uv",
-      "args": ["run", "-qs", "${CLAUDE_PLUGIN_ROOT}/mcp/subspace-relay.py"]
+      "args": ["run", "-qs", "${CLAUDE_PLUGIN_ROOT}/mcp/subspace-relay.py"],
+      "env": {
+        "SUBSPACE_OPTION_WS_URL": "${user_config.server_url}",
+        "SUBSPACE_OPTION_TOKEN": "${user_config.token}"
+      }
     }
   }
 }

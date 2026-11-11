@@ -1,6 +1,7 @@
 # vim: filetype=python
-"""Unit tests for the relay plugin: the session-id state file, the token and URL
-settings, channel detection, and the relay's delivery, backoff, and resume hold."""
+"""Unit tests for the relay plugin: the session-id state file, channel
+detection, and the relay's delivery, backoff, and resume hold. The URL and
+credential tests are in test_unit_relay_credentials.py."""
 
 import importlib.util
 import json
@@ -169,45 +170,6 @@ def test_effective_session_id_env_fallback_on_recycled_pid(tmp_path, monkeypatch
     sid, source = session_state.effective_session_id()
     assert sid == "env-sid"
     assert source.startswith("env")
-
-
-# --------------------------------------------------------------------------- #
-# wsproto shared token
-# --------------------------------------------------------------------------- #
-
-
-def test_token_autocreates_stable_and_0600(tmp_path, monkeypatch):
-    monkeypatch.delenv("NOTIFICATIONS_TOKEN", raising=False)
-    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
-    first = wsproto.token()
-    assert first
-    token_file = tmp_path / "token"
-    assert token_file.read_text().strip() == first
-    assert (token_file.stat().st_mode & 0o777) == 0o600
-    assert wsproto.token() == first  # stable on repeated calls
-
-
-def test_token_env_overrides_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("NOTIFICATIONS_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("NOTIFICATIONS_TOKEN", "explicit-secret")
-    assert wsproto.token() == "explicit-secret"
-    assert not (tmp_path / "token").exists()  # env path never touches the file
-
-
-def test_uri_builds_from_host_port_by_default(monkeypatch):
-    monkeypatch.delenv("NOTIFICATIONS_WS_URL", raising=False)
-    monkeypatch.setenv("NOTIFICATIONS_WS_HOST", "127.0.0.1")
-    monkeypatch.setenv("NOTIFICATIONS_WS_PORT", "8137")
-    assert wsproto.uri() == "ws://127.0.0.1:8137"
-
-
-def test_uri_full_url_override_wins(monkeypatch):
-    # A remote daemon behind a TLS-terminating ingress: the relay connects via wss://
-    # and the host/port are ignored entirely.
-    monkeypatch.setenv("NOTIFICATIONS_WS_HOST", "127.0.0.1")
-    monkeypatch.setenv("NOTIFICATIONS_WS_PORT", "8137")
-    monkeypatch.setenv("NOTIFICATIONS_WS_URL", "wss://subspace.example.com")
-    assert wsproto.uri() == "wss://subspace.example.com"
 
 
 # --------------------------------------------------------------------------- #

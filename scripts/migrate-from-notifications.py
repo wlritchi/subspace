@@ -5,8 +5,10 @@
 Before the rename, the server kept its data in ~/.claude/notifications. This
 script moves that directory to settings.data_dir() (SUBSPACE_DATA_DIR, else
 $XDG_DATA_HOME/subspace). Then it links ~/.claude/notifications/token to the
-moved token, because the relay (the `subspace` plugin) still reads its secret
-from that path.
+moved token. The relay (the `subspace` plugin) reads that path as a deprecated
+credential source. It is not the only source: with no URL setting, the relay
+also reads the server's token file, so a local setup does not need the link.
+See "The relay" in server/README.md.
 
 Stop the server before you run this script.
 """

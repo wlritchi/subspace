@@ -3,5 +3,20 @@
   "description": "Connect each Claude Code session to a subspace server: agent messages, PR updates, and scheduled callbacks arrive as channel events",
   "author": {
     "name": "wlritchi"
+  },
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "WebSocket URL of the subspace server, for example wss://subspace.example.com. Leave empty for a server on this machine.",
+      "required": false
+    },
+    "token": {
+      "type": "string",
+      "title": "Credential",
+      "description": "The token that the relay connects with: an ssp_ credential, or the server's master token.",
+      "required": false,
+      "sensitive": true
+    }
   }
 }

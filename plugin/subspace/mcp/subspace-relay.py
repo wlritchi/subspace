@@ -53,11 +53,17 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import JSONRPCMessage, JSONRPCNotification
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed, InvalidURI, WebSocketException
+from websockets.exceptions import (
+    ConnectionClosed,
+    InvalidStatus,
+    InvalidURI,
+    WebSocketException,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import channel_detect
+import connection
 import messaging
 import session_state
 import wsproto
@@ -199,6 +205,18 @@ INSTRUCTIONS = (
 mcp = FastMCP(SERVER_NAME, instructions=INSTRUCTIONS)
 
 
+class _NoRedirectConnect(connect):
+    """connect() that does not follow a redirect. A redirect sends the
+    credential again, to an address that the user did not configure."""
+
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        return exc
+
+
+def _log(line: str) -> None:
+    print(f"subspace relay: {line}", file=sys.stderr)
+
+
 class DaemonClient:
     """Maintains the WebSocket to the server and bridges it to the channel."""
 
@@ -209,6 +227,16 @@ class DaemonClient:
         self._pending: dict[int, object] = {}  # req_id -> memory send stream
         self._registered_session: str | None = None
         self._connected_once = False  # did the current attempt establish a connection?
+        # The settings of the last connection attempt, and the sources that the
+        # log gave last, so that the log gives the sources again only on a change.
+        self._settings: connection.Settings | None = None
+        self._logged_sources: list[str] | None = None
+        # The error for tool calls when no credential is set or the server
+        # refused it. None for other failures.
+        self._credential_error: str | None = None
+        # The last failure that the log gave, so that a retry does not repeat it.
+        self._logged_failure: str | None = None
+        self._attempts = 0  # connection attempts that ended
         # A foreground tool call sets this to break the reconnect backoff and force an
         # immediate attempt, so an active agent never waits out an idle-tuned long sleep.
         self._reconnect_now = anyio.Event()
@@ -292,11 +320,26 @@ class DaemonClient:
         backoff; only an actively-waiting caller forces the immediate attempt.)"""
         if self.connected:
             return True
+        attempts = self._attempts
         self._reconnect_now.set()  # an agent is actively waiting — break the backoff
         with anyio.move_on_after(timeout):
             while not self.connected:
+                # The attempt after the nudge found no credential, or the
+                # server refused it. A longer wait does not change that.
+                if self._credential_error is not None and self._attempts != attempts:
+                    break
                 await anyio.sleep(0.1)
         return self.connected
+
+    @property
+    def credential_error(self) -> str | None:
+        """The tool error for a missing or refused credential, else None."""
+        return self._credential_error
+
+    def display_url(self) -> str:
+        """The server URL, safe to show in an error."""
+        settings = self._settings or connection.resolve()
+        return connection.display_url(settings.url)
 
     async def _send_raw(self, method: str, params: dict) -> None:
         if self._write_stream is None:
@@ -910,6 +953,7 @@ class DaemonClient:
                     file=sys.stderr,
                 )
             finally:
+                self._attempts += 1
                 self._ws = None
                 # The registered id stays: the reconnect compares the id it
                 # registers with it, and treats a different one as a session
@@ -935,12 +979,60 @@ class DaemonClient:
                 await self._reconnect_now.wait()
             self._reconnect_now = anyio.Event()
 
+    def _resolve_settings(self) -> connection.Settings:
+        """Resolve the sources again, and log them if they changed."""
+        settings = connection.resolve()
+        self._settings = settings
+        lines = connection.source_lines(settings)
+        if lines != self._logged_sources:
+            self._logged_sources = lines
+            for line in lines:
+                _log(line)
+        return settings
+
+    def _log_failure(self, line: str) -> None:
+        if line != self._logged_failure:
+            self._logged_failure = line
+            _log(line)
+
+    def _handshake_rejected(self, settings: connection.Settings, status: int) -> None:
+        if status in (401, 403):
+            error = connection.refused_error(settings)
+            self._credential_error = f"subspace: {error}"
+            self._log_failure(f"{error} (HTTP {status})")
+        else:
+            # The Location value is not logged: it can hold a secret.
+            self._log_failure(
+                f"the server at {connection.display_url(settings.url)} answered "
+                f"the handshake with HTTP {status}. The relay does not follow "
+                "redirects."
+            )
+
     async def _connect_once(self) -> None:
-        headers = {"Authorization": f"Bearer {wsproto.token()}"}
-        async with connect(
-            wsproto.uri(), additional_headers=headers, open_timeout=5
-        ) as ws:
+        settings = self._resolve_settings()
+        if settings.token is None:
+            error = connection.no_credential_error(settings)
+            self._credential_error = f"subspace: {error}"
+            self._log_failure(error)
+            return
+        self._credential_error = None
+        headers = {"Authorization": f"Bearer {settings.token}"}
+        # A proxy would send the master token of the server on this machine to
+        # a different machine.
+        proxy: bool | None = None if settings.uses_server_token_file else True
+        try:
+            ws = await _NoRedirectConnect(
+                settings.url, additional_headers=headers, open_timeout=5, proxy=proxy
+            )
+        except InvalidStatus as exc:
+            status = exc.response.status_code
+            if status in (401, 403) or 300 <= status < 400:
+                self._handshake_rejected(settings, status)
+                return
+            raise
+        async with ws:
             self._connected_once = True
+            self._logged_failure = None
             # Register before `connected` turns true, so a waiting claim sees
             # the registered id and does not register a second time.
             await self._register(ws)
@@ -1052,10 +1144,13 @@ DAEMON = DaemonClient()
 
 
 def _daemon_unreachable_message() -> str:
+    if DAEMON.credential_error is not None:
+        return DAEMON.credential_error
     return (
-        f"The subspace server is not reachable at {wsproto.uri()}. Start it "
-        "(for a local server: systemctl --user start subspace-server), or set "
-        "NOTIFICATIONS_WS_URL to its address, and try again."
+        f"The subspace server is not reachable at {DAEMON.display_url()}. Start "
+        "it (for a local server: systemctl --user start subspace-server), or set "
+        "the plugin's server_url option or SUBSPACE_WS_URL to its address, and "
+        "try again."
     )
 
 

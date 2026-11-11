@@ -59,21 +59,67 @@ It provides two capabilities:
 | `SUBSPACE_PR_WARM_TTL_SECONDS`        | `1800`                     | Keep an unsubscribed PR tracker warm this long before deleting (0 = delete immediately)                        |
 | `SUBSPACE_PR_CHECK_SUMMARY_THRESHOLD` | `5`                        | Collapse this many+ passing checks completing in one poll into a single summary event; 0 disables              |
 
-The relay (the `subspace` plugin; install it with
+### The relay
+
+The relay is the `subspace` plugin. Install it with
 `claude plugin marketplace add wlritchi/subspace` and
-`claude plugin install subspace@subspace`) has its own settings with the
-`NOTIFICATIONS_` prefix: `NOTIFICATIONS_WS_HOST`/`PORT`/`URL` to find the
-server, and `NOTIFICATIONS_TOKEN` or `~/.claude/notifications/token` for the
-shared secret. If you change the port, set it for both (e.g. in your shell
-profile, so Claude Code's MCP servers inherit it). `GITHUB_TOKEN` only needs to
-be set for the server.
+`claude plugin install subspace@subspace`. `GITHUB_TOKEN` only needs to be set
+for the server.
+
+A relay and a server on one machine need no setup: with no URL setting, the
+relay connects to `ws://127.0.0.1:8137` and reads the server's token file
+(`$SUBSPACE_DATA_DIR/token`, default `$XDG_DATA_HOME/subspace/token`). If the
+server uses `SUBSPACE_DATA_DIR`, set the same value for Claude Code. This step
+trusts the process that listens on that port. On a machine where other users
+or untrusted programs run, set the URL and a credential.
+
+For other setups, set the plugin's two options. Claude Code stores them and
+gives them only to the relay process:
+
+- `server_url`: the WebSocket URL of the server, for example
+  `wss://subspace.example.com`.
+- `token` (sensitive): an `ssp_` credential of an account, or the server's
+  master token.
+
+Claude Code asks for the options when you enable the plugin.
+`/plugin configure subspace@subspace` changes them. For a setup that is not
+interactive, give a JSON object on stdin:
+
+```bash
+echo '{"server_url": "wss://subspace.example.com", "token": "ssp_…"}' |
+  claude plugin configure subspace@subspace --values-stdin
+```
+
+A change takes effect when Claude Code restarts.
+
+The relay takes the first value that is set and not empty. It reads the
+sources again before each connection attempt.
+
+- URL: the `server_url` option, `SUBSPACE_WS_URL`, `NOTIFICATIONS_WS_URL`
+  (deprecated), `NOTIFICATIONS_WS_HOST` and `NOTIFICATIONS_WS_PORT`
+  (deprecated), then `ws://127.0.0.1:8137`.
+- Credential: the `token` option, `SUBSPACE_TOKEN`, `NOTIFICATIONS_TOKEN`
+  (deprecated), `$NOTIFICATIONS_DATA_DIR/token` (deprecated; default
+  `~/.claude/notifications/token`), then the server's token file, only if no
+  source gives a URL.
+
+The relay does not read `SUBSPACE_WS_HOST` or `SUBSPACE_WS_PORT`: those give
+the address that the server listens on.
+
+The options come first: an environment variable can be meant for a different
+program, for example a `SUBSPACE_TOKEN` exported to start a server. A
+credential in the option is not in the environment of the agent's commands,
+hooks, or other MCP servers, if you also remove `SUBSPACE_TOKEN` and
+`NOTIFICATIONS_TOKEN` from Claude Code's environment. The agent can still read
+the option from Claude Code's credential store.
+
+The relay logs the source of each value at startup, never the credential. If
+no source gives a credential, or the server refuses it, each tool call says
+what to set. The relay does not follow redirects.
 
 The WebSocket is authenticated with a shared token. By default the server
 auto-creates it at `<SUBSPACE_DATA_DIR>/token` (mode `0600`) on first use, and
-connections without it are rejected. Local relays must read the same secret:
-either link `~/.claude/notifications/token` to the server's token file, or set
-`SUBSPACE_TOKEN` for the server and `NOTIFICATIONS_TOKEN` for the relays to the
-same value.
+connections without it are rejected.
 
 ## Accounts, sessions, and handles
 
@@ -171,8 +217,10 @@ uv run -qs scripts/migrate-from-notifications.py
 
 The script moves the directory to `$SUBSPACE_DATA_DIR` (default
 `$XDG_DATA_HOME/subspace`) and links `~/.claude/notifications/token` to the moved
-token, so local relays keep authenticating. Deployments that set
-`NOTIFICATIONS_*` variables must rename them to `SUBSPACE_*`.
+token. That link is a deprecated credential source for the relay. A relay with
+no URL setting also reads the server's token file directly, so a local setup
+does not need the link. For the relay's own settings, see
+[The relay](#the-relay).
 
 ## Remote-agent gateway
 

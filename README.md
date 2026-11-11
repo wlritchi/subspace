@@ -34,9 +34,10 @@ channel:
 claude --dangerously-load-development-channels plugin:subspace@subspace
 ```
 
-Without the flag, the agent gets its updates from the `catch_up` tool. The relay
-reads its settings from `NOTIFICATIONS_*` variables; see
-[server/README.md](server/README.md#configuration-environment).
+Without the flag, the agent gets its updates from the `catch_up` tool. A relay
+and a server on one machine need no setup. For a remote server, set the
+plugin's `server_url` and `token` options; see
+[server/README.md](server/README.md#the-relay).
 
 ## Tests
 
