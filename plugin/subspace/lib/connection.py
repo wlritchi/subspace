@@ -109,8 +109,8 @@ def read_token_file(path: Path) -> TokenFile:
 
 
 def legacy_token_path() -> Path:
-    """Path of the deprecated token file, which the migration script links to
-    the server's token."""
+    """<NOTIFICATIONS_DATA_DIR>/token, default ~/.claude/notifications/token.
+    The migration script links it to the server's token."""
     base = _env("NOTIFICATIONS_DATA_DIR")
     return (Path(base) if base else Path.home() / ".claude" / "notifications") / "token"
 
@@ -218,21 +218,19 @@ def resolve() -> Settings:
 
 
 def display_url(url: str) -> str:
-    """`url` without its user information, query, and fragment, for logs and
-    errors. These parts can hold a secret."""
+    """`url` without its query and fragment, for logs and errors. These parts
+    can hold a secret. A URL with user information gives only a placeholder."""
+    if "@" in url:
+        # A "@", "#", "?" or "/" in the password moves the end of the user
+        # information. No parse finds that end reliably.
+        return "<URL with user information>"
     try:
         parts = urllib.parse.urlsplit(url)
     except ValueError:
         return "<invalid URL>"
     if not parts.scheme or not parts.netloc:
-        # The path of a URL with no host can hold the user information.
         return "<invalid URL>"
-    if "@" in url and "@" not in parts.netloc:
-        # A "#", "?" or "/" in the password ends the host part early. Then a
-        # part of the password is in the host, path, query, or fragment.
-        return "<URL with user information>"
-    host = parts.netloc.rpartition("@")[2]
-    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def source_lines(settings: Settings) -> list[str]:

@@ -219,6 +219,16 @@ def _log(line: str) -> None:
     print(f"subspace relay: {line}", file=sys.stderr)
 
 
+def _failure_kind(exc: BaseException) -> str:
+    """The type of a failure, for the log. The text of an exception is not
+    used: it can hold a part of the URL or of a header."""
+    if isinstance(exc, InvalidStatus):
+        return f"{type(exc).__name__}, HTTP {exc.response.status_code}"
+    if isinstance(exc, BaseExceptionGroup):
+        return ", ".join(_failure_kind(inner) for inner in exc.exceptions)
+    return type(exc).__name__
+
+
 class DaemonClient:
     """Maintains the WebSocket to the server and bridges it to the channel."""
 
@@ -229,6 +239,9 @@ class DaemonClient:
         self._pending: dict[int, MemoryObjectSendStream[dict]] = {}  # by req_id
         self._registered_session: str | None = None
         self._connected_once = False  # did the current attempt establish a connection?
+        # Did the server close the connection of the current attempt with the
+        # unauthorized close code?
+        self._closed_unauthorized = False
         # The settings of the last connection attempt, and the sources that the
         # log gave last, so that the log gives the sources again only on a change.
         self._settings: connection.Settings | None = None
@@ -942,6 +955,7 @@ class DaemonClient:
         while True:
             started = time.monotonic()
             self._connected_once = False
+            self._closed_unauthorized = False
             try:
                 await self._connect_once()
             except (
@@ -963,7 +977,8 @@ class DaemonClient:
                 # server down on a server restart (side-door relays vanished until a
                 # manual /mcp reconnect).
                 print(
-                    f"subspace relay: reconnect attempt failed ({exc!r}); retrying",
+                    "subspace relay: reconnect attempt failed "
+                    f"({_failure_kind(exc)}); retrying",
                     file=sys.stderr,
                 )
             finally:
@@ -980,8 +995,11 @@ class DaemonClient:
                 # Held messages are unacked, so the server re-ships them on reconnect
                 # and they'll re-hold; clear to avoid duplicating the re-shipped copies.
                 self._held = []
+            # A connection that the server closed for its credential is not a
+            # good connection, also if it stayed open for a long time.
             stable = (
                 self._connected_once
+                and not self._closed_unauthorized
                 and (time.monotonic() - started) >= RECONNECT_STABLE_SECONDS
             )
             failures = 0 if stable else min(failures + 1, _RECONNECT_MAX_FAILURES)
@@ -1010,9 +1028,11 @@ class DaemonClient:
             _log(line)
 
     def _authenticated(self) -> None:
-        """The server accepted the credential. A later failure logs again,
-        also if it is the same as the last one. The handshake alone is not
-        sufficient: the server refuses a credential after the handshake."""
+        """A frame came from the server, so the server accepted the
+        credential. A later failure logs again, also if it is the same as the
+        last one. The handshake and the time that the connection stays open
+        are not evidence: the server refuses a credential after the
+        handshake, and it can revoke a credential at any time."""
         self._logged_failure = None
 
     def _refused(self, settings: connection.Settings, detail: str) -> None:
@@ -1063,7 +1083,6 @@ class DaemonClient:
                 self._handshake_rejected(settings, status)
                 return
             raise
-        opened = time.monotonic()
         try:
             async with ws:
                 self._connected_once = True
@@ -1076,14 +1095,11 @@ class DaemonClient:
                     tg.start_soon(self._recv_loop, ws, tg)
                     tg.start_soon(self._session_watch, ws, tg)
         finally:
-            # The server refuses a credential at once. So a connection that
-            # stayed open had a credential that the server accepted.
-            if time.monotonic() - opened >= RECONNECT_STABLE_SECONDS:
-                self._authenticated()
             # The server accepts the handshake, and then closes with this code
             # if it refuses the credential, at once or after a revocation.
             # The close code is known only after the connection is closed.
             if ws.close_code == wsproto.UNAUTHORIZED_CLOSE_CODE:
+                self._closed_unauthorized = True
                 self._refused(settings, f"WebSocket close code {ws.close_code}")
             # No reply comes on a closed connection. Do not let a request wait
             # for its timeout.

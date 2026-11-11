@@ -16,7 +16,8 @@ import anyio
 import anyio.abc
 import pytest
 from websockets.asyncio.server import ServerConnection, serve
-from websockets.exceptions import ConnectionClosed, WebSocketException
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 from websockets.http11 import Request, Response
 
 import connection
@@ -912,6 +913,46 @@ def test_repeated_refusal_logs_once(
     assert anyio.run(scenario) == [1, 2, 1, 1]
 
 
+@pytest.mark.parametrize(
+    ("close_code", "failures", "refusals"),
+    [
+        (wsproto.UNAUTHORIZED_CLOSE_CODE, [1, 2, 3, 4], 1),
+        # The control: a normal close of a long connection resets the backoff.
+        (1000, [0, 0, 0, 0], 0),
+    ],
+)
+def test_long_connection_refused_logs_once_and_backs_off(
+    relay: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    close_code: int,
+    failures: list[int],
+    refusals: int,
+) -> None:
+    """With RECONNECT_STABLE_SECONDS at 0, each connection is open longer
+    than the stable time. A refusal at its end still logs once, and the
+    backoff still grows."""
+    monkeypatch.setenv("SUBSPACE_TOKEN", "env-value")
+    monkeypatch.setattr(relay, "RECONNECT_STABLE_SECONDS", 0.0)
+    seen: list[int] = []
+
+    def delay(count: int) -> float:
+        seen.append(count)
+        return 0.01
+
+    monkeypatch.setattr(relay, "_reconnect_delay", delay)
+
+    async def scenario() -> None:
+        async with running(FakeServer(close_code=close_code)) as server:
+            monkeypatch.setenv("SUBSPACE_WS_URL", server.url)
+            async with running_client(relay, monkeypatch):
+                await _until(lambda: len(seen) >= len(failures))
+
+    anyio.run(scenario)
+    assert seen[: len(failures)] == failures
+    assert capsys.readouterr().err.count("refused the credential from") == refusals
+
+
 def test_refusal_after_a_request_is_sent(
     relay: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -981,20 +1022,51 @@ def test_unreachable_error_names_the_new_settings(
 _USERINFO = "SENTINEL-USER-2e8a:SENTINEL-PASS-3b9e"
 
 
+_QUERY = "?key=SENTINEL-QUERY-5a2f"
+# Cases with user information, and the URLs for them. The cases with a "@",
+# "#", "?" or "/" in the password connect to localhost:9 or to nothing, so
+# that no name goes to a DNS server.
+_USERINFO_URLS = {
+    "refused": "ws://" + _USERINFO + "@127.0.0.1:{port}/relay" + _QUERY,
+    "closed": "ws://" + _USERINFO + "@127.0.0.1:{port}/relay" + _QUERY,
+    "hash": "ws://SENTINEL-USER:SENTINEL-PW1#SENTINEL-PW2@127.0.0.1:{port}/relay",
+    "slash": "ws://SENTINEL-USER:SENTINEL-PW1/SENTINEL-PW2@127.0.0.1:{port}/x",
+    "at-slash": (
+        "ws://SENTINEL-USER:SENTINEL-PW1@localhost:9/SENTINEL-PW2@127.0.0.1:{port}/x"
+    ),
+    "at-query": (
+        "ws://SENTINEL-USER:SENTINEL-PW1@localhost:9?SENTINEL-PW2@127.0.0.1:{port}"
+    ),
+    "at-hash": (
+        "ws://SENTINEL-USER:SENTINEL-PW1@SENTINEL-PW2#SENTINEL-PW3@127.0.0.1:{port}"
+    ),
+}
+# The client refuses a URL with a fragment.
+_NOT_VALID = {"hash", "slash", "at-hash"}
+
+
 def _secret_url(case: str, port: int) -> str:
-    query = "?key=SENTINEL-QUERY-5a2f"
+    if case in _USERINFO_URLS:
+        return _USERINFO_URLS[case].format(port=port)
     if case == "unreachable":
-        # The client refuses a URL with a fragment, so only this case has one.
-        return f"ws://{_USERINFO}@127.0.0.1:{port}/relay{query}#SENTINEL-FRAG-9d4c"
-    if case == "hash":
-        return f"ws://SENTINEL-USER:SENTINEL-PW1#SENTINEL-PW2@127.0.0.1:{port}/relay"
-    if case == "slash":
-        return f"ws://SENTINEL-USER:SENTINEL-PW1/SENTINEL-PW2@127.0.0.1:{port}/x"
-    return f"ws://{_USERINFO}@127.0.0.1:{port}/relay{query}"
+        return f"ws://127.0.0.1:{port}/relay{_QUERY}#SENTINEL-FRAG-9d4c"
+    return f"ws://127.0.0.1:{port}/relay{_QUERY}"
 
 
 @pytest.mark.parametrize(
-    "case", ["refused", "closed", "redirect", "unreachable", "hash", "slash"]
+    "case",
+    [
+        "refused",
+        "refused-query",
+        "closed",
+        "redirect",
+        "unreachable",
+        "hash",
+        "slash",
+        "at-slash",
+        "at-query",
+        "at-hash",
+    ],
 )
 def test_secrets_stay_out_of_logs_and_tool_errors(
     relay: ModuleType,
@@ -1003,12 +1075,13 @@ def test_secrets_stay_out_of_logs_and_tool_errors(
     case: str,
 ) -> None:
     """A refusal at the handshake and with the close code, a redirect, a
-    server that is not reachable, and two URLs with a "#" or a "/" in the
+    server that is not reachable, and URLs with a "@", "#", "/" or "?" in the
     password. The URL is from an option and the credential from the
     environment, so that the log also gives the mixed-sources warning."""
     monkeypatch.setenv("SUBSPACE_TOKEN", "SENTINEL-TOKEN-7c1d")
     fakes = {
         "refused": FakeServer(401),
+        "refused-query": FakeServer(401),
         "closed": FakeServer(close_code=wsproto.UNAUTHORIZED_CLOSE_CODE),
         "redirect": FakeServer(302, "ws://127.0.0.1:9/?SENTINEL-QUERY-5a2f"),
     }
@@ -1019,7 +1092,7 @@ def test_secrets_stay_out_of_logs_and_tool_errors(
             port = server.port if case in fakes else 9
             monkeypatch.setenv("SUBSPACE_OPTION_WS_URL", _secret_url(case, port))
             async with running_client(relay, monkeypatch) as client:
-                if case in ("refused", "closed"):
+                if case in ("refused", "refused-query", "closed"):
                     await _until(lambda: client.credential_error is not None)  # type: ignore[attr-defined]
                     with anyio.fail_after(5):
                         texts.append(await relay.list_agents())
@@ -1031,12 +1104,13 @@ def test_secrets_stay_out_of_logs_and_tool_errors(
     texts, port = anyio.run(scenario)
     err = capsys.readouterr().err
     assert "warning:" in err
-    if case in ("hash", "slash"):
+    if case in _USERINFO_URLS:
         assert "<URL with user information>" in texts[0]
-        assert "is not a valid WebSocket URL" in err
     else:
-        assert f"ws://127.0.0.1:{port}/" in texts[0]
-    if case in ("refused", "closed"):
+        assert f"ws://127.0.0.1:{port}/relay" in texts[0]
+    if case in _NOT_VALID:
+        assert "is not a valid WebSocket URL" in err
+    if case in ("refused", "refused-query", "closed"):
         assert "refused the credential from SUBSPACE_TOKEN" in texts[0]
     elif case == "redirect":
         assert "HTTP 302" in err
@@ -1059,9 +1133,17 @@ def test_secret_in_deprecated_host_stays_out_of_logs(
     assert settings.url == f"ws://{_USERINFO}@127.0.0.1:9"
     text = relay._daemon_unreachable_message()
     err = capsys.readouterr().err
-    assert "use SUBSPACE_WS_URL=ws://127.0.0.1:9" in err
+    assert "use SUBSPACE_WS_URL=<URL with user information>" in err
     assert "SENTINEL" not in err
     assert "SENTINEL" not in text
+
+
+def test_failure_log_gives_only_the_exception_type(relay: ModuleType) -> None:
+    status = InvalidStatus(Response(500, "SENTINEL-REASON", Headers()))
+    group = ExceptionGroup("SENTINEL-GROUP", [ValueError("SENTINEL-PW1"), status])
+    assert relay._failure_kind(ValueError("SENTINEL-PW1")) == "ValueError"
+    assert relay._failure_kind(status) == "InvalidStatus, HTTP 500"
+    assert relay._failure_kind(group) == "ValueError, InvalidStatus, HTTP 500"
 
 
 def test_settings_repr_hides_the_credential(
@@ -1076,14 +1158,19 @@ def test_settings_repr_hides_the_credential(
 @pytest.mark.parametrize(
     ("url", "shown"),
     [
-        ("wss://u:p@host.example:8443/a?b=c#d", "wss://host.example:8443/a"),
+        ("wss://host.example:8443/a?b=c#d", "wss://host.example:8443/a"),
+        ("wss://u:p@host.example:8443/a?b=c#d", "<URL with user information>"),
         ("ws://[::1]:8137/", "ws://[::1]:8137/"),
         ("wss://alice:pa#ss@host.example", "<URL with user information>"),
         ("wss://alice:pa/ss@host.example/x", "<URL with user information>"),
         ("wss://alice:pa?ss@host.example", "<URL with user information>"),
+        ("wss://alice:pa@ss/SECRET@host.example/x", "<URL with user information>"),
+        ("wss://alice:pa@ss?SECRET@host.example/x", "<URL with user information>"),
+        ("wss://alice:pa@ss#SECRET@host.example/x", "<URL with user information>"),
         ("wss://host.example", "wss://host.example"),
         ("not a url", "<invalid URL>"),
-        ("ws//u:p@host", "<invalid URL>"),
+        ("ws//u:p@host", "<URL with user information>"),
+        ("ws//host/path", "<invalid URL>"),
     ],
 )
 def test_display_url(url: str, shown: str) -> None:
