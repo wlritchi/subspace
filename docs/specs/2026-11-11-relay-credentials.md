@@ -42,6 +42,7 @@ This causes three problems:
 - Existing installations keep working for a deprecation period.
 - A missing or refused credential gives an error that tells the user what
   to set.
+- A relay and a server on one machine need no setup.
 
 ## Non-goals
 
@@ -126,6 +127,7 @@ Claude Code stores the values as follows:
   ```bash
   claude plugin configure subspace@subspace --values-stdin
   ```
+
 - A change takes effect when Claude Code restarts.
 
 ## Resolution order
@@ -151,7 +153,48 @@ link applies at the next reconnect.
 4. `<NOTIFICATIONS_DATA_DIR>/token` (deprecated). The relay uses the file
    only if it is a regular file after it follows links, the relay can read
    it, and it is not empty. A dangling link counts as no file.
-5. None: see [A missing or refused credential](#a-missing-or-refused-credential).
+5. The server's token file, only if no source gives a URL. See
+   [The server's token file](#the-servers-token-file).
+6. None: see [A missing or refused credential](#a-missing-or-refused-credential).
+
+### The server's token file
+
+A server and a relay on one machine need no setup. When the server has no
+`SUBSPACE_TOKEN`, it creates its master token in `<data dir>/token`. The
+relay finds that file with the server's rule: `SUBSPACE_DATA_DIR`, else
+`$XDG_DATA_HOME/subspace`, else `~/.local/share/subspace`. The file rules
+of step 4 apply.
+
+The relay uses this step only if no source gives a URL, so that the URL is
+the default `ws://127.0.0.1:8137`. If the user sets any URL, the user also
+sets a credential. A check of the host name is not sufficient:
+
+- A name such as `localhost` can resolve to an address on another machine.
+- A local port can be a forward to a remote server.
+- Two servers on one machine can listen on different ports, and the file
+  belongs to only one of them.
+
+In each case, the master token would go to a server that does not own it.
+The default URL is a literal address, so no name is resolved. The default
+port is the port that the server listens on when it has no configuration.
+
+For a connection that uses this step, the relay does not use a proxy. The
+`websockets` client otherwise reads a proxy from the environment.
+
+This step is not deprecated. The file holds the master token, so the relay
+acts in the default account. That is the expected setup on a machine with
+one user.
+
+This step trusts the process that listens on `127.0.0.1:8137`. The relay
+does not authenticate that process as the server that owns the file. Any
+local process can bind the port before the server starts, and then it gets
+the master token. On a machine where other users or untrusted programs run,
+set a credential explicitly and set the URL. A URL setting turns this step
+off.
+
+The server creates the file when it starts. If the relay starts first, the
+file is not there yet. The relay resolves the sources again before each
+connection attempt, so it finds the file at a later attempt.
 
 ### Why the options come first
 
@@ -166,17 +209,22 @@ then act in the default account, with every permission.
 To override an option, change the option (`/plugin configure` or
 `--values-stdin`), or clear it.
 
-### Logs
+### Logs and redirects
 
 At startup, and when a source changes, the relay logs the source of each
 value. For example: `subspace relay: URL from the server_url option,
 credential from SUBSPACE_TOKEN`. These rules apply:
 
 - The relay never logs a credential.
+- The relay does not follow a redirect from the server. A redirect sends
+  the credential again, to an address that the user did not configure. The
+  `websockets` client follows redirects by default. The relay treats a
+  redirect as a failed connection, and logs the status without the
+  `Location` value.
 - Logs and tool errors show a URL without its user information, query, and
   fragment.
 - If the URL and the credential come from different kinds of source (one
-  from an option, the other from the environment or the token file), the
+  from an option, the other from the environment or a token file), the
   relay logs a warning. Then a credential is not sent to an address that
   was configured for a different one without a notice. The default URL
   does not count as a source.
@@ -196,12 +244,16 @@ server, those names give the address that the server listens on. The
 address that the relay connects to can be different. So the relay takes
 only the full URL.
 
+The relay reads `SUBSPACE_DATA_DIR` only to find the server's token file.
+That is the same meaning as on the server.
+
 ## A missing or refused credential
 
-The relay no longer creates the token file. It reads the file only under
-the rules in step 4. A local setup makes the file a link to the server's
-token (`scripts/migrate-from-notifications.py` does this for a moved
-installation). That setup keeps working.
+The relay no longer creates its token file. It reads the file only under
+the rules in step 4. A moved local installation can have that file as a
+link to the server's token (`scripts/migrate-from-notifications.py` makes
+the link). That setup keeps working. With step 5, a local setup does not
+need the link.
 
 **No credential.** If no source gives a credential, the relay does not
 connect. It logs the error below at startup, so a user who never calls a
@@ -210,9 +262,16 @@ tool can also find it. Each tool call returns the same error:
 ```
 subspace: no credential. Set the plugin's token option
 (/plugin configure subspace@subspace), or SUBSPACE_TOKEN.
-For a server on this machine, the server's token file is
-$XDG_DATA_HOME/subspace/token.
+The relay also read the server's token file
+(/home/user/.local/share/subspace/token): it does not exist.
+For a server on this machine, start the server first.
 ```
+
+The last three lines appear only if step 5 applies. They give the path
+that the relay read and the reason that the file was not usable: it does
+not exist, it is a dangling link, it is not a regular file, it cannot be
+read, or it is empty. The advice to start the server appears only if the
+file does not exist.
 
 **Refused credential.** If the server refuses the WebSocket handshake with
 `401` or `403`, the relay logs the refusal and the source of the
@@ -262,17 +321,13 @@ agent cannot control. That is out of scope.
    - It stops setting the `NOTIFICATIONS_` names.
    - To keep the credential out of the environment, it uses the option and
      sets no token variable.
-3. **A local installation** that uses the token file link sets the option
-   from the server's token, for example:
-
-   ```bash
-   jq -n --rawfile t "${XDG_DATA_HOME:-$HOME/.local/share}/subspace/token" \
-     '{token: ($t | rtrimstr("\n"))}' \
-     | claude plugin configure subspace@subspace --values-stdin
-   ```
-
-4. **A later release** removes the deprecated names and the token file
-   step. It needs a date only after deployments have switched.
+3. **A local installation** needs no change if the server keeps its
+   default port and data directory, and the relay has no URL setting: step
+   5 finds the token. If the server uses `SUBSPACE_DATA_DIR`, set the same
+   value for Claude Code. If the relay has a URL setting, for a different
+   port, also set the token option or `SUBSPACE_TOKEN`.
+4. **A later release** removes the deprecated names and step 4. It needs a
+   date only after deployments have switched.
 
 ## Tests
 
@@ -288,6 +343,24 @@ agent cannot control. That is out of scope.
 
 **Unit, token file:** a custom `NOTIFICATIONS_DATA_DIR`. A link to an
 existing file. A dangling link. An empty file. An unreadable file.
+
+**Unit, the server's token file:**
+
+- The default URL with no other source uses the file.
+- `SUBSPACE_DATA_DIR` and `XDG_DATA_HOME` move it.
+- A URL from any source does not use the file, even if the file exists and
+  the URL is `ws://127.0.0.1:8137` or `ws://localhost:8137`. The result is
+  the "no credential" error without the step 5 lines.
+- With a proxy set in the environment, a step 5 connection does not use
+  it.
+- Step 4 comes before step 5.
+- A file that appears after the relay starts is used at the next attempt.
+- The error gives the right reason for a missing file, a dangling link, a
+  directory, an unreadable file, and an empty file.
+
+**Unit, redirects:** a server that answers the handshake with a redirect.
+The relay does not connect to the `Location`, does not send the credential
+again, and does not log the `Location` value.
 
 **Unit, errors:**
 
@@ -320,7 +393,8 @@ or in tool errors.
 
 - `server/README.md`:
   - The relay section gives the new names, the options, and
-    non-interactive setup.
+    non-interactive setup. It says that a relay and a server on one machine
+    need no setup.
   - The token section drops the advice to set `SUBSPACE_TOKEN` and
     `NOTIFICATIONS_TOKEN` to the same value.
   - The migration section drops the advice to rename every `NOTIFICATIONS_`
@@ -333,9 +407,4 @@ or in tool errors.
 
 ## Open questions
 
-1. **A default for local servers.** The relay could also read the server's
-   default token file (`$XDG_DATA_HOME/subspace/token`) as a last step. A
-   server and a relay on one machine would then need no setup. The cost:
-   the relay reads a file that belongs to the server, and that file holds
-   the master token.
-2. **When to remove the deprecated names.** This spec gives no date.
+1. **When to remove the deprecated names.** This spec gives no date.
