@@ -133,6 +133,15 @@ def test_write_read_roundtrip_and_reap(tmp_path, monkeypatch):
     assert session_state.read_session(DEAD_PID) is None
 
 
+def test_reap_removes_resume_marks_and_taken_marks_of_dead_pids(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    mark = session_state.mark_resume(DEAD_PID, "ghost")
+    taken = mark.with_name(f"{DEAD_PID}.taken-1-abcd1234")
+    taken.write_text("{}")  # a consumer that died after its rename
+    session_state.reap_stale()
+    assert not mark.exists() and not taken.exists()
+
+
 def test_read_session_accepts_matching_start_time(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 111)
@@ -1351,6 +1360,110 @@ def test_ipc_resume_with_no_prompt_goes_to_the_channel(relay, monkeypatch, ipc_s
     anyio.run(scenario)
     assert [content for content, _ in delivered] == ["@here all hands"]
     assert acked == ["m1"]
+
+
+class _BlockingRegisterWs(_FakeWs):
+    """A daemon connection whose REGISTER send waits until `release` is set,
+    as with backpressure on the WebSocket."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocked = anyio.Event()
+        self.release = anyio.Event()
+
+    async def send(self, raw: str) -> None:
+        frame = json.loads(raw)
+        if frame.get("type") == wsproto.REGISTER:
+            self.blocked.set()
+            await self.release.wait()
+        self.sent.append(frame)
+
+
+def test_resume_blocked_in_register_does_not_abandon_a_claim(
+    relay, monkeypatch, ipc_socket
+):
+    """/resume in a running session: the resume connection waits in its
+    REGISTER while the first prompt claims. When the resume connection ends,
+    it must not abandon the claim of the other connection: the message would
+    go to the channel and also be in the hook's output."""
+    client, delivered, acked = _holding_client(relay, monkeypatch)
+    client._ws = _BlockingRegisterWs()
+    client._registered_session = "old"
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.serve_ipc)
+            await _wait_for(ipc_socket)
+            await _hook_exchange(
+                ipc_socket,
+                {"type": "resume", "session_id": "new", "source": "resume"},
+                done=False,
+            )
+            with anyio.fail_after(5.0):
+                await client._ws.blocked.wait()
+            # The server's copy of the resumed session's message.
+            client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+            async with await anyio.connect_unix(str(ipc_socket)) as stream:
+                request = {"type": "claim", "session_id": "new", "source": "prompt"}
+                await stream.send(json.dumps(request).encode() + b"\n")
+                lines = BufferedByteReceiveStream(stream)
+                reply = json.loads(await lines.receive_until(b"\n", 65536))
+                assert reply["count"] == 1
+                client._ws.release.set()  # the resume connection ends now
+                await anyio.sleep(0.2)
+                assert delivered == [] and acked == []
+                await stream.send(b'{"type": "done"}\n')
+                await anyio.sleep(0.1)
+            tg.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert acked == ["m1"]
+    assert delivered == []
+    assert not client.holding
+
+
+def test_second_claim_while_one_is_open_gets_nothing(relay, monkeypatch, ipc_socket):
+    """A second claim while the first waits for whoami takes nothing and does
+    not end the hold; the first claim keeps its items and acks them once."""
+    client, delivered, acked = _holding_client(relay, monkeypatch)
+    client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+    waiting = anyio.Event()
+    gate = anyio.Event()
+
+    async def slow_request(payload, *, timeout=0.0):
+        waiting.set()
+        await gate.wait()
+        return {"type": wsproto.WHOAMI_RESULT, "session_id": "sid"}
+
+    client.request = slow_request
+    replies: list[dict] = []
+    claim = {"type": "claim", "session_id": "sid", "source": "prompt"}
+
+    async def first_claim() -> None:
+        replies.append(await _hook_exchange(ipc_socket, claim, done=True))
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.serve_ipc)
+            await _wait_for(ipc_socket)
+            tg.start_soon(first_claim)
+            with anyio.fail_after(5.0):
+                await waiting.wait()
+            with anyio.fail_after(5.0):  # the answer does not wait for the first
+                second = await _hook_exchange(ipc_socket, claim, done=True)
+            assert second == {"type": "claimed", "count": 0, "content": ""}
+            assert client.holding
+            gate.set()
+            with anyio.fail_after(5.0):
+                while not replies or client._claim_open:
+                    await anyio.sleep(0.02)
+            await client._flush_debounce()
+            tg.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert replies[0]["count"] == 1
+    assert acked == ["m1"]
+    assert delivered == []
 
 
 def test_ipc_close_before_done_keeps_messages_for_the_channel(

@@ -9,6 +9,7 @@ import asyncio
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -399,3 +400,24 @@ def test_resume_mark_of_a_recycled_pid_is_not_valid(state_dir, monkeypatch):
     session_state.mark_resume(4242, "sid-9")
     monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 222)
     assert session_state.take_resume(4242) is None
+
+
+def test_take_resume_keeps_a_newer_mark(state_dir, monkeypatch):
+    """A newer resume can replace the mark while a prompt takes the old one.
+    The take moves the mark away before it reads it, so it never removes the
+    newer mark."""
+    session_state.mark_resume(4242, "sid-old")
+    real_rename = os.rename
+
+    def rename_then_resume(src: str | Path, dst: str | Path) -> None:
+        real_rename(src, dst)
+        session_state.mark_resume(4242, "sid-new")
+
+    monkeypatch.setattr(session_state.os, "rename", rename_then_resume)
+    mark = session_state.take_resume(4242)
+    monkeypatch.setattr(session_state.os, "rename", real_rename)
+    assert mark is not None and mark[0] == "sid-old"
+    mark = session_state.take_resume(4242)
+    assert mark is not None and mark[0] == "sid-new"
+    assert session_state.take_resume(4242) is None
+    assert list(state_dir.parent.glob("*.taken-*")) == []

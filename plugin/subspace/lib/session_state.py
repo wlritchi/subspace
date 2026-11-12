@@ -20,6 +20,7 @@ stdlib only, so the hook can run without building a dependency environment.
 
 import json
 import os
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -216,11 +217,23 @@ def take_resume(claude_pid: int) -> tuple[str, float] | None:
         return None
     if secure_state_dir() is None:
         return None
+    # Move the mark to a name of this caller before reading it. A read and then
+    # an unlink of the mark could remove a newer mark that a resume wrote
+    # between the two.
+    taken = path.with_name(f"{claude_pid}.taken-{os.getpid()}-{secrets.token_hex(4)}")
     try:
-        raw = path.read_text()
-        path.unlink()
+        os.rename(path, taken)
+    except OSError:
+        return None  # no mark, or another caller took it
+    try:
+        raw = taken.read_text()
     except OSError:
         return None
+    finally:
+        try:
+            taken.unlink()
+        except OSError:
+            pass
     try:
         data = json.loads(raw)
     except ValueError:
@@ -363,6 +376,7 @@ def reap_stale() -> None:
         *directory.glob("*.json"),
         *directory.glob("*.sock"),
         *directory.glob("*.resume"),
+        *directory.glob("*.taken-*"),
     ]
     for entry in entries:
         try:

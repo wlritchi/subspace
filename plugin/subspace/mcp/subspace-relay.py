@@ -292,6 +292,10 @@ class DaemonClient:
         # and the session they belong to.
         self._claimed: list[dict] = []
         self._claimed_session = ""
+        # True while one hook connection owns a claim, from its request to its
+        # confirm or abandon. A second claim then gets nothing: it must not
+        # replace the items of the first, or end its hold.
+        self._claim_open = False
         # Ids the hook wrote (id -> session), kept until the next session
         # change so that a replay of one of them is not delivered again; the
         # subset whose ack did not reach the server, to ack on the next live
@@ -703,8 +707,6 @@ class DaemonClient:
         except Exception as exc:  # noqa: BLE001
             # A hook failure must not take the relay down.
             print(f"subspace relay: hook request failed ({exc!r})", file=sys.stderr)
-        if self._claimed:  # the hook went away before "done"
-            await self.abandon_claim()
 
     async def _serve_hook(self, stream) -> None:
         lines = BufferedByteReceiveStream(stream)
@@ -720,21 +722,30 @@ class DaemonClient:
             return
         if kind != "claim":
             return
-        items = await self.claim(str(request.get("session_id") or ""))
-        reply = {
-            "type": "claimed",
-            "count": len(items),
-            "content": "\n\n".join(item["content"] for item in items),
-        }
-        await stream.send(json.dumps(reply).encode() + b"\n")
-        if not items:
-            self._release_hold()
+        if self._claim_open:
+            await stream.send(_claimed_reply([]))
             return
-        done = await _read_ipc_line(lines, IPC_DONE_SECONDS)
-        if done is not None and done.get("type") == "done":
-            await self.confirm_claim()
-        else:
-            await self.abandon_claim()
+        self._claim_open = True
+        settled = False
+        try:
+            items = await self.claim(str(request.get("session_id") or ""))
+            await stream.send(_claimed_reply(items))
+            if not items:
+                self._release_hold()
+                settled = True
+                return
+            done = await _read_ipc_line(lines, IPC_DONE_SECONDS)
+            if done is not None and done.get("type") == "done":
+                await self.confirm_claim()
+                settled = True
+        finally:
+            # Only the connection that made the claim abandons it: the hook went
+            # away, sent junk, or the relay stops. The items go back to channel
+            # delivery, unacked.
+            if not settled:
+                with anyio.CancelScope(shield=True):
+                    await self.abandon_claim()
+            self._claim_open = False
 
     async def _dispatch_notify(self, notification_id, content: str, meta: dict) -> None:
         """Route one delivered item by kind and mode."""
@@ -1221,6 +1232,16 @@ def _hook_expected() -> bool:
         return False
     age = session_state.state_file_age(claude_pid)
     return age is None or age < START_HOLD_MAX_AGE_SECONDS
+
+
+def _claimed_reply(items: list[dict]) -> bytes:
+    """The answer to a hook's claim: the claimed contents, one line of JSON."""
+    reply = {
+        "type": "claimed",
+        "count": len(items),
+        "content": "\n\n".join(item["content"] for item in items),
+    }
+    return json.dumps(reply).encode() + b"\n"
 
 
 async def _read_ipc_line(
