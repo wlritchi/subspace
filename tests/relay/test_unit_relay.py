@@ -1466,6 +1466,82 @@ def test_second_claim_while_one_is_open_gets_nothing(relay, monkeypatch, ipc_soc
     assert delivered == []
 
 
+def test_abandon_that_fails_still_allows_a_later_claim(
+    relay, monkeypatch, ipc_socket, capsys
+):
+    """The channel send of an abandoned claim fails (the MCP stream closed):
+    the error is logged, the message stays unacked, and the next claim works."""
+    client, delivered, acked = _holding_client(relay, monkeypatch)
+    client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+    record_delivery = client._deliver_channel
+
+    async def broken_deliver(content, meta):
+        raise RuntimeError("stream closed")
+
+    client._deliver_channel = broken_deliver
+    claim = {"type": "claim", "session_id": "sid", "source": "prompt"}
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.serve_ipc)
+            await _wait_for(ipc_socket)
+            reply = await _hook_exchange(ipc_socket, claim, done=False)
+            assert reply["count"] == 1
+            with anyio.fail_after(5.0):
+                while client._claim_open:
+                    await anyio.sleep(0.02)
+            client._deliver_channel = record_delivery
+            client._pending_debounce = [_message("m2", "@you direct", "direct")]
+            client._start_hold()  # a later resume
+            reply = await _hook_exchange(ipc_socket, claim, done=True)
+            assert reply["count"] == 1 and reply["content"] == "@you direct"
+            tg.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert acked == ["m2"]  # m1 is unacked: the server sends it again
+    assert delivered == []
+    assert not client._claim_open
+    assert "abandoned claim not delivered" in capsys.readouterr().err
+
+
+def test_relay_stop_with_a_blocked_abandon_ends_in_time(relay, monkeypatch, ipc_socket):
+    """The relay stops while a hook holds a claim, and the channel send of the
+    abandon blocks: the stop waits only ABANDON_SECONDS, and the claim flag
+    is reset."""
+    monkeypatch.setattr(relay, "ABANDON_SECONDS", 0.3)
+    client, _delivered, acked = _holding_client(relay, monkeypatch)
+    client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+    started = anyio.Event()
+
+    async def blocked_deliver(content, meta):
+        started.set()
+        await anyio.sleep_forever()
+
+    client._deliver_channel = blocked_deliver
+    claim = {"type": "claim", "session_id": "sid", "source": "prompt"}
+
+    async def scenario() -> float:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.serve_ipc)
+            await _wait_for(ipc_socket)
+            stream = await anyio.connect_unix(str(ipc_socket))
+            await stream.send(json.dumps(claim).encode() + b"\n")
+            lines = BufferedByteReceiveStream(stream)
+            reply = json.loads(await lines.receive_until(b"\n", 65536))
+            assert reply["count"] == 1
+            assert client._claim_open
+            began = time.monotonic()
+            tg.cancel_scope.cancel()  # the relay stops before "done"
+        await stream.aclose()
+        return time.monotonic() - began
+
+    elapsed = anyio.run(scenario)
+    assert started.is_set()  # the abandon tried the channel
+    assert elapsed < 2.0
+    assert not client._claim_open
+    assert acked == []
+
+
 def test_ipc_close_before_done_keeps_messages_for_the_channel(
     relay, monkeypatch, ipc_socket
 ):

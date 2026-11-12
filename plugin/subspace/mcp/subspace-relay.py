@@ -115,6 +115,11 @@ WHOAMI_TIMEOUT_SECONDS = 6.0
 IPC_LINE_MAX_BYTES = 65536
 IPC_REQUEST_SECONDS = 5.0
 IPC_DONE_SECONDS = 30.0
+# An abandoned claim sends its items to the channel, also while the relay
+# stops, so the abandon is shielded from cancellation. This limit keeps a
+# blocked channel or ack from stopping the relay. Items it did not send stay
+# unacked on the server, which sends them again on the next connection.
+ABANDON_SECONDS = 5.0
 
 # Debounce/coalesce window for push (channel) delivery. A burst of notifications
 # (e.g. several PR check/review/comment events landing in one poll) is coalesced
@@ -742,10 +747,19 @@ class DaemonClient:
             # Only the connection that made the claim abandons it: the hook went
             # away, sent junk, or the relay stops. The items go back to channel
             # delivery, unacked.
-            if not settled:
-                with anyio.CancelScope(shield=True):
-                    await self.abandon_claim()
-            self._claim_open = False
+            try:
+                if not settled:
+                    with anyio.move_on_after(ABANDON_SECONDS, shield=True):
+                        await self.abandon_claim()
+            except Exception as exc:  # noqa: BLE001
+                # The unsent items stay unacked on the server. A later claim
+                # must still be possible.
+                print(
+                    f"subspace relay: abandoned claim not delivered ({exc!r})",
+                    file=sys.stderr,
+                )
+            finally:
+                self._claim_open = False
 
     async def _dispatch_notify(self, notification_id, content: str, meta: dict) -> None:
         """Route one delivered item by kind and mode."""
