@@ -1122,7 +1122,6 @@ def test_catch_up_repeats_the_resume_delivery_once(relay, monkeypatch):
 def test_claim_registers_a_new_session_and_discards_old_items(relay, monkeypatch):
     client, _delivered, acked = _holding_client(relay, monkeypatch)
     client._registered_session = "old"
-    client._hold_deadline = None
     client._pending_debounce = [_message("old1", "stale", "urgent")]
     client._held = [_message("old2", "stale quiet", "ambient")]
 
@@ -1285,6 +1284,75 @@ def test_ipc_claim_then_done_acks(relay, monkeypatch, ipc_socket):
     assert not ipc_socket.exists()  # removed on shutdown
 
 
+def test_ipc_resume_holds_until_the_prompt_claims(relay, monkeypatch, ipc_socket):
+    """SessionStart sends resume and claims nothing; the first prompt claims."""
+    monkeypatch.setattr(relay, "HOLD_SECONDS", 0.1)
+    client, delivered, acked = _holding_client(relay, monkeypatch)
+    client._hold_deadline = None
+    client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.serve_ipc)
+            tg.start_soon(client.debounce_loop)
+            await _wait_for(ipc_socket)
+            await _hook_exchange(
+                ipc_socket,
+                {"type": "resume", "session_id": "sid", "source": "resume"},
+                done=False,
+            )
+            await anyio.sleep(0.3)  # past the start hold
+            assert client.holding
+            assert delivered == [] and acked == []
+            reply = await _hook_exchange(
+                ipc_socket,
+                {"type": "claim", "session_id": "sid", "source": "prompt"},
+                done=True,
+            )
+            assert reply["content"] == "@here all hands"
+            tg.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert acked == ["m1"]
+    assert delivered == []
+    assert not client.holding
+
+
+def test_ipc_resume_with_no_prompt_goes_to_the_channel(relay, monkeypatch, ipc_socket):
+    """A resume that no prompt follows: nothing is claimed, and the messages go
+    out as a channel event when the hold ends. A late prompt takes nothing."""
+    monkeypatch.setattr(relay, "HOLD_SECONDS", 0.1)
+    monkeypatch.setattr(relay, "RESUME_HOLD_SECONDS", 0.3)
+    client, delivered, acked = _holding_client(relay, monkeypatch)
+    client._hold_deadline = None
+    client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client.serve_ipc)
+            tg.start_soon(client.debounce_loop)
+            await _wait_for(ipc_socket)
+            await _hook_exchange(
+                ipc_socket,
+                {"type": "resume", "session_id": "sid", "source": "resume"},
+                done=False,
+            )
+            with anyio.fail_after(5.0):
+                while not delivered:
+                    await anyio.sleep(0.02)
+            reply = await _hook_exchange(
+                ipc_socket,
+                {"type": "claim", "session_id": "sid", "source": "prompt"},
+                done=True,
+            )
+            assert reply == {"type": "claimed", "count": 0, "content": ""}
+            tg.cancel_scope.cancel()
+
+    anyio.run(scenario)
+    assert [content for content, _ in delivered] == ["@here all hands"]
+    assert acked == ["m1"]
+
+
 def test_ipc_close_before_done_keeps_messages_for_the_channel(
     relay, monkeypatch, ipc_socket
 ):
@@ -1377,7 +1445,9 @@ def test_hook_expected_follows_the_state_file_age(relay, monkeypatch, tmp_path):
 
 
 def test_claim_holds_before_it_waits_for_the_connection(relay, monkeypatch):
+    # Not yet a push session, so a claim with no hold on still claims.
     client, _delivered, _acked = _holding_client(relay, monkeypatch)
+    client._mode = None
     client._hold_deadline = None
     seen: list[bool] = []
 
@@ -1388,6 +1458,69 @@ def test_claim_holds_before_it_waits_for_the_connection(relay, monkeypatch):
     client.wait_connected = fake_wait_connected
     assert anyio.run(client.claim, "sid") == []
     assert seen == [True]
+
+
+def test_claim_after_the_hold_ended_takes_nothing_at_once(relay, monkeypatch):
+    """A prompt that comes after the hold ended: the channel has the messages,
+    so the claim does not take them again, and does not make the prompt wait
+    for the connection or for whoami."""
+    client, _delivered, _acked = _holding_client(relay, monkeypatch)
+    client._release_hold()
+    client._pending_debounce = [_message("m1", "@here all hands", "urgent")]
+    waited: list[float] = []
+
+    async def fake_wait_connected(timeout: float) -> bool:
+        waited.append(timeout)
+        return True
+
+    client.wait_connected = fake_wait_connected
+    assert anyio.run(client.claim, "sid") == []
+    assert waited == [] and client._ws.sent == []
+    assert not client.holding
+    assert [item["id"] for item in client._pending_debounce] == ["m1"]
+
+
+def test_expect_prompt_holds_for_the_first_prompt(relay, monkeypatch):
+    """The SessionStart hook says the start is a resume: the hold lasts for
+    RESUME_HOLD_SECONDS, and a later session-change hold does not cut it."""
+    monkeypatch.setattr(relay, "HOLD_SECONDS", 0.1)
+    monkeypatch.setattr(relay, "RESUME_HOLD_SECONDS", 60.0)
+    client, _delivered, _acked = _holding_client(relay, monkeypatch)
+    client._hold_deadline = None
+
+    async def scenario():
+        await client.expect_prompt("sid")
+        assert client._ws.sent == []  # the same id: no register
+        await client._register(client._ws, "other")  # a session change
+        await anyio.sleep(0.2)
+        assert client.holding
+
+    anyio.run(scenario)
+    assert client._hold_deadline - time.monotonic() > 50
+
+
+def test_expect_prompt_registers_a_new_session(relay, monkeypatch):
+    """/resume in a running session: the relay registers the resumed id at
+    once, so the server sends its pending items during the hold."""
+    client, _delivered, _acked = _holding_client(relay, monkeypatch)
+    client._registered_session = "old"
+    client._hold_deadline = None
+    client._pending_debounce = [_message("old1", "stale", "urgent")]
+
+    anyio.run(client.expect_prompt, "new")
+    assert client._ws.sent == [{"type": wsproto.REGISTER, "session_id": "new"}]
+    assert client._registered_session == "new"
+    assert client.holding
+    assert client._pending_debounce == []
+
+
+def test_expect_prompt_before_the_connection_ends_the_grace(relay, monkeypatch):
+    client, _delivered, _acked = _holding_client(relay, monkeypatch)
+    client._ws = None
+    client._hold_deadline = None
+    anyio.run(client.expect_prompt, "sid")
+    assert client.holding
+    assert client._reconnect_now.is_set()
 
 
 def test_replay_of_a_claimed_message_is_not_delivered_twice(relay, monkeypatch):
@@ -1502,6 +1635,7 @@ def test_confirm_while_disconnected_acks_on_the_next_registration(relay, monkeyp
         assert delivered == []  # the replay is dropped
 
         client._pending_debounce = [_message("m2", "@you", "direct")]
+        client._start_hold()  # a second resume
         await client.claim("sid")
         client._ws = None  # drops again before the hook confirms
         await client.confirm_claim()

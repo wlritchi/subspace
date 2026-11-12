@@ -1,6 +1,6 @@
 # vim: filetype=python
-"""Shared session-id correlation between the subspace MCP relay and the
-SessionStart hook.
+"""Shared session-id correlation between the subspace MCP relay and its
+hooks (SessionStart and UserPromptSubmit).
 
 Background: when a session is resumed (`/resume`, or `--resume` with the picker),
 the CLAUDE_CODE_SESSION_ID handed to the already-spawned stdio MCP server is the
@@ -168,9 +168,77 @@ def _state_path(claude_pid: int) -> Path:
 
 
 def ipc_path(claude_pid: int) -> Path:
-    """The local socket on which the relay of this Claude Code process takes the
-    SessionStart hook's claim of the messages that arrived while it was stopped."""
+    """The local socket on which the relay of this Claude Code process talks to
+    the hooks: the SessionStart hook tells it how the session starts, and the
+    first prompt after a resume claims the messages that arrived while the
+    session was stopped."""
     return state_dir() / f"{claude_pid}.sock"
+
+
+def _resume_path(claude_pid: int) -> Path:
+    return state_dir() / f"{claude_pid}.resume"
+
+
+def mark_resume(claude_pid: int, session_id: str) -> Path | None:
+    """Record that a resume of `session_id` waits for its first prompt. The
+    UserPromptSubmit hook claims the held messages only when this mark is
+    there, so the other prompts cost no relay round trip."""
+    if secure_state_dir() is None:
+        return None
+    path = _resume_path(claude_pid)
+    payload = {
+        "session_id": session_id,
+        "start_time": _proc_start_time(claude_pid),
+        "written": time.time(),
+    }
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
+    return path
+
+
+def clear_resume(claude_pid: int) -> None:
+    """Remove the resume mark: a later start is not a resume."""
+    try:
+        _resume_path(claude_pid).unlink()
+    except OSError:
+        pass
+
+
+def take_resume(claude_pid: int) -> tuple[str, float] | None:
+    """Remove the resume mark and return its session id and age in seconds,
+    or None if there is no valid mark. Only one caller gets a given mark.
+
+    A mark of a recycled pid, or in a directory that is not private to this
+    user, is not valid."""
+    path = _resume_path(claude_pid)
+    if not path.exists():
+        return None
+    if secure_state_dir() is None:
+        return None
+    try:
+        raw = path.read_text()
+        path.unlink()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    recorded_start = data.get("start_time")
+    if recorded_start is not None:
+        current_start = _proc_start_time(claude_pid)
+        if current_start is not None and current_start != recorded_start:
+            return None
+    session_id = data.get("session_id")
+    written = data.get("written")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(written, int | float):
+        return None
+    return session_id, max(0.0, time.time() - written)
 
 
 def write_session(
@@ -291,7 +359,12 @@ def reap_stale() -> None:
     directory = state_dir()
     if not directory.is_dir():
         return
-    for entry in [*directory.glob("*.json"), *directory.glob("*.sock")]:
+    entries = [
+        *directory.glob("*.json"),
+        *directory.glob("*.sock"),
+        *directory.glob("*.resume"),
+    ]
+    for entry in entries:
         try:
             pid = int(entry.stem)
         except ValueError:

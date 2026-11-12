@@ -8,12 +8,15 @@ the long-lived MCP server can pick up the correct id even when its env var holds
 the stale temporary id from before a resume. Correlation is by the Claude Code
 process both the hook and the server descend from.
 
-On a resume, the hook also claims from the relay the messages that arrived while
-the session was stopped, and returns them as `additionalContext`, so the agent
-has them in its first turn. The relay holds them back from channel delivery
-until the hook claims or declines; the relay acks them only after the hook has
-written its output. The hook talks to the relay, never to the server: a second
-server connection would get every unacked message again.
+The hook also tells the relay how the session starts. On a resume, the relay
+keeps holding the messages that arrived while the session was stopped, and the
+hook leaves a resume mark for the UserPromptSubmit hook (prompt-submit.py),
+which claims them for the first turn. The hook does not claim them itself:
+SessionStart context reaches the model only with a turn, and a resume with no
+prompt starts no turn. The relay acks a claimed message, so a claim here would
+lose it. For any other start, the hook declines and the relay ends its hold.
+The hook talks to the relay, never to the server: a second server connection
+would get every unacked message again.
 
 Entirely best-effort: any failure is swallowed so a session never fails to start
 because of us, and every wait is bounded.
@@ -25,110 +28,40 @@ because of us, and every wait is bounded.
 # ///
 
 import asyncio
-import contextlib
 import json
 import sys
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import hook_ipc
 import session_state
 
 # The relay's socket appears when its MCP server starts, which can lag a slow
-# `uv run`. A claim waits through the relay's startup grace and the server's
-# whoami; a decline only needs a relay that is already up.
-CLAIM_WAIT_SECONDS = 10.0
-DECLINE_WAIT_SECONDS = 3.0
-CONNECT_POLL_SECONDS = 0.1
-CONTEXT_HEADER = (
-    "Agent messages arrived while this session was stopped. They are delivered "
-    "here once, at resume, in place of channel notifications:\n\n"
-)
+# `uv run`. A relay that starts later holds at start anyway (it finds a fresh
+# state file), so the hook does not wait long for it.
+NOTIFY_WAIT_SECONDS = 3.0
 
 
-def build_output(content: str) -> dict:
-    """The SessionStart hook JSON that puts `content` into the first turn."""
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": CONTEXT_HEADER + content,
-        }
-    }
-
-
-async def _connect(
-    path: Path, deadline: float
-) -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
-    """Connect to the relay's socket, trying again until `deadline`."""
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        try:
-            return await asyncio.wait_for(
-                asyncio.open_unix_connection(str(path)), timeout=remaining
-            )
-        except (OSError, TimeoutError):
-            await asyncio.sleep(CONNECT_POLL_SECONDS)
-
-
-async def _send(writer: asyncio.StreamWriter, message: dict) -> None:
-    writer.write(json.dumps(message).encode() + b"\n")
-    await writer.drain()
-
-
-async def handoff(
-    path: Path, session_id: str, source: str, emit: Callable[[str], None]
-) -> bool:
-    """Claim the held messages for a resume (or decline for any other start).
-
-    `emit` writes the hook output; it is called at most once, before the relay
-    is told "done" and acks the messages. Returns True if messages were emitted.
-    """
-    claim = source == "resume"
-    wait = CLAIM_WAIT_SECONDS if claim else DECLINE_WAIT_SECONDS
-    deadline = time.monotonic() + wait
-    connection = await _connect(path, deadline)
+async def handoff(path: Path, session_id: str, source: str) -> bool:
+    """Tell the relay that this start is a resume, or decline for any other
+    start. Returns True if the relay got the message."""
+    kind = "resume" if source == "resume" else "decline"
+    deadline = time.monotonic() + NOTIFY_WAIT_SECONDS
+    connection = await hook_ipc.connect(path, deadline)
     if connection is None:
         return False
-    reader, writer = connection
+    _reader, writer = connection
     try:
-        await _send(
-            writer,
-            {
-                "type": "claim" if claim else "decline",
-                "session_id": session_id,
-                "source": source,
-            },
+        await hook_ipc.send(
+            writer, {"type": kind, "session_id": session_id, "source": source}
         )
-        if not claim:
-            return False
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        raw = await asyncio.wait_for(reader.readline(), timeout=remaining)
-        reply = json.loads(raw)
-        if not isinstance(reply, dict) or reply.get("type") != "claimed":
-            return False
-        content = reply.get("content")
-        if not isinstance(content, str) or not content:
-            return False
-        emit(json.dumps(build_output(content)))
-        await _send(writer, {"type": "done"})
         return True
-    except (OSError, TimeoutError, ValueError):
+    except OSError:
         return False
     finally:
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
-
-
-def _emit(text: str) -> None:
-    sys.stdout.write(text + "\n")
-    sys.stdout.flush()
+        await hook_ipc.close(writer)
 
 
 def main() -> None:
@@ -150,9 +83,11 @@ def main() -> None:
     source = payload.get("source")
     session_state.write_session(claude_pid, session_id, source)
     session_state.reap_stale()
-    asyncio.run(
-        handoff(session_state.ipc_path(claude_pid), session_id, str(source), _emit)
-    )
+    if source == "resume":
+        session_state.mark_resume(claude_pid, session_id)
+    else:
+        session_state.clear_resume(claude_pid)
+    asyncio.run(handoff(session_state.ipc_path(claude_pid), session_id, str(source)))
 
 
 if __name__ == "__main__":

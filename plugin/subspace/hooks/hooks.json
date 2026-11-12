@@ -10,6 +10,17 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/prompt-submit.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
     "PostCompact": [
       {
         "hooks": [

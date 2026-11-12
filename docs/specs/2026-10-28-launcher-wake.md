@@ -146,57 +146,85 @@ The relay (the notifications plugin) does this, not hyperspace. Hyperspace does
 not read or carry message content, and it has no subspace credential; the relay
 already holds the session's connection and its acks.
 
+The claim is made when a turn starts, on the first prompt, and not at
+SessionStart. Hook context reaches the model only with a turn. A resume can
+start with no prompt: a fleet view that reopens a stopped background session,
+or `claude --resume <sid>` with nobody at the keyboard. A claim at SessionStart
+would ack the messages, so the core would show them as delivered, but no turn
+comes and the model never sees them. Nothing is then unacked, so no wake
+follows, and a stop of the session loses them.
+
 - **Hold.** At start, and at each change of the session that it registers, the
   relay does not send messages as channel notifications (its push flush
-  included) until its SessionStart hook claims them or declines. If no hook
+  included) until its SessionStart hook declines or a claim ends. If no hook
   contacts it within about 15 s, it stops the hold. After a change, the relay
   drops each `notify` whose `session_id` is the earlier session's. At start, the
   relay holds only if the hook has not yet written the session state file, or
   wrote it recently: a relay that an MCP reconnect restarts later has no hook
   coming. The age of the process does not tell this, because a hot-spare worker
-  is old when its relay starts. A claim also starts a hold before the relay
-  connects. A change of session also discards the local buffers of the earlier
-  session; their messages stay unacked in the core. This applies to the change
-  that a claim makes and to the change that the existing session-id watcher
-  makes.
-- **Claim.** The relay listens on a local socket at a path keyed by the Claude
-  Code process id, which the hook and the relay both find today for the session
-  state file. The hook sends its session id there, and waits up to about 10 s:
-  the relay sleeps 3 s before it connects, and `whoami` can take 5 s. If the id
-  is not the one that the relay registered (after `/resume` in a running
-  session, the relay started under the earlier session's id), the relay
-  registers it. If the watcher already made that change, the claim takes its
-  hold. The relay then sends `whoami`; the core sends the reply after the items
-  that were pending, or after 5 s. The relay answers the hook with the held
-  messages that pass the session's threshold. Messages below the threshold stay
-  held, as today. The claim takes the messages out of channel delivery, so the
-  two paths cannot both send one message.
-- **Output.** The hook returns the messages as `additionalContext`, with a
-  header that says that they arrived while the session was stopped. After it has
-  written its output, it tells the relay, and the relay acks them. If the IPC
-  closes before that, the relay keeps the messages unacked and sends them as
-  channel notifications.
-- **Decline.** For a start that is not a resume, the hook declines, and the
-  relay stops the hold at once.
+  is old when its relay starts. A change of session also discards the local
+  buffers of the earlier session; their messages stay unacked in the core. This
+  applies to the change that a resume or a claim makes and to the change that
+  the existing session-id watcher makes. A shorter hold never cuts a longer one
+  that is on.
+- **Resume.** The relay listens on a local socket at a path keyed by the Claude
+  Code process id, which the hooks and the relay all find for the session state
+  file. On a resume, the SessionStart hook writes a resume mark (a file in the
+  state directory, with the session id) and then sends `resume` with its
+  session id on the socket. It claims nothing and writes no context. The relay
+  holds for about 30 s from then, to wait for the first prompt: a prompt on
+  the command line comes when all SessionStart hooks end, which can take some
+  seconds. If the id is not the one that the relay registered (after `/resume`
+  in a running session, the relay started under the earlier session's id), the
+  relay registers it at once, so the core sends that session's pending items
+  during the hold. A relay that is not yet connected connects at once, not
+  after its startup sleep.
+- **Claim.** The UserPromptSubmit hook runs on each prompt. It takes the resume
+  mark away; if there was no mark, or the mark is of another session, it does
+  nothing. So only the first prompt after a resume contacts the relay, and the
+  other prompts cost a file check. The hook sends its session id on the socket
+  and waits up to about 10 s: the relay can still be connecting, and `whoami`
+  can take 5 s. This wait blocks only that first prompt. If the session is a
+  channel and its hold has ended, the relay answers at once with nothing: the
+  messages went out as channel notifications. Otherwise the relay registers the
+  id if it is not the registered one, sends `whoami` (the core sends the reply
+  after the items that were pending, or after 5 s), and answers the hook with
+  the held messages that pass the session's threshold. Messages below the
+  threshold stay held for `catch_up`. The claim takes the messages out of channel
+  delivery, so the two paths cannot both send one message.
+- **Output.** The hook returns the messages as UserPromptSubmit
+  `additionalContext`, with a header that says that they arrived while the
+  session was stopped. After it has written its output, it tells the relay, and
+  the relay acks them. If the IPC closes before that, the relay keeps the
+  messages unacked and sends them as channel notifications.
+- **No prompt.** If no prompt comes before the hold ends, nothing claims, and
+  the relay sends the messages as channel notifications. A channel notification
+  starts a turn, so the agent sees them. The relay acks them only then. In a
+  session that is not a channel they stay held for `catch_up`, and the first
+  prompt still claims them.
+- **Decline.** For a start that is not a resume, the SessionStart hook removes
+  any resume mark and declines, and the relay stops the hold at once.
 
-The hook connects to the relay, not to the core: each connection to a session
+The hooks connect to the relay, not to the core: each connection to a session
 gets each unacked message, so a second connection would put the messages in the
 context twice.
 
 This works for each resume, also an interactive `claude --resume` by a user.
+When the user types the first prompt within the hold, the messages come with
+it; later, they come as channel notifications.
 
 Checked on 2026-10-28 with Claude Code 2.1.301, for `claude --bg --resume`
 (cold, and into a `bg-spare` worker), `claude --resume <sid>`, and `/resume` in
 a running session:
 
 - Claude Code starts the MCP servers while the SessionStart hook runs, and the
-  first prompt waits until the hook ends. So the hook can wait for the relay,
-  and its `additionalContext` comes before the first turn.
-- UserPromptSubmit runs for the prompt on the command line.
+  first prompt waits until the hook ends.
+- UserPromptSubmit runs for the prompt on the command line, which is how the
+  launcher resumes a session.
 - The relay's environment has the resumed session id in each case except
   `/resume` in a running session: there the MCP servers keep the id of the
-  session that started the process. The hook payload has the right id in each
-  case, so the claim carries it.
+  session that started the process. The hook payloads have the right id in each
+  case, so the resume and the claim carry it.
 
 ## How the rules fit
 

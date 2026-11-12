@@ -14,8 +14,10 @@ repo). This relay only knows how to:
   - acknowledge delivered notifications back to the server
   - forward the agent's schedule/subscribe tool calls to the server
   - at a resume, hold the messages that arrived while the session was stopped
-    for the SessionStart hook (../hooks/session-start.py), which claims them
-    over a local socket and puts them into the first turn
+    until the first prompt: its UserPromptSubmit hook (../hooks/prompt-submit.py)
+    claims them over a local socket and puts them into that turn. The
+    SessionStart hook (../hooks/session-start.py) only says whether the start
+    is a resume.
 
 Delivery is mode-aware. The relay reads Claude Code's per-server MCP log (see
 ../lib/channel_detect.py) to learn whether it was loaded as a channel:
@@ -88,18 +90,23 @@ SESSION_POLL_SECONDS = 5.0
 STARTUP_GRACE_SECONDS = 3.0
 REQUEST_TIMEOUT_SECONDS = 10.0
 
-# Delivery at resume. The SessionStart hook claims the messages that arrived
-# while the session was stopped and puts them into the first turn. Until it
-# claims or declines, nothing goes to the channel. The hold ends on its own if
-# no hook contacts the relay in time.
+# Delivery at resume. The first prompt after a resume claims the messages that
+# arrived while the session was stopped and puts them into its turn. Until the
+# SessionStart hook declines (not a resume), or the claim ends, nothing goes to
+# the channel. The hold ends on its own if no hook contacts the relay in time.
 HOLD_SECONDS = 15.0
-# The hook writes the session state file just before it claims or declines. A
-# relay that finds an older file started later in the session (an MCP
-# reconnect): no hook is coming, so it does not hold at start. The process age
-# would not do: a hot-spare worker is old by the time its relay starts.
+# After the SessionStart hook says the start is a resume, the hold waits for
+# the first prompt. A command-line prompt comes only when all SessionStart hooks
+# have ended, which can take some seconds. A resume with no prompt gets its
+# messages as channel notifications this much later.
+RESUME_HOLD_SECONDS = 30.0
+# The hook writes the session state file just before it sends resume or
+# decline. A relay that finds an older file started later in the session (an
+# MCP reconnect): no hook is coming, so it does not hold at start. The process
+# age would not do: a hot-spare worker is old by the time its relay starts.
 START_HOLD_MAX_AGE_SECONDS = 60.0
-# The hook waits about 10 s in total, so a claim gives up on the connection and
-# on whoami before that.
+# The prompt hook waits about 10 s in total, so a claim gives up on the
+# connection and on whoami before that.
 CLAIM_CONNECT_SECONDS = 5.0
 # The server answers whoami after its delivery pass, or after 5 s.
 WHOAMI_TIMEOUT_SECONDS = 6.0
@@ -278,7 +285,8 @@ class DaemonClient:
         self._debounce_first: float | None = None  # monotonic ts of first pending item
         self._debounce_last: float | None = None  # monotonic ts of most recent arrival
         # Delivery at resume: while the hold is on (monotonic deadline in the
-        # future), push delivery waits for the SessionStart hook's claim or decline.
+        # future), push delivery waits for the SessionStart hook's decline or the
+        # first prompt's claim.
         self._hold_deadline: float | None = None
         # Items the hook claimed, unacked until it confirms that it wrote them,
         # and the session they belong to.
@@ -290,9 +298,9 @@ class DaemonClient:
         # registration of that session.
         self._confirmed: dict[str, str] = {}
         self._ack_pending: set[str] = set()
-        # The contents that the hook put into the session-start context, until the
-        # next catch_up shows them again. A model can miss the hook context, call
-        # catch_up, and find nothing: the hook took the messages.
+        # The contents that the hook put into the first prompt's context, until
+        # the next catch_up shows them again. A model can miss the hook context,
+        # call catch_up, and find nothing: the hook took the messages.
         self._resumed: list[str] = []
 
     def attach_write_stream(self, write_stream) -> None:
@@ -492,8 +500,14 @@ class DaemonClient:
             self._hold_deadline is not None and time.monotonic() < self._hold_deadline
         )
 
-    def _start_hold(self) -> None:
-        self._hold_deadline = time.monotonic() + HOLD_SECONDS
+    def _start_hold(self, seconds: float | None = None) -> None:
+        """Hold for `seconds` (default HOLD_SECONDS) from now. A longer hold
+        that is on stays: a session change must not cut the wait for the first
+        prompt short."""
+        deadline = time.monotonic() + (HOLD_SECONDS if seconds is None else seconds)
+        if self._hold_deadline is not None:
+            deadline = max(deadline, self._hold_deadline)
+        self._hold_deadline = deadline
         self._debounce_event.set()  # the flush deadline moved
 
     def _release_hold(self) -> None:
@@ -548,13 +562,34 @@ class DaemonClient:
                 self._buffer.pop(notification_id, None)
         return taken
 
-    async def claim(self, session_id: str) -> list[dict]:
-        """Take the messages that arrived while `session_id` was stopped, for the
-        hook to put into the first turn. They stay unacked until confirm_claim.
+    async def expect_prompt(self, session_id: str) -> None:
+        """A resume of `session_id` started: hold until its first prompt claims.
 
         Registers `session_id` if it is not the registered one (after /resume in
-        a running session the relay's environment still has the earlier id).
-        Then asks the server with whoami, which replies after the pending items."""
+        a running session the relay's environment still has the earlier id), so
+        that the server sends the pending items during the hold."""
+        self._start_hold(RESUME_HOLD_SECONDS)
+        ws = self._ws
+        if ws is None:
+            self._reconnect_now.set()  # connect now, not after the startup grace
+            return
+        if session_id and session_id != self._registered_session:
+            try:
+                await self._register(ws, session_id)
+            except (ConnectionClosed, WebSocketException):
+                pass  # the reconnect registers the new id
+
+    async def claim(self, session_id: str) -> list[dict]:
+        """Take the messages that arrived while `session_id` was stopped, for the
+        hook to put into the first prompt's turn. They stay unacked until
+        confirm_claim.
+
+        A push session whose hold has ended takes nothing: the channel has the
+        messages, and a later prompt must not wait. Registers `session_id` if
+        it is not the registered one. Then asks the server with whoami, which
+        replies after the pending items."""
+        if self._mode == "push" and not self.holding:
+            return []
         self._start_hold()  # nothing may reach the channel while the hook waits
         if not await self.wait_connected(CLAIM_CONNECT_SECONDS):
             return []
@@ -630,7 +665,7 @@ class DaemonClient:
             await self._dispatch_notify(item["id"], item["content"], item["meta"])
 
     async def serve_ipc(self) -> None:
-        """Listen for the SessionStart hook on the per-process local socket."""
+        """Listen for the hooks on the per-process local socket."""
         path = _ipc_path()
         if path is None:
             return  # no hook can find this relay, so nothing to wait for
@@ -658,9 +693,10 @@ class DaemonClient:
             path.unlink(missing_ok=True)
 
     async def _handle_ipc(self, stream) -> None:
-        """One hook connection: {claim|decline, session_id, source} in, {claimed,
-        count, content} out, then {done} in. A connection that ends before "done"
-        abandons the claim."""
+        """One hook connection. SessionStart: {resume|decline, session_id,
+        source} in. The first prompt after a resume: {claim, session_id,
+        source} in, {claimed, count, content} out, then {done} in. A connection
+        that ends before "done" abandons the claim."""
         try:
             async with stream:
                 await self._serve_hook(stream)
@@ -678,6 +714,9 @@ class DaemonClient:
         kind = request.get("type")
         if kind == "decline":
             await self.decline(str(request.get("session_id") or ""))
+            return
+        if kind == "resume":
+            await self.expect_prompt(str(request.get("session_id") or ""))
             return
         if kind != "claim":
             return
@@ -843,7 +882,7 @@ class DaemonClient:
         resumed, self._resumed = self._resumed, []
         if resumed:
             sections.append(
-                f"Already delivered at resume, in the session-start context "
+                f"Already delivered at resume, in the first prompt's context "
                 f"({len(resumed)} message(s), repeated once here):\n\n"
                 + "\n\n".join(resumed)
             )
@@ -947,7 +986,8 @@ class DaemonClient:
             self._pending.pop(req_id, None)
 
     async def run(self) -> None:
-        # A hook's claim ends the grace early: the hold keeps the channel quiet.
+        # A hook's resume or claim ends the grace early: the hold keeps the
+        # channel quiet.
         with anyio.move_on_after(STARTUP_GRACE_SECONDS):
             await self._reconnect_now.wait()
         self._reconnect_now = anyio.Event()
@@ -1174,8 +1214,8 @@ def _ipc_path() -> Path | None:
 
 
 def _hook_expected() -> bool:
-    """True if the SessionStart hook is about to claim or decline: it has not
-    written this process's state file yet, or wrote it just now."""
+    """True if the SessionStart hook is about to send resume or decline: it has
+    not written this process's state file yet, or wrote it just now."""
     claude_pid = session_state.resolve_claude_pid()
     if claude_pid is None:
         return False
@@ -2498,7 +2538,7 @@ async def _serve() -> None:
     async with stdio_server() as (read_stream, write_stream):
         DAEMON.attach_write_stream(write_stream)
         async with anyio.create_task_group() as tg:
-            tg.start_soon(DAEMON.serve_ipc)  # the SessionStart hook's claim
+            tg.start_soon(DAEMON.serve_ipc)  # the hooks' local socket
             tg.start_soon(DAEMON.run)
             tg.start_soon(DAEMON.detect_and_apply)  # decide push vs catch_up
             tg.start_soon(DAEMON.debounce_loop)  # coalesce push-mode bursts

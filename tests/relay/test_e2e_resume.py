@@ -1,9 +1,10 @@
 # vim: filetype=python
 """End-to-end tests for delivery at resume: the real server, a relay that runs
-under a stand-in for the Claude Code process, and the SessionStart hook's
-handoff code. A session that was away gets the messages that passed its
-threshold in the hook's output once, and not as a channel event; a start that
-is not a resume declines, and the messages reach the channel as before."""
+under a stand-in for the Claude Code process, and the hooks' handoff code. A
+session that was away and gets a prompt has the messages that passed its
+threshold in the prompt hook's output once, and not as a channel event. A
+resume with no prompt gets them as a channel event when the hold ends. A start
+that is not a resume declines, and the messages reach the channel as before."""
 
 import importlib.util
 import json
@@ -30,15 +31,19 @@ pytestmark = [
 ]
 
 
-def _load_hook():
-    path = h.ROOT / "plugin" / "subspace" / "hooks" / "session-start.py"
-    spec = importlib.util.spec_from_file_location("session_start", path)
+def _load_hook(name: str):
+    path = h.ROOT / "plugin" / "subspace" / "hooks" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-start = _load_hook()
+start = _load_hook("session-start")
+prompt = _load_hook("prompt-submit")
+# The relay's RESUME_HOLD_SECONDS. The relay runs in its own process, so a test
+# cannot make it shorter.
+RESUME_HOLD_SECONDS = 30.0
 
 
 @pytest.fixture
@@ -123,7 +128,7 @@ async def _setup_room(stack: h.Stack) -> None:
         assert "Posted to #room" in text
 
 
-def test_resume_puts_held_messages_into_the_first_turn(
+def test_resume_puts_held_messages_into_the_first_prompt(
     tmp_path, short_dir, monkeypatch
 ):
     with h.core(tmp_path) as stack:
@@ -136,10 +141,15 @@ def test_resume_puts_held_messages_into_the_first_turn(
                 write,
                 socket,
             ):
-                # As the hook does: the state file first, then the claim.
+                # As SessionStart does: the state file first, then "resume".
                 session_state.write_session(int(socket.stem), "sid-B", "resume")
-                assert await start.handoff(socket, "sid-B", "resume", emitted.append)
+                assert await start.handoff(socket, "sid-B", "resume")
+                # The first prompt claims.
+                assert await prompt.claim(socket, "sid-B", emitted.append)
                 output = json.loads(emitted[0])
+                assert output["hookSpecificOutput"]["hookEventName"] == (
+                    "UserPromptSubmit"
+                )
                 context = output["hookSpecificOutput"]["additionalContext"]
                 assert "all hands" in context and "agent-a" in context
                 assert "fyi thing" not in context  # below the threshold: held
@@ -174,14 +184,51 @@ def test_start_that_is_not_a_resume_declines(tmp_path, short_dir, monkeypatch):
                 _write,
                 socket,
             ):
-                assert not await start.handoff(
-                    socket, "sid-B", "startup", emitted.append
-                )
-                assert emitted == []
+                assert await start.handoff(socket, "sid-B", "startup")
                 # The decline ends the hold: the urgent message reaches the
                 # channel well before the hold would end on its own.
                 event = await h.mcp_await_channel_with(read, "all hands", timeout=10)
                 assert event is not None
                 assert "fyi thing" not in event.params["content"]
+
+        anyio.run(scenario)
+
+
+def test_resume_with_no_prompt_delivers_on_the_channel(
+    tmp_path, short_dir, monkeypatch
+):
+    """A resume that no prompt follows (a fleet view that reopens a stopped
+    session, or `claude --resume` with nobody at the keyboard): nothing is
+    claimed, and the urgent message reaches the channel when the hold ends,
+    which starts a turn. A prompt after that takes nothing."""
+    with h.core(tmp_path) as stack:
+
+        async def scenario():
+            await _setup_room(stack)
+            emitted: list[str] = []
+            async with _resumed_session(stack, short_dir, "sid-B", monkeypatch) as (
+                read,
+                write,
+                socket,
+            ):
+                session_state.write_session(int(socket.stem), "sid-B", "resume")
+                assert await start.handoff(socket, "sid-B", "resume")
+                # Held while a prompt can still come.
+                assert (
+                    await h.mcp_await_channel_with(read, "all hands", timeout=5) is None
+                )
+                event = await h.mcp_await_channel_with(
+                    read, "all hands", timeout=RESUME_HOLD_SECONDS + 15
+                )
+                assert event is not None
+                assert "fyi thing" not in event.params["content"]
+
+                assert not await prompt.claim(socket, "sid-B", emitted.append)
+                assert emitted == []
+                # The channel delivery acked it: catch_up does not show it.
+                text, _ = await h.mcp_call(read, write, 2, "catch_up")
+                assert "fyi thing" in text
+                assert "all hands" not in text
+                assert "Already delivered at resume" not in text
 
         anyio.run(scenario)

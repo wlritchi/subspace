@@ -1,13 +1,16 @@
 # vim: filetype=python
-"""Unit tests for the plugin's hook scripts: the PostCompact compaction-audit hook
-and the SessionStart hook's handoff of messages that arrived while the session
-was stopped (a fake relay socket stands in for the MCP server)."""
+"""Unit tests for the plugin's hook scripts: the PostCompact compaction-audit hook,
+and the delivery at resume of the messages that arrived while the session was
+stopped: the SessionStart hook says the start is a resume, and the
+UserPromptSubmit hook claims them on the first prompt (a fake relay socket
+stands in for the MCP server)."""
 
 import asyncio
 import importlib.util
 import io
 import json
 import tempfile
+import time
 from pathlib import Path
 from typing import Self
 
@@ -28,6 +31,7 @@ def _load_hook(name: str):
 
 hook = _load_hook("compaction-audit")
 start = _load_hook("session-start")
+prompt = _load_hook("prompt-submit")
 
 
 def test_build_record_full_payload():
@@ -79,7 +83,7 @@ def test_audit_path_default_under_home(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# SessionStart: handoff of the messages that arrived while the session was stopped
+# Delivery at resume: SessionStart says "resume", the first prompt claims
 # --------------------------------------------------------------------------- #
 
 
@@ -98,13 +102,14 @@ def short_dir():
 
 
 class FakeRelay:
-    """The relay's side of the hook socket: records what the hook sends and
+    """The relay's side of the hook socket: records what the hooks send and
     answers a claim with `reply`."""
 
     def __init__(self, path: Path, reply: dict | None) -> None:
         self.path = path
         self.reply = reply
         self.received: list[dict] = []
+        self.connections = 0
         self.closed = asyncio.Event()
         self._server: asyncio.AbstractServer | None = None
 
@@ -120,6 +125,7 @@ class FakeRelay:
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self.connections += 1
         try:
             while line := await reader.readline():
                 message = json.loads(line)
@@ -132,7 +138,117 @@ class FakeRelay:
             self.closed.set()
 
 
-def test_resume_claims_and_confirms_after_writing(short_dir):
+def test_resume_tells_the_relay_and_claims_nothing(short_dir):
+    """SessionStart context reaches the model only with a turn, and a resume
+    with no prompt starts none. So the hook does not claim at resume."""
+    path = short_dir / "1.sock"
+
+    async def scenario() -> bool:
+        async with FakeRelay(
+            path, {"type": "claimed", "count": 1, "content": "x"}
+        ) as relay:
+            sent = await start.handoff(path, "sid-1", "resume")
+            await asyncio.wait_for(relay.closed.wait(), 5)
+            assert relay.received == [
+                {"type": "resume", "session_id": "sid-1", "source": "resume"}
+            ]
+            return sent
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_other_starts_decline(short_dir):
+    path = short_dir / "1.sock"
+
+    async def scenario() -> bool:
+        async with FakeRelay(path, None) as relay:
+            sent = await start.handoff(path, "sid-1", "startup")
+            await asyncio.wait_for(relay.closed.wait(), 5)
+            assert relay.received == [
+                {"type": "decline", "session_id": "sid-1", "source": "startup"}
+            ]
+            return sent
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_session_start_without_relay_gives_up_in_time(short_dir, monkeypatch):
+    monkeypatch.setattr(start, "NOTIFY_WAIT_SECONDS", 0.3)
+    began = time.monotonic()
+    sent = asyncio.run(start.handoff(short_dir / "none.sock", "sid-1", "resume"))
+    assert sent is False
+    assert time.monotonic() - began < 2.0
+
+
+def _run_session_start(monkeypatch, payload: dict) -> None:
+    monkeypatch.setattr(start.sys, "stdin", io.StringIO(json.dumps(payload)))
+    start.main()
+
+
+@pytest.fixture
+def state_dir(short_dir, monkeypatch):
+    """A private state directory for the Claude Code process 4242 (this test
+    process stands in for it, so the pid-recycling guard sees the same start
+    time on both sides)."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_dir))
+    monkeypatch.setattr(session_state, "resolve_claude_pid", lambda: 4242)
+    monkeypatch.setattr(session_state, "reap_stale", lambda: None)
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 111)
+    monkeypatch.setattr(start, "NOTIFY_WAIT_SECONDS", 0.2)
+    path = session_state.ipc_path(4242)
+    path.parent.mkdir(parents=True, mode=0o700)
+    return path
+
+
+def test_session_start_main_marks_a_resume(state_dir, monkeypatch, capsys):
+    """The whole SessionStart hook: the state file for the relay's session id,
+    the resume mark for the first prompt, then "resume" on the socket keyed by
+    the same Claude Code pid. It writes no context."""
+
+    async def scenario() -> list[dict]:
+        async with FakeRelay(state_dir, None) as relay:
+            payload = {"session_id": "sid-9", "source": "resume"}
+            await asyncio.to_thread(_run_session_start, monkeypatch, payload)
+            await asyncio.wait_for(relay.closed.wait(), 5)
+            return relay.received
+
+    received = asyncio.run(scenario())
+    assert [m["type"] for m in received] == ["resume"]
+    assert session_state.read_session(4242) == "sid-9"
+    assert capsys.readouterr().out == ""
+    mark = session_state.take_resume(4242)
+    assert mark is not None and mark[0] == "sid-9"
+
+
+def test_session_start_main_clears_the_mark_for_other_starts(state_dir, monkeypatch):
+    session_state.mark_resume(4242, "sid-9")
+    _run_session_start(monkeypatch, {"session_id": "sid-9", "source": "clear"})
+    assert session_state.take_resume(4242) is None
+
+
+def test_session_start_skips_a_state_dir_that_is_not_private(
+    short_dir, monkeypatch, capsys
+):
+    """A socket in a directory another user could own may be a fake relay: the
+    hook writes nothing and sends nothing."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_dir))
+    monkeypatch.setattr(session_state, "resolve_claude_pid", lambda: 4242)
+    path = session_state.ipc_path(4242)
+    path.parent.mkdir(parents=True, mode=0o755)
+
+    async def scenario() -> list[dict]:
+        async with FakeRelay(path, None) as relay:
+            payload = {"session_id": "sid-9", "source": "resume"}
+            await asyncio.to_thread(_run_session_start, monkeypatch, payload)
+            return relay.received
+
+    assert asyncio.run(scenario()) == []
+    assert session_state.read_session(4242) is None
+    assert not (path.parent / "4242.resume").exists()
+    assert capsys.readouterr().out == ""
+
+
+def test_prompt_claims_and_confirms_after_writing(short_dir):
     path = short_dir / "1.sock"
     emitted: list[str] = []
     reply = {
@@ -143,10 +259,10 @@ def test_resume_claims_and_confirms_after_writing(short_dir):
 
     async def scenario() -> bool:
         async with FakeRelay(path, reply) as relay:
-            done = await start.handoff(path, "sid-1", "resume", emitted.append)
+            done = await prompt.claim(path, "sid-1", emitted.append)
             await asyncio.wait_for(relay.closed.wait(), 5)
             assert relay.received == [
-                {"type": "claim", "session_id": "sid-1", "source": "resume"},
+                {"type": "claim", "session_id": "sid-1", "source": "prompt"},
                 {"type": "done"},
             ]
             return done
@@ -155,19 +271,19 @@ def test_resume_claims_and_confirms_after_writing(short_dir):
     assert len(emitted) == 1
     output = json.loads(emitted[0])
     context = output["hookSpecificOutput"]["additionalContext"]
-    assert output["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "while this session was stopped" in context
     assert context.endswith("#room alice: hi\n\n[dm] bob: hey")
 
 
-def test_resume_with_nothing_held_writes_nothing(short_dir):
+def test_prompt_with_nothing_held_writes_nothing(short_dir):
     path = short_dir / "1.sock"
     emitted: list[str] = []
     reply = {"type": "claimed", "count": 0, "content": ""}
 
     async def scenario() -> bool:
         async with FakeRelay(path, reply) as relay:
-            done = await start.handoff(path, "sid-1", "resume", emitted.append)
+            done = await prompt.claim(path, "sid-1", emitted.append)
             await asyncio.wait_for(relay.closed.wait(), 5)
             assert [m["type"] for m in relay.received] == ["claim"]  # no "done"
             return done
@@ -176,89 +292,110 @@ def test_resume_with_nothing_held_writes_nothing(short_dir):
     assert emitted == []
 
 
-def test_other_starts_decline(short_dir):
-    path = short_dir / "1.sock"
+def test_prompt_without_relay_gives_up_in_time(short_dir, monkeypatch):
+    monkeypatch.setattr(prompt, "CLAIM_WAIT_SECONDS", 0.3)
     emitted: list[str] = []
-
-    async def scenario() -> bool:
-        async with FakeRelay(path, None) as relay:
-            done = await start.handoff(path, "sid-1", "startup", emitted.append)
-            await asyncio.wait_for(relay.closed.wait(), 5)
-            assert relay.received == [
-                {"type": "decline", "session_id": "sid-1", "source": "startup"}
-            ]
-            return done
-
-    assert asyncio.run(scenario()) is False
-    assert emitted == []
-
-
-def test_no_relay_socket_gives_up_in_time(short_dir, monkeypatch):
-    monkeypatch.setattr(start, "CLAIM_WAIT_SECONDS", 0.3)
-    emitted: list[str] = []
-    done = asyncio.run(
-        start.handoff(short_dir / "none.sock", "sid-1", "resume", emitted.append)
-    )
+    began = time.monotonic()
+    done = asyncio.run(prompt.claim(short_dir / "none.sock", "sid-1", emitted.append))
     assert done is False
     assert emitted == []
+    assert time.monotonic() - began < 2.0
+
+
+def test_prompt_long_after_the_resume_tries_the_relay_once(short_dir):
+    """Long after the resume, a missing socket means no relay is coming: the
+    prompt does not wait for one."""
+    began = time.monotonic()
+    done = asyncio.run(
+        prompt.claim(short_dir / "none.sock", "sid-1", print, connect_seconds=-50.0)
+    )
+    assert done is False
+    assert time.monotonic() - began < 0.5
 
 
 def test_relay_that_never_answers_gives_up_in_time(short_dir, monkeypatch):
-    monkeypatch.setattr(start, "CLAIM_WAIT_SECONDS", 0.3)
+    monkeypatch.setattr(prompt, "CLAIM_WAIT_SECONDS", 0.3)
     path = short_dir / "1.sock"
     emitted: list[str] = []
 
     async def scenario() -> bool:
         async with FakeRelay(path, None):
-            return await start.handoff(path, "sid-1", "resume", emitted.append)
+            return await prompt.claim(path, "sid-1", emitted.append)
 
     assert asyncio.run(scenario()) is False
     assert emitted == []
 
 
-def test_main_writes_state_file_and_context(short_dir, monkeypatch, capsys):
-    """The whole hook: the state file for the relay's session id, then the claim
-    on the socket keyed by the same Claude Code pid."""
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_dir))
-    monkeypatch.setattr(session_state, "resolve_claude_pid", lambda: 4242)
-    monkeypatch.setattr(session_state, "reap_stale", lambda: None)
-    path = session_state.ipc_path(4242)
-    path.parent.mkdir(parents=True, mode=0o700)
-    payload = {"session_id": "sid-9", "source": "resume", "hook_event_name": "x"}
-    monkeypatch.setattr(start.sys, "stdin", io.StringIO(json.dumps(payload)))
+def _run_prompt(monkeypatch, session_id: str) -> None:
+    payload = {
+        "session_id": session_id,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "go on",
+    }
+    monkeypatch.setattr(prompt.sys, "stdin", io.StringIO(json.dumps(payload)))
+    prompt.main()
+
+
+def test_prompt_main_claims_once_after_a_resume(state_dir, monkeypatch, capsys):
+    """The whole UserPromptSubmit hook: the first prompt after the resume mark
+    claims on the socket keyed by the Claude Code pid; the next prompt does
+    not contact the relay."""
+    session_state.mark_resume(4242, "sid-9")
     reply = {"type": "claimed", "count": 1, "content": "#room alice: hi"}
 
     # The fake relay must share the loop with main()'s asyncio.run, so run the
     # hook in a worker thread while the loop serves.
-    async def scenario() -> list[dict]:
-        async with FakeRelay(path, reply) as relay:
-            await asyncio.to_thread(start.main)
+    async def scenario() -> FakeRelay:
+        async with FakeRelay(state_dir, reply) as relay:
+            await asyncio.to_thread(_run_prompt, monkeypatch, "sid-9")
             await asyncio.wait_for(relay.closed.wait(), 5)
-            return relay.received
+            await asyncio.to_thread(_run_prompt, monkeypatch, "sid-9")
+            await asyncio.sleep(0.1)
+            return relay
 
-    received = asyncio.run(scenario())
-    assert [m["type"] for m in received] == ["claim", "done"]
-    assert session_state.read_session(4242) == "sid-9"
-    output = json.loads(capsys.readouterr().out)
+    relay = asyncio.run(scenario())
+    assert [m["type"] for m in relay.received] == ["claim", "done"]
+    assert relay.connections == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    output = json.loads(lines[0])
+    assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert output["hookSpecificOutput"]["additionalContext"].endswith("alice: hi")
 
 
-def test_main_skips_a_state_dir_that_is_not_private(short_dir, monkeypatch, capsys):
-    """A socket in a directory another user could own may be a fake relay that
-    injects context: the hook writes nothing and claims nothing."""
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short_dir))
-    monkeypatch.setattr(session_state, "resolve_claude_pid", lambda: 4242)
-    path = session_state.ipc_path(4242)
-    path.parent.mkdir(parents=True, mode=0o755)
-    payload = {"session_id": "sid-9", "source": "resume"}
-    monkeypatch.setattr(start.sys, "stdin", io.StringIO(json.dumps(payload)))
-    reply = {"type": "claimed", "count": 1, "content": "injected"}
+def test_prompt_main_with_no_resume_is_a_fast_no_op(state_dir, monkeypatch, capsys):
+    """No resume mark: the hook does not contact the relay, and does not wait
+    for a relay that is not there."""
+    monkeypatch.setattr(prompt, "CLAIM_WAIT_SECONDS", 5.0)
 
-    async def scenario() -> list[dict]:
-        async with FakeRelay(path, reply) as relay:
-            await asyncio.to_thread(start.main)
-            return relay.received
+    async def scenario() -> tuple[FakeRelay, float]:
+        async with FakeRelay(state_dir, {"type": "claimed", "count": 0}) as relay:
+            began = time.monotonic()
+            await asyncio.to_thread(_run_prompt, monkeypatch, "sid-9")
+            return relay, time.monotonic() - began
 
-    assert asyncio.run(scenario()) == []
-    assert session_state.read_session(4242) is None
+    relay, elapsed = asyncio.run(scenario())
+    assert relay.connections == 0
+    assert elapsed < 0.5
+    began = time.monotonic()
+    _run_prompt(monkeypatch, "sid-9")  # no socket at all
+    assert time.monotonic() - began < 0.5
     assert capsys.readouterr().out == ""
+
+
+def test_prompt_main_ignores_a_mark_of_another_session(state_dir, monkeypatch):
+    session_state.mark_resume(4242, "sid-old")
+
+    async def scenario() -> FakeRelay:
+        async with FakeRelay(state_dir, {"type": "claimed", "count": 0}) as relay:
+            await asyncio.to_thread(_run_prompt, monkeypatch, "sid-9")
+            return relay
+
+    assert asyncio.run(scenario()).connections == 0
+    assert session_state.take_resume(4242) is None  # used up
+
+
+def test_resume_mark_of_a_recycled_pid_is_not_valid(state_dir, monkeypatch):
+    session_state.mark_resume(4242, "sid-9")
+    monkeypatch.setattr(session_state, "_proc_start_time", lambda pid: 222)
+    assert session_state.take_resume(4242) is None
